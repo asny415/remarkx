@@ -20,7 +20,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from store import Store  # noqa: E402
-from fetcher import Fetcher, XError  # noqa: E402
+from fetcher import Fetcher, XError, SessionError  # noqa: E402
 from render import Renderer, W, H  # noqa: E402
 
 log = logging.getLogger("remarkx")
@@ -43,6 +43,7 @@ def load_config(path: str) -> dict:
         "title": "X · Following",
         "data_dir": os.path.join(BASE, "data"),
         "font": "",             # 留空=自动找中文字体
+        "browser": "brave",     # 会话失效时自动导入 Cookie 的浏览器（可逗号分隔多个）
         "mock": False,
     }
     if os.path.exists(path):
@@ -254,17 +255,46 @@ time        {s['now']}
 # 轮询
 # ---------------------------------------------------------------------- #
 
+async def _poll_once(store: Store, fetcher: Fetcher) -> int:
+    n = await fetcher.poll()
+    store.set_meta("last_poll", time.strftime("%Y-%m-%d %H:%M:%S"))
+    store.set_meta("last_poll_ok", "1")
+    store.set_meta("last_error", "")
+    return n
+
+
 async def poll_loop(cfg: dict, store: Store, fetcher: Fetcher):
     while True:
         started = time.monotonic()
+        delay = cfg["poll_seconds"]
         try:
-            n = await fetcher.poll()
-            store.set_meta("last_poll", time.strftime("%Y-%m-%d %H:%M:%S"))
-            store.set_meta("last_poll_ok", "1")
-            store.set_meta("last_error", "")
+            n = await _poll_once(store, fetcher)
             log.info("轮询完成，新增 %d 条（耗时 %.1fs）", n,
                      time.monotonic() - started)
-            delay = cfg["poll_seconds"]
+        except SessionError:
+            # 会话失效 -> 自动从浏览器导入 Cookie 自愈
+            log.warning("会话失效，尝试从浏览器 [%s] 自动恢复 ...",
+                        cfg.get("browser"))
+            store.set_meta("last_error", "会话失效，正在自动恢复…")
+            ok = await asyncio.to_thread(fetcher.refresh_session)
+            if not ok:
+                store.set_meta(
+                    "last_error",
+                    "会话失效，且浏览器 Cookie 导入失败"
+                    "（浏览器未安装/未登录 X？）。"
+                    "请在浏览器登录 x.com，下次轮询自动重试")
+                delay = max(cfg["poll_seconds"], 900)
+            else:
+                try:
+                    n = await _poll_once(store, fetcher)
+                    log.info("已从浏览器恢复会话，新增 %d 条", n)
+                except XError as e2:
+                    store.set_meta(
+                        "last_error",
+                        f"导入浏览器 Cookie 后仍失败：{e2}。"
+                        "请在浏览器里打开 x.com 刷新一下页面，"
+                        "下次轮询自动重试")
+                    delay = max(cfg["poll_seconds"], 900)
         except XError as e:
             store.set_meta("last_error", str(e))
             log.error("抓取错误（15 分钟后重试）: %s", e)
@@ -318,6 +348,16 @@ def cmd_run(args) -> None:
 
         async def run_real():
             from aiohttp import web
+            # 首次启动且无会话时，先尝试从浏览器自动导入 Cookie（免输密码）
+            if not os.path.exists(cfg["session_file"]):
+                log.info("无会话文件，尝试从浏览器 [%s] 自动导入 Cookie ...",
+                         cfg.get("browser"))
+                if await asyncio.to_thread(fetcher.refresh_session):
+                    log.info("浏览器 Cookie 自动导入成功")
+                else:
+                    log.warning("浏览器 Cookie 自动导入失败。可运行 "
+                                "'python3 relay.py login' 手动登录，"
+                                "或在浏览器登录 x.com 后等待下次轮询自动恢复")
             app = build_app(cfg, store, renderer)
             runner = web.AppRunner(app)
             await runner.setup()

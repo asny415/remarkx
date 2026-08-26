@@ -16,6 +16,10 @@ class XError(Exception):
     """登录/会话/网络类错误，message 会展示给用户。"""
 
 
+class SessionError(XError):
+    """会话失效——可通过从浏览器导入 Cookie 自动恢复。"""
+
+
 class Fetcher:
     def __init__(self, config: dict, store):
         self.cfg = config
@@ -24,7 +28,31 @@ class Fetcher:
         self.session_file = config["session_file"]
         self.media_dir = config["media_dir"]
         self.poll_count = int(config.get("poll_count", 30))
+        # 浏览器名（可多个，逗号分隔），用于会话失效时自动导入 Cookie
+        self.browsers = [b.strip() for b in
+                         str(config.get("browser", "brave")).split(",")
+                         if b.strip()]
         self._client = None
+
+    # ------------------------------------------------------------------ #
+    # 会话恢复
+    # ------------------------------------------------------------------ #
+
+    def refresh_session(self) -> bool:
+        """从本地浏览器重新导入 X Cookie 到会话文件，并重建客户端。
+
+        成功返回 True。同步函数（读浏览器 Cookie 库会阻塞），
+        调用方用 asyncio.to_thread 包裹。
+        """
+        from cookies_browser import try_import
+
+        if not try_import(self.browsers, self.session_file):
+            return False
+        self._client = None
+        client = self._new_client()
+        client.load_cookies(self.session_file)
+        self._client = client
+        return True
 
     # ------------------------------------------------------------------ #
     # 客户端
@@ -78,16 +106,8 @@ class Fetcher:
         client = await self.ensure_client()
         try:
             result = await client.get_latest_timeline(self.poll_count)
-        except XError:
-            raise
         except Exception as e:
-            msg = str(e)
-            low = msg.lower()
-            if any(k in low for k in ("cookie", "auth", "login", "session",
-                                      "401", "unauthorized")):
-                raise XError(
-                    f"登录态失效，请重新运行 login（原错误: {msg[:200]}）") from e
-            raise XError(f"拉取时间线失败: {msg[:200]}") from e
+            raise self._classify(e) from e
 
         new_count = 0
         for tweet in result:
@@ -98,6 +118,26 @@ class Fetcher:
             if self.store.upsert_tweet(item):
                 new_count += 1
         return new_count
+
+    def _classify(self, e: Exception) -> XError:
+        """把底层异常翻译成对用户友好的错误（会话失效 -> SessionError）。"""
+        if isinstance(e, XError):
+            return e
+        try:
+            from twikit import errors as te
+        except ImportError:
+            te = None
+        if te is not None and isinstance(e, te.TwitterException):
+            if isinstance(e, (te.Unauthorized, te.Forbidden)):
+                return SessionError(f"登录态失效: {e}")
+            if isinstance(e, te.AccountLocked):
+                return XError("账号被临时锁定（可能触发风控），"
+                              "稍后再试或检查该账号是否异常")
+            if isinstance(e, te.AccountSuspended):
+                return XError("账号已被停用")
+            if isinstance(e, te.TooManyRequests):
+                return XError("被限流(429)，请把 poll_seconds 调大")
+        return XError(f"拉取时间线失败: {str(e)[:200]}")
 
     # ------------------------------------------------------------------ #
     # 数据规整

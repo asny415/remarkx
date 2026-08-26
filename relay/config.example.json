@@ -8,5 +8,6 @@
   "title": "X · Following",
   "data_dir": "data",
   "font": "",
+  "browser": "brave",
   "mock": false
 }

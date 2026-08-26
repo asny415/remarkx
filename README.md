@@ -71,8 +71,24 @@ cp relay/config.example.json relay/config.json
 | `page_size` | 每页候选条数（实际按版面裁剪，大图会占满整页） |
 | `title` | 页面左上角标题 |
 | `font` | 留空=自动找中文字体 |
+| `browser` | 会话失效时自动导入 Cookie 的浏览器名（`brave`/`chrome`/`chromium`/`edge`/`firefox`/`opera`/`vivaldi`/`safari`），可逗号分隔多个按序尝试 |
 
-### 3. 登录小号（首次）
+### 3. X 登录态（免输密码）
+
+主路径：**在本机浏览器登录小号**（如 Brave 打开 x.com 登录一次），
+relay 启动时会自动从浏览器导入 Cookie（`browser` 配置，默认 `brave`，
+可用逗号分隔多个：`"browser": "brave,chrome"`），不需要输密码：
+
+```bash
+./venv/bin/python relay/relay.py run
+# 首次运行：无会话文件 -> 自动从浏览器导入 -> 开始轮询
+```
+
+**会话过期怎么办**：relay 轮询发现失效后会**自动重新从浏览器导入**；
+若仍失败，说明浏览器里的登录态也过期了——在浏览器里打开 x.com 刷新
+一下页面即可，下次轮询自动恢复，全程不用手动干预。
+
+兜底：不想用浏览器，或浏览器方式不可用时，可用密码登录：
 
 ```bash
 ./venv/bin/python relay/relay.py login
@@ -188,8 +204,9 @@ Host rmx
 | 现象 | 处理 |
 |---|---|
 | 设备显示"无法连接中转站" | 电脑开机了吗？`curl http://<电脑IP>:8788/healthz` 通吗？防火墙放行了 8788 吗？ |
-| 状态页显示"尚未登录" | 在电脑跑 `./venv/bin/python relay/relay.py login` |
-| 状态页显示"登录态失效" | X 会周期性让会话过期，重新 `login` 即可（数据保留） |
+| 状态页显示"尚未登录" | 在**浏览器**登录 x.com 后等下次轮询（或重启 relay）；或跑 `login` |
+| 状态页显示"登录态失效" | relay 会自动从浏览器重新导入；若仍失败，在浏览器打开 x.com 刷一下页面，下次轮询自动恢复（数据保留） |
+| 浏览器导入失败（"浏览器未安装/未登录"） | 确认 `browser` 配置对了（brave/chrome/...），且该浏览器确实登录了 x.com |
 | 中文是方块 | 中转站没装中文字体：`sudo apt install fonts-noto-cjk` |
 | 图片不显示 | 看 relay 日志里的"媒体下载失败"；多半是代理没配好 |
 | 抓取报 429/限流 | 把 `poll_seconds` 调大（600+） |
@@ -205,7 +222,9 @@ Host rmx
 
 ## 四、已知边界
 
-- **非官方**：twikit 模拟网页会话，X 改版可能坏（坏时日志有明确错误，修 fetcher 即可）。
+- **非官方**：用 `twifork`（twikit 的维护版 fork，`import twikit` 不变）模拟网页会话，
+  X 改版可能坏（坏时日志有明确错误，修 fetcher 即可）。上游 twikit 已停更，
+  若 twifork 也失效，可看 https://github.com/PawiX25/twifork 跟进或换同思路实现。
 - **频率**：轮询太频繁有被限流/风控风险，默认 5 分钟一次，够用就好。
 - **首页时间线**：抓的是 Home → Following 页签（你关注的人）；For You（推荐）
   含推广内容，未启用。

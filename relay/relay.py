@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """remarkx relay — 家中转站：抓 X 首页时间线 -> 缓存 -> 渲染 -> 提供给 reMarkable。
 
+数据获取策略：不做定时轮询。只有设备请求第 0 页（最新）且数据超过
+poll_seconds 秒未更新时才抓一次 X（single-flight，并发请求只等不重复抓）；
+第 1 页及以后永远直接读缓存，翻页不产生任何 X 请求。渲染结果按数据版本
+缓存并预渲染下一页，翻页秒开。
+
 用法:
   python3 relay.py login              # 首次：登录小号（交互式）
-  python3 relay.py run                # 启动服务（抓取轮询 + HTTP）
+  python3 relay.py run                # 启动服务（按需抓取 + HTTP）
   python3 relay.py run --mock         # 用模拟数据跑（调试/演示用）
   python3 relay.py render out.png     # 把第 0 页渲染成 PNG（检查排版）
   python3 relay.py mockseed           # 往库里塞一批模拟数据
@@ -11,6 +16,7 @@
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import os
@@ -37,7 +43,7 @@ def load_config(path: str) -> dict:
         "bind": "0.0.0.0",
         "port": 8788,
         "proxy": "",            # 访问 X 用的代理，如 http://127.0.0.1:7890
-        "poll_seconds": 300,    # 轮询间隔
+        "poll_seconds": 300,    # 缓存有效期（秒）：仅设备请求首页且过期才抓一次
         "poll_count": 30,       # 每次拉多少条
         "page_size": 12,        # 每页候选条数（实际按版面裁剪）
         "title": "X · Following",
@@ -179,8 +185,104 @@ def seed_mock(store: Store, media_dir: str, n: int = 14) -> None:
 # HTTP 服务
 # ---------------------------------------------------------------------- #
 
-def build_app(cfg: dict, store: Store, renderer: Renderer):
+def _is_stale(store: Store, cfg: dict) -> bool:
+    """数据是否过期：无数据，或上次抓取距今超过 poll_seconds 秒。"""
+    if store.count() == 0:
+        return True
+    m = store.get_meta("last_poll")
+    if not m:
+        return True
+    try:
+        t = time.mktime(time.strptime(m, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return True
+    return time.time() - t > int(cfg["poll_seconds"])
+
+
+def _data_version(store: Store) -> str:
+    """数据版本号：refetch 后 count/最新推文 id 变化，渲染缓存随之失效。"""
+    return f"{store.count()}:{store.latest().get('id', '')}"
+
+
+async def do_poll(cfg: dict, store: Store, fetcher: Fetcher) -> int:
+    """抓一次 X（含会话自愈）。返回新增条数；失败抛 XError。"""
+    try:
+        n = await fetcher.poll()
+    except SessionError as e:
+        # 会话失效（或尚未登录）-> 从浏览器导入 Cookie 自愈
+        log.warning("会话失效，尝试从浏览器 [%s] 自动恢复 ...", cfg.get("browser"))
+        store.set_meta("last_error", "会话失效，正在自动恢复…")
+        ok = await asyncio.to_thread(fetcher.refresh_session)
+        if not ok:
+            raise XError("会话失效，且浏览器 Cookie 导入失败"
+                         "（浏览器未安装/未登录 X？）。"
+                         "请在浏览器登录 x.com 后刷新首页重试") from e
+        n = await fetcher.poll()
+    store.set_meta("last_poll", time.strftime("%Y-%m-%d %H:%M:%S"))
+    store.set_meta("last_poll_ok", "1")
+    store.set_meta("last_error", "")
+    return n
+
+
+def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
     from aiohttp import web
+
+    # 每个 app 一份运行时状态：抓取锁 / 抓取中标志 / 渲染缓存
+    state = {
+        "lock": asyncio.Lock(),
+        "fetching": False,
+        "cache": {},        # page -> (version, png bytes)
+        "inflight": set(),  # 正在预渲染的页码
+    }
+
+    async def ensure_fresh() -> None:
+        """服务首页前确保数据新鲜：过期才抓；已有抓取在进行则等它完成。"""
+        if fetcher is None or not _is_stale(store, cfg):
+            return
+        if state["lock"].locked():
+            async with state["lock"]:
+                pass  # 等进行中的抓取结束，下面会重新判断是否还过期
+        async with state["lock"]:
+            if not _is_stale(store, cfg):
+                return
+            state["fetching"] = True
+            log.info("数据已过期，按需从 X 抓取 ...")
+            try:
+                n = await do_poll(cfg, store, fetcher)
+                log.info("按需抓取完成，新增 %d 条", n)
+            except XError as e:
+                log.error("按需抓取失败: %s", e)
+                store.set_meta("last_error", str(e))
+            except Exception as e:  # noqa: BLE001
+                log.exception("按需抓取异常")
+                store.set_meta("last_error", repr(e)[:300])
+            finally:
+                state["fetching"] = False
+
+    async def render_png(page: int, per: int) -> bytes:
+        total_pages = max(1, -(-store.count() // per))
+        tweets = store.fetch_page(page, per)
+        status = store.status()
+        img = await asyncio.to_thread(
+            renderer.render_page, tweets, page, total_pages, status)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    async def prerender(page: int, per: int) -> None:
+        """后台预渲染一页（渲染期间数据变了则丢弃结果）。"""
+        version = _data_version(store)
+        state["inflight"].add(page)
+        try:
+            data = await render_png(page, per)
+            if _data_version(store) == version:
+                if len(state["cache"]) > 32:
+                    state["cache"].clear()
+                state["cache"][page] = (version, data)
+        except Exception:  # noqa: BLE001
+            log.exception("预渲染第 %d 页失败（不影响主流程）", page)
+        finally:
+            state["inflight"].discard(page)
 
     async def h_page(request: web.Request) -> web.Response:
         try:
@@ -189,21 +291,35 @@ def build_app(cfg: dict, store: Store, renderer: Renderer):
             p = 0
         p = max(0, p)
         per = int(cfg["page_size"])
+        if p == 0:
+            await ensure_fresh()
         total_pages = max(1, -(-store.count() // per))
         if p > total_pages:
             p = total_pages - 1
-        tweets = store.fetch_page(p, per)
-        status = store.status()
-        img = renderer.render_page(tweets, p, total_pages, status)
-        import io
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        data = buf.getvalue()
+        version = _data_version(store)
+        hit = state["cache"].get(p)
+        if hit and hit[0] == version:
+            data = hit[1]
+        else:
+            data = await render_png(p, per)
+            if len(state["cache"]) > 32:
+                state["cache"].clear()
+            state["cache"][p] = (version, data)
+        # 预渲染下一页：翻页秒开（旧版本残留条目不算命中）
+        nxt = p + 1
+        nhit = state["cache"].get(nxt)
+        if (nxt < total_pages
+                and not (nhit and nhit[0] == version)
+                and nxt not in state["inflight"]):
+            asyncio.create_task(prerender(nxt, per))
         return web.Response(body=data, content_type="image/png",
                             headers={"Cache-Control": "no-store"})
 
     async def h_status(request: web.Request) -> web.Response:
-        return web.json_response(store.status())
+        s = store.status()
+        s["fetching"] = state["fetching"]
+        s["stale"] = fetcher is not None and _is_stale(store, cfg)
+        return web.json_response(s)
 
     async def h_feed(request: web.Request) -> web.Response:
         try:
@@ -249,61 +365,6 @@ time        {s['now']}
     app.router.add_get("/media/{path:.+}", h_media)
     app.router.add_get("/healthz", h_health)
     return app
-
-
-# ---------------------------------------------------------------------- #
-# 轮询
-# ---------------------------------------------------------------------- #
-
-async def _poll_once(store: Store, fetcher: Fetcher) -> int:
-    n = await fetcher.poll()
-    store.set_meta("last_poll", time.strftime("%Y-%m-%d %H:%M:%S"))
-    store.set_meta("last_poll_ok", "1")
-    store.set_meta("last_error", "")
-    return n
-
-
-async def poll_loop(cfg: dict, store: Store, fetcher: Fetcher):
-    while True:
-        started = time.monotonic()
-        delay = cfg["poll_seconds"]
-        try:
-            n = await _poll_once(store, fetcher)
-            log.info("轮询完成，新增 %d 条（耗时 %.1fs）", n,
-                     time.monotonic() - started)
-        except SessionError:
-            # 会话失效 -> 自动从浏览器导入 Cookie 自愈
-            log.warning("会话失效，尝试从浏览器 [%s] 自动恢复 ...",
-                        cfg.get("browser"))
-            store.set_meta("last_error", "会话失效，正在自动恢复…")
-            ok = await asyncio.to_thread(fetcher.refresh_session)
-            if not ok:
-                store.set_meta(
-                    "last_error",
-                    "会话失效，且浏览器 Cookie 导入失败"
-                    "（浏览器未安装/未登录 X？）。"
-                    "请在浏览器登录 x.com，下次轮询自动重试")
-                delay = max(cfg["poll_seconds"], 900)
-            else:
-                try:
-                    n = await _poll_once(store, fetcher)
-                    log.info("已从浏览器恢复会话，新增 %d 条", n)
-                except XError as e2:
-                    store.set_meta(
-                        "last_error",
-                        f"导入浏览器 Cookie 后仍失败：{e2}。"
-                        "请在浏览器里打开 x.com 刷新一下页面，"
-                        "下次轮询自动重试")
-                    delay = max(cfg["poll_seconds"], 900)
-        except XError as e:
-            store.set_meta("last_error", str(e))
-            log.error("抓取错误（15 分钟后重试）: %s", e)
-            delay = max(cfg["poll_seconds"], 900)
-        except Exception as e:  # noqa: BLE001
-            store.set_meta("last_error", repr(e)[:300])
-            log.exception("轮询异常（15 分钟后重试）")
-            delay = max(cfg["poll_seconds"], 900)
-        await asyncio.sleep(delay)
 
 
 # ---------------------------------------------------------------------- #
@@ -357,14 +418,16 @@ def cmd_run(args) -> None:
                 else:
                     log.warning("浏览器 Cookie 自动导入失败。可运行 "
                                 "'python3 relay.py login' 手动登录，"
-                                "或在浏览器登录 x.com 后等待下次轮询自动恢复")
-            app = build_app(cfg, store, renderer)
+                                "或在浏览器登录 x.com 后在阅读器刷新首页重试")
+            app = build_app(cfg, store, renderer, fetcher)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, cfg["bind"], cfg["port"])
             await site.start()
-            log.info("服务启动: http://%s:%s", cfg["bind"], cfg["port"])
-            await poll_loop(cfg, store, fetcher)
+            log.info("服务启动: http://%s:%s（按需抓取：设备请求首页且数据"
+                     "超过 %ss 未更新时才抓一次 X）",
+                     cfg["bind"], cfg["port"], cfg["poll_seconds"])
+            await asyncio.Event().wait()
 
         asyncio.run(run_real())
 

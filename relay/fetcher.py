@@ -2,7 +2,7 @@
 
 用法（在 relay.py 中）：
   await fetcher.login(...)   # 首次：交互式登录，保存会话
-  await fetcher.poll()       # 周期性调用：拉取新推文 + 下载图片
+  await fetcher.poll()       # 按需调用：拉取新推文 + 下载图片
 """
 
 import asyncio
@@ -67,7 +67,10 @@ class Fetcher:
         if self._client is not None:
             return self._client
         if not os.path.exists(self.session_file):
-            raise XError("尚未登录：请先运行  python3 relay.py login")
+            # 尚未登录也归为 SessionError：可尝试从浏览器导入 Cookie 自愈
+            raise SessionError("尚未登录（无会话文件）。"
+                               "可运行 python3 relay.py login，"
+                               "或在浏览器登录 x.com 后刷新首页自动导入")
         client = self._new_client()
         client.load_cookies(self.session_file)
         self._client = client
@@ -98,7 +101,7 @@ class Fetcher:
         return client
 
     # ------------------------------------------------------------------ #
-    # 轮询
+    # 抓取
     # ------------------------------------------------------------------ #
 
     async def poll(self) -> int:

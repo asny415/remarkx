@@ -188,11 +188,10 @@ class Fetcher:
         for i, m in enumerate(item["media"]):
             path = os.path.join(self.media_dir, f"{item['id']}_{i}.jpg")
             try:
-                resp = await client.http.get(
-                    m["url"], timeout=30, allow_redirects=True)
-                if resp.status != 200:
+                resp = await client.http.get(m["url"], timeout=30)
+                if resp.status_code != 200:
                     log.warning("媒体下载 %s -> HTTP %s", m["url"][:80],
-                                resp.status)
+                                resp.status_code)
                     continue
                 data = resp.content
                 ctype = (resp.headers.get("Content-Type") or "").lower()

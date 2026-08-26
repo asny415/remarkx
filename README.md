@@ -88,6 +88,11 @@ relay 启动时会自动从浏览器导入 Cookie（`browser` 配置，默认 `b
 若仍失败，说明浏览器里的登录态也过期了——在浏览器里打开 x.com 刷新
 一下页面即可，下次轮询自动恢复，全程不用手动干预。
 
+> 注意（Linux）：读浏览器加密 Cookie 需要访问系统 keyring（GNOME Keyring /
+> KWallet，`secretstorage`），relay 必须运行在**已登录的桌面会话**里
+> （终端、用户级 systemd 服务都可以）。用全局 systemd 服务（system
+> scope）启动读不到 keyring，自动导入会失败。
+
 兜底：不想用浏览器，或浏览器方式不可用时，可用密码登录：
 
 ```bash

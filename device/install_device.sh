@@ -16,13 +16,21 @@ command -v wget >/dev/null 2>&1 || {
 
 mkdir -p /opt/rmx
 
-# ---- 1) simple（rmkit 构建服务器的 armhf 二进制）----
-if [ ! -x /opt/bin/simple ]; then
-    echo "下载 simple ..."
-    wget -qO /opt/bin/simple https://build.rmkit.dev/master/latest/rm/simple
+# ---- 1) simple（rmkit 构建的 armhf 二进制）----
+# 设备上的 busybox wget 不支持 HTTPS，所以不从设备直接下载：
+# 在电脑上把 device/simple 一起 scp 过来（见 README），这里直接拷贝。
+if [ -x /opt/bin/simple ]; then
+    echo "simple 已存在，跳过"
+elif [ -f "$HERE/simple" ]; then
+    cp "$HERE/simple" /opt/bin/simple
     chmod +x /opt/bin/simple
+    echo "simple 已从 $HERE/simple 安装"
 else
-    echo "simple 已存在，跳过下载"
+    echo "缺少 simple 二进制（设备 wget 不支持 HTTPS，无法在线下载）。"
+    echo "在电脑上执行："
+    echo "    scp device/simple root@设备:/tmp/"
+    echo "然后重跑本脚本。"
+    exit 1
 fi
 
 # ---- 2) 脚本与配置 ----

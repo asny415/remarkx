@@ -41,8 +41,9 @@ relay/
   requirements.txt
   config.example.json
 device/
-  xreader.sh         # 设备端阅读脚本（纯 shell）
-  install_device.sh  # 设备端安装脚本
+   xreader.sh         # 设备端阅读脚本（纯 shell）
+   install_device.sh  # 设备端安装脚本
+   simple             # SAS 解释器（armhf 二进制，scp 到设备用）
 ```
 
 ---
@@ -162,12 +163,13 @@ ssh root@<设备IP>
 把 `device/` 目录拷到设备（在电脑上执行）：
 
 ```bash
-scp device/xreader.sh device/install_device.sh root@<设备IP>:/tmp/
+scp device/xreader.sh device/install_device.sh device/simple root@<设备IP>:/tmp/
 ssh root@<设备IP> 'sh /tmp/install_device.sh http://<电脑IP>:8788'
 ```
 
 安装内容（都不碰系统文件，可删）：
-- `/opt/bin/simple` — rmkit 构建的 SAS 解释器（armhf 二进制，来自 build.rmkit.dev）
+- `/opt/bin/simple` — SAS 解释器（armhf 二进制，随本仓库 `device/simple` 提供；
+  设备上的 busybox wget 不支持 HTTPS，无法在线自下载）
 - `/opt/rmx/xreader.sh` + `/opt/rmx/config` — 阅读脚本与中转站地址
 
 > 不需要、也不建议安装 Toltec：Toltec 仅支持 OS 2.6.1.71 ~ 3.3.2.1666，

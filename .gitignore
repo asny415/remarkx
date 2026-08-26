@@ -1,0 +1,17 @@
+# 数据与凭据（绝不入库）
+relay/data/
+**/session.json
+*.db
+*.db-*
+
+# 本地运行配置（含代理等环境相关项；模板见 relay/config.example.json）
+relay/config.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地渲染产物
+page*.png

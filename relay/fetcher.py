@@ -1,0 +1,173 @@
+"""X (Twitter) 抓取器：基于 twikit，登录小号，拉取 Home -> Following 时间线。
+
+用法（在 relay.py 中）：
+  await fetcher.login(...)   # 首次：交互式登录，保存会话
+  await fetcher.poll()       # 周期性调用：拉取新推文 + 下载图片
+"""
+
+import asyncio
+import logging
+import os
+
+log = logging.getLogger("remarkx.fetch")
+
+
+class XError(Exception):
+    """登录/会话/网络类错误，message 会展示给用户。"""
+
+
+class Fetcher:
+    def __init__(self, config: dict, store):
+        self.cfg = config
+        self.store = store
+        self.proxy = config.get("proxy") or None
+        self.session_file = config["session_file"]
+        self.media_dir = config["media_dir"]
+        self.poll_count = int(config.get("poll_count", 30))
+        self._client = None
+
+    # ------------------------------------------------------------------ #
+    # 客户端
+    # ------------------------------------------------------------------ #
+
+    def _new_client(self):
+        import twikit
+
+        return twikit.Client(proxy=self.proxy)
+
+    async def ensure_client(self):
+        if self._client is not None:
+            return self._client
+        if not os.path.exists(self.session_file):
+            raise XError("尚未登录：请先运行  python3 relay.py login")
+        client = self._new_client()
+        client.load_cookies(self.session_file)
+        self._client = client
+        return client
+
+    async def login(self, username: str, email: str = None,
+                    password: str = None, totp_secret: str = None):
+        """交互式登录（2FA 验证码在终端输入）。成功后保存会话文件。"""
+        import getpass
+
+        client = self._new_client()
+        username = username or input("账号(用户名/邮箱/手机号): ").strip()
+        email = email or input("备用邮箱(可选, 回车跳过): ").strip() or None
+        password = password or getpass.getpass("密码: ")
+        totp_secret = totp_secret or input(
+            "2FA secret(可选, 回车跳过): ").strip() or None
+
+        log.info("登录中，如出现 2FA 请在提示后输入验证码 ...")
+        await client.login(
+            auth_info_1=username,
+            auth_info_2=email,
+            password=password,
+            totp_secret=totp_secret,
+            cookies_file=self.session_file,
+        )
+        self._client = client
+        log.info("登录成功，会话已保存: %s", self.session_file)
+        return client
+
+    # ------------------------------------------------------------------ #
+    # 轮询
+    # ------------------------------------------------------------------ #
+
+    async def poll(self) -> int:
+        """拉取一页时间线，入库新推文并下载图片，返回新推文数。"""
+        client = await self.ensure_client()
+        try:
+            result = await client.get_latest_timeline(self.poll_count)
+        except XError:
+            raise
+        except Exception as e:
+            msg = str(e)
+            low = msg.lower()
+            if any(k in low for k in ("cookie", "auth", "login", "session",
+                                      "401", "unauthorized")):
+                raise XError(
+                    f"登录态失效，请重新运行 login（原错误: {msg[:200]}）") from e
+            raise XError(f"拉取时间线失败: {msg[:200]}") from e
+
+        new_count = 0
+        for tweet in result:
+            item = self._normalize(tweet)
+            if item is None:
+                continue
+            await self._download_media(client, item)
+            if self.store.upsert_tweet(item):
+                new_count += 1
+        return new_count
+
+    # ------------------------------------------------------------------ #
+    # 数据规整
+    # ------------------------------------------------------------------ #
+
+    def _normalize(self, t) -> dict:
+        """twikit.Tweet -> 内部 dict。retweeted 展开为原推文。"""
+        try:
+            orig = t.retweeted_tweet if t.retweeted_tweet is not None else t
+            author = orig.user or t.user
+            name = author.name if author else ""
+            handle = (author.screen_name if author else "").lstrip("@")
+
+            media = []
+            for m in (orig.media or []):
+                if getattr(m, "type", "") != "photo":
+                    continue  # 只要静态图片；视频/GIF 跳过
+                media.append({
+                    "url": m.media_url or m.url,
+                    "w": int(m.width or 0),
+                    "h": int(m.height or 0),
+                    "path": "",
+                })
+
+            return {
+                "id": str(t.id),
+                "created_at": t.created_at,
+                "author_name": name,
+                "author_handle": handle,
+                "text": (orig.text or "").strip(),
+                "is_retweet": t.retweeted_tweet is not None,
+                "rt_handle": (
+                    (t.user.screen_name if t.user else "").lstrip("@")
+                    if t.retweeted_tweet is not None else ""
+                ),
+                "media": media,
+                "url": f"https://x.com/{handle}/status/{t.id}",
+            }
+        except Exception as e:
+            log.warning("跳过无法解析的推文: %s", e)
+            return None
+
+    async def _download_media(self, client, item: dict) -> None:
+        """下载推文图片到 media_dir，成功后把本地相对路径写回 item。"""
+        if not item["media"]:
+            return
+        os.makedirs(self.media_dir, exist_ok=True)
+        for i, m in enumerate(item["media"]):
+            path = os.path.join(self.media_dir, f"{item['id']}_{i}.jpg")
+            try:
+                resp = await client.http.get(
+                    m["url"], timeout=30, allow_redirects=True)
+                if resp.status != 200:
+                    log.warning("媒体下载 %s -> HTTP %s", m["url"][:80],
+                                resp.status)
+                    continue
+                data = resp.content
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if "png" in ctype:
+                    path = os.path.join(self.media_dir, f"{item['id']}_{i}.png")
+                with open(path, "wb") as f:
+                    f.write(data)
+                m["path"] = os.path.relpath(path, self.media_dir)
+            except Exception as e:
+                log.warning("媒体下载失败 %s: %s", m["url"][:80], e)
+        # 下载完成后更新数据库里的 media 列表（含本地路径）
+        import json
+        self._update_media(item)
+
+    def _update_media(self, item: dict) -> None:
+        import json
+        self.store.update_media(
+            item["id"], json.dumps(item["media"], ensure_ascii=False))

@@ -44,6 +44,13 @@ echo "自检 simple（屏幕上会显示 3 秒）..."
 printf '@timeout 3\nlabel 200 800 1000 80 remarkx 安装成功，3 秒后自动退出\n' \
     | /opt/bin/simple >/dev/null 2>&1 || true
 
+if [ -f /proc/device-tree/model ] && grep -q "reMarkable 2" /proc/device-tree/model 2>/dev/null; then
+    echo ""
+    echo "检测到 reMarkable 2：RM2 的 /dev/fb0 是假的，还需安装 rm2fb 显示栈。"
+    echo "在电脑上执行（免密 SSH 后一键）：  device/install_rm2fb.sh"
+    echo "装好后打开阅读器：  sh /opt/rmx/xreader-rm2.sh"
+fi
+
 echo ""
 echo "安装完成。以后打开阅读器（SSH 到设备后执行）："
 echo "    sh /opt/rmx/xreader.sh"

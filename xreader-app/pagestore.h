@@ -40,6 +40,7 @@ public slots:
     void quit();
     Q_INVOKABLE void retry() { if (!m_error.isEmpty()) { m_error.clear(); emit errorChanged(); goPage(0, true); } }
     Q_INVOKABLE void suspendNow();
+    Q_INVOKABLE void menuExit(int code);
     Q_INVOKABLE void setCalib(const QString &file);
 
 signals:

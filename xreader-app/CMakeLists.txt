@@ -17,6 +17,6 @@ set_target_properties(xreader PROPERTIES OUTPUT_NAME "xr")
 qt_add_qml_module(xreader
     URI xreader
     VERSION 1.0
-    QML_FILES Main.qml)
+    QML_FILES Main.qml Menu.qml)
 
 target_link_libraries(xreader PRIVATE Qt6::Quick Qt6::Network Qt6::GuiPrivate)

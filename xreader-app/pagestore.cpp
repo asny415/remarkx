@@ -162,6 +162,11 @@ void PageStore::suspendNow()
     QProcess::startDetached("systemctl", {"suspend"});
 }
 
+void PageStore::menuExit(int code)
+{
+    QCoreApplication::exit(code);
+}
+
 void PageStore::extendPoll()
 {
     if (m_extendTarget >= 0)

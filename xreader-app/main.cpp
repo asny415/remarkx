@@ -85,7 +85,9 @@ int main(int argc, char *argv[])
                      &app, []() { QCoreApplication::exit(-1); },
                      Qt::QueuedConnection);
 
-    engine.loadFromModule("xreader", "Main");
+    const bool menuMode = app.arguments().contains("--menu");
+    qInfo() << "BUILD_INK=v8" << (menuMode ? "menu" : "reader") << "mode";
+    engine.loadFromModule("xreader", menuMode ? "Menu" : "Main");
 
     return app.exec();
 }

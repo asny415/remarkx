@@ -85,9 +85,10 @@ def clean_text(text: str) -> str:
 
 class Renderer:
     def __init__(self, media_dir: str, title: str = "X · Following",
-                 font_path: str = ""):
+                 font_path: str = "", prefer_zh: bool = False):
         self.media_dir = media_dir
         self.title = title
+        self.prefer_zh = prefer_zh      # 有译文时显示中文
         self.font_path = font_path or find_cjk_font()
         if not self.font_path:
             log.warning("未找到中文字体，中文将显示为方块。"
@@ -217,6 +218,9 @@ class Renderer:
         return img.resize((dw, dh), Image.LANCZOS), dw, dh
 
     def _card_text(self, t: dict) -> str:
+        # 配置开启翻译且该推有中文译文 → 显示译文；否则原文
+        if self.prefer_zh and t.get("translated"):
+            return clean_text(t["translated"])
         return clean_text(t.get("text", ""))
 
     def _card_media(self, t: dict) -> list:

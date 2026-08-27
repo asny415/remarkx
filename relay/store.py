@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+# 旧库平滑迁移：tweets 增加译文列（已存在则忽略）
+_MIGRATIONS = [
+    "ALTER TABLE tweets ADD COLUMN translated TEXT NOT NULL DEFAULT ''",
+]
+
 
 class Store:
     def __init__(self, path: str):
@@ -37,6 +42,11 @@ class Store:
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(_SCHEMA)
+        for ddl in _MIGRATIONS:
+            try:
+                self._db.execute(ddl)
+            except sqlite3.OperationalError:
+                pass                    # 列已存在
         self._db.commit()
 
     # ---------- meta ----------
@@ -87,6 +97,14 @@ class Store:
             self._db.commit()
             return cur.rowcount > 0
 
+    def update_translation(self, tweet_id: str, translated: str) -> None:
+        with self._lock:
+            self._db.execute(
+                "UPDATE tweets SET translated=? WHERE id=?",
+                (translated, str(tweet_id)),
+            )
+            self._db.commit()
+
     def update_media(self, tweet_id: str, media_json: str) -> None:
         with self._lock:
             self._db.execute(
@@ -118,7 +136,7 @@ class Store:
         with self._lock:
             rows = self._db.execute(
                 "SELECT id, created_at, author_name, author_handle, text, "
-                "       is_retweet, rt_handle, media, url "
+                "       is_retweet, rt_handle, media, url, translated "
                 "FROM tweets ORDER BY CAST(id AS INTEGER) DESC "
                 "LIMIT ? OFFSET ?",
                 (per_page, lo),
@@ -135,6 +153,7 @@ class Store:
                 "rt_handle": r[6],
                 "media": json.loads(r[7] or "[]"),
                 "url": r[8],
+                "translated": r[9] or "",
             }
             out.append(d)
         return out

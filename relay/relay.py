@@ -47,6 +47,7 @@ def load_config(path: str) -> dict:
         "poll_count": 30,       # 每次拉多少条
         "page_size": 12,        # 每页候选条数（实际按版面裁剪）
         "title": "X · Following",
+        "translate": "",        # 机翻目标语言；留空禁用（免费后端不稳定，暂默认关）
         "data_dir": os.path.join(BASE, "data"),
         "font": "",             # 留空=自动找中文字体
         "browser": "brave",     # 会话失效时自动导入 Cookie 的浏览器（可逗号分隔多个）
@@ -446,7 +447,7 @@ def cmd_run(args) -> None:
         cfg["mock"] = True
     store = Store(cfg["db_file"])
     store.set_meta("started", time.strftime("%Y-%m-%d %H:%M:%S"))
-    renderer = Renderer(cfg["media_dir"], cfg["title"], cfg.get("font", ""))
+    renderer = Renderer(cfg["media_dir"], cfg["title"], cfg.get("font", ""), prefer_zh=bool(cfg.get("translate", "")))
 
     if cfg["mock"]:
         if store.count() == 0:
@@ -494,7 +495,7 @@ def cmd_run(args) -> None:
 def cmd_render(args) -> None:
     cfg = load_config(args.config)
     store = Store(cfg["db_file"])
-    renderer = Renderer(cfg["media_dir"], cfg["title"], cfg.get("font", ""))
+    renderer = Renderer(cfg["media_dir"], cfg["title"], cfg.get("font", ""), prefer_zh=bool(cfg.get("translate", "")))
     if store.count() == 0:
         seed_mock(store, cfg["media_dir"])
     tweets = store.fetch_page(0, 10 ** 6)

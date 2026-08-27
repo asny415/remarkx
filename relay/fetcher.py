@@ -1,8 +1,8 @@
-"""X (Twitter) 抓取器：基于 twikit，登录小号，拉取 Home -> Following 时间线。
+"""X (Twitter) 抓取器：基于 twikit，登录小号，拉取 Home -> For You 时间线。
 
 用法（在 relay.py 中）：
   await fetcher.login(...)   # 首次：交互式登录，保存会话
-  await fetcher.poll()       # 按需调用：拉取新推文 + 下载图片
+  await fetcher.poll()       # 按需调用：拉取新推文 + 下载图片 + 机翻中文
 """
 
 import asyncio
@@ -106,24 +106,21 @@ class Fetcher:
     # ------------------------------------------------------------------ #
 
     async def poll(self) -> int:
-        """拉取最新一页时间线，入库新推文并下载图片，返回新推文数。"""
+        """拉取最新一页 For You 时间线，入库新推文+图片+译文，返回新推文数。"""
         client = await self.ensure_client()
         try:
-            result = await client.get_latest_timeline(self.poll_count)
+            result = await client.get_timeline(self.poll_count)
         except Exception as e:
             raise self._classify(e) from e
         self._timeline = result
         return await self._ingest(client, result)
 
     async def poll_extend(self) -> int:
-        """续抓更早的时间线（cursor 向后翻），用于"书读不完"。
-
-        首次 extend 时从最近一次 poll 的结果继续向后翻。
-        """
+        """续抓更早的 For You 时间线（cursor 向后翻），用于"书读不完"。"""
         client = await self.ensure_client()
         try:
             if self._timeline is None:
-                result = await client.get_latest_timeline(self.poll_count)
+                result = await client.get_timeline(self.poll_count)
             else:
                 result = await self._timeline.next()
         except Exception as e:
@@ -132,15 +129,25 @@ class Fetcher:
         return await self._ingest(client, result)
 
     async def _ingest(self, client, result) -> int:
-        new_count = 0
+        from translator import Translator
+
+        new_items = []
         for tweet in result:
             item = self._normalize(tweet)
             if item is None:
                 continue
             await self._download_media(client, item)
             if self.store.upsert_tweet(item):
-                new_count += 1
-        return new_count
+                new_items.append(item)
+        # 机翻中文（仅新推文；失败不影响主流程）
+        tr = Translator(self.cfg)
+        if tr.enabled and new_items:
+            try:
+                await tr.translate_items(
+                    new_items, lambda i, zh: self.store.update_translation(i, zh))
+            except Exception as e:
+                log.warning("翻译批次失败: %s", e)
+        return len(new_items)
 
     def _classify(self, e: Exception) -> XError:
         """把底层异常翻译成对用户友好的错误（会话失效 -> SessionError）。"""

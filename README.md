@@ -43,11 +43,11 @@ scp build/xr root@<rm2>:/home/root/xreader/xr
 ```
 长按顶部中央(≥0.7s, 位移≤40px)
   → hello-hotkey(常驻小进程, 只听手指触摸, 笔迹免疫)
-  → run-reader.sh: 先弹确认菜单 [启动阅读器] [取消]（10s 自动取消）
-  → 确认后进入阅读器；退出/取消均自动拉回原生 xochitl
+  → run-reader.sh: 直接进入阅读器
+  → 退出阅读器(顶部下滑)自动拉回原生 xochitl
 ```
 
-误触率归零： accidental 碰撞需要"长按住 + 再点一次按钮"两个刻意动作。
+误触率极低：需要"按住 0.7 秒以上且基本不动"，抓握/轻碰不会触发。
 安装：
 
 ```bash

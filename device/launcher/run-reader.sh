@@ -9,6 +9,4 @@ export QT_QUICK_BACKEND=epaper
 export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=inverty
 
 /home/root/xreader/xr -platform epaper
-# 返回书架主页而非自动打开特殊书
-sed -i 's/^LastOpen=.*/LastOpen=/' /home/root/.config/remarkable/xochitl.conf
 systemctl start xochitl

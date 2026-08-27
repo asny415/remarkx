@@ -5,6 +5,8 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
+#include <QSet>
+#include <algorithm>
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -73,8 +75,36 @@ void PageStore::start()
         m_entries = o["entries"].toArray();
         bf.close();
     }
+    cleanupOnStartup();
     setStatus("正在连接中转站…");
     fetchStatus();
+}
+
+// 只有带笔迹的页面（.draw.png 存在）会连同其页面 PNG 一起保留，
+// 其余缓存 PNG 全部删除，避免占用空间（需要的页面浏览时会按需重新下载）。
+void PageStore::cleanupOnStartup()
+{
+    QSet<QString> keep;
+    for (int i = 0; i < m_entries.size(); ++i) {
+        const QJsonObject e = m_entries.at(i).toObject();
+        if (!e["has_draw"].toBool())
+            continue;
+        const QString num = e["number"].toString();
+        keep.insert(num + ".png");
+        keep.insert(num + ".draw.png");
+    }
+    QDir dir(m_bookDir);
+    const QFileInfoList files =
+        dir.entryInfoList(QStringList{"*.png"}, QDir::Files);
+    int removed = 0;
+    for (const QFileInfo &fi : files) {
+        if (!keep.contains(fi.fileName())) {
+            QFile::remove(fi.absoluteFilePath());
+            ++removed;
+        }
+    }
+    if (removed)
+        qInfo() << "cleanupOnStartup: removed" << removed << "cached pages";
 }
 
 void PageStore::fetchStatus()
@@ -106,22 +136,73 @@ void PageStore::onStatus(QNetworkReply *reply)
 
 void PageStore::updateLabel()
 {
+    if (m_mode == FavMode) {
+        const int n = favCount();
+        m_bookLabel = QString("收藏 %1/%2")
+                          .arg(qBound(1, m_favIndex + 1, qMax(n, 1)))
+                          .arg(n);
+        return;
+    }
     m_bookLabel = QString("第 %1 页 · 共 %2 页")
                       .arg(m_feedPage + 1)
                       .arg(m_totalPages);
+}
+
+// 收藏页 = 所有带笔迹(has_draw)的书页，按编号（时间）升序
+QList<QString> PageStore::favNumbers() const
+{
+    QList<QString> out;
+    for (int i = 0; i < m_entries.size(); ++i) {
+        const QJsonObject e = m_entries.at(i).toObject();
+        if (e["has_draw"].toBool())
+            out.append(e["number"].toString());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+int PageStore::favCount() const
+{
+    return favNumbers().size();
+}
+
+void PageStore::enterFav(int index)
+{
+    const QList<QString> nums = favNumbers();
+    if (nums.isEmpty())
+        return;
+    index = qBound(0, index, nums.size() - 1);
+    saveInkNow();
+    m_mode = FavMode;
+    m_favIndex = index;
+    m_downloading = -1;
+    m_loading = false;
+    loadLocal(nums.at(index));
+    updateLabel();
+    emit stateChanged();
 }
 
 void PageStore::refresh()
 {
     saveInkNow();
     m_version.clear();
-    goPage(0, true);
+    goPage(0, true);       // 刷新总是落在新内容第 1 页
 }
 
 void PageStore::next()
 {
     if (m_loading || m_downloading >= 0) {
         qInfo() << "next ignored: busy";
+        return;
+    }
+    if (m_mode == FavMode) {
+        if (m_favIndex + 1 < favCount()) {
+            enterFav(m_favIndex + 1);
+        } else {
+            qInfo() << "fav last -> feed page 0";
+            m_mode = FeedMode;
+            goPage(0, false);
+        }
         return;
     }
     if (m_feedPage + 1 < m_totalPages) {
@@ -138,10 +219,21 @@ void PageStore::prev()
         qInfo() << "prev ignored: busy";
         return;
     }
+    if (m_mode == FavMode) {
+        if (m_favIndex > 0)
+            enterFav(m_favIndex - 1);
+        return;
+    }
     if (m_feedPage > 0) {
         goPage(m_feedPage - 1, false);
     } else {
-        qInfo() << "prev at first page: no-op";
+        // 第 1 页继续上一页 → 进入收藏（带笔迹页）浏览
+        if (favCount() > 0) {
+            qInfo() << "prev at first page -> fav view";
+            enterFav(favCount() - 1);
+        } else {
+            qInfo() << "prev at first page: no fav pages";
+        }
     }
 }
 
@@ -214,6 +306,7 @@ void PageStore::pollStatus(int attempts)
 void PageStore::goPage(int n, bool force)
 {
     saveInkNow();
+    m_mode = FeedMode;
     m_feedPage = n;
     m_downloading = n;
     m_loading = true;
@@ -245,8 +338,21 @@ int PageStore::entryIndex(const QString &version, int feedPage) const
 
 void PageStore::loadLocal(const QString &number)
 {
-    m_currentNumber = number;
+    // 缓存被启动清理掉的页面：回退为按该条目记录的 feed 页重新下载
     const QString base = m_bookDir + "/" + number;
+    if (!QFile::exists(base + ".png")) {
+        for (int i = 0; i < m_entries.size(); ++i) {
+            const QJsonObject e = m_entries.at(i).toObject();
+            if (e["number"].toString() == number) {
+                qInfo() << "loadLocal: cache missing for" << number
+                        << "-> re-download feed page" << e["feed_page"].toInt();
+                m_mode = FeedMode;
+                downloadPage(e["feed_page"].toInt(), false);
+                return;
+            }
+        }
+    }
+    m_currentNumber = number;
     m_currentFile = "file://" + base + ".png";
     m_downloading = -1;
     m_loading = false;

@@ -49,6 +49,8 @@ signals:
     void errorChanged();
 
 private:
+    enum Mode { FeedMode, FavMode };
+
     void goPage(int n, bool force);
     void loadLocal(const QString &number);
     void downloadPage(int n, bool force);
@@ -65,6 +67,11 @@ private:
     int entryIndex(const QString &version, int feedPage) const;
     void setStatus(const QString &s);
     void updateLabel();
+    // 收藏（带笔迹）页相关
+    QList<QString> favNumbers() const;
+    int favCount() const;
+    void enterFav(int index);
+    void cleanupOnStartup();
 
     QString m_relay;
     QString m_bookDir;
@@ -89,4 +96,6 @@ private:
     QString m_error;
     QString m_bookLabel;
     int m_extendTarget = -1;
+    Mode m_mode = FeedMode;
+    int m_favIndex = 0;
 };

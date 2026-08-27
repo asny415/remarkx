@@ -38,23 +38,21 @@ scp build/xr root@<rm2>:/home/root/xreader/xr
 
 ### 启动机制（`device/launcher/`）
 
-设备主用途是读电子书，因此不做常驻阅读器，采用**原生观感的确认菜单**方案：
+设备主用途是读电子书，因此不做常驻阅读器。启动入口**嵌在原生书架里**：
 
 ```
-长按顶部中央(≥0.7s, 位移≤40px)
-  → hello-hotkey(常驻小进程, 只听手指触摸, 笔迹免疫)
-  → run-reader.sh: 直接进入阅读器
-  → 退出阅读器(顶部下滑)自动拉回原生 xochitl
+书架中有一本特殊书「remarkx 阅读器」（自动生成，封面即说明页）
+  → 点开它：hello-hotkey(常驻小进程) 检测到该书 lastOpened 变化
+  → run-reader.sh: 停 xochitl，直接进入阅读器
+  → 退出阅读器(顶部下滑)：自动回书架，并复位 LastOpen 避免自动重开特殊书
 ```
 
-误触率极低：需要"按住 0.7 秒以上且基本不动"，抓握/轻碰不会触发。
-安装：
+备选手势：**长按顶部中央**(≥0.7s、位移≤40px，仅手指、笔迹免疫) 同样可启动。
+守护进程两种触发并存；只认手指，书写时不会误触。
 
-```bash
-${CC} -O2 -o hello-hotkey device/launcher/hello-hotkey.c   # SDK 交叉编译
-scp device/launcher/{hello-hotkey,run-reader.sh} ...
-# hello-hotkey 放 /home/root/hello-launch/，服务 hello-hotkey.service 开机自启
-```
+安装：`${CC} -O2 -o hello-hotkey device/launcher/hello-hotkey.c`（SDK 交叉编译），
+部署到 `/home/root/hello-launch/`，服务 `hello-hotkey.service` 开机自启；
+特殊书由 `device/launcher/setup-book.sh` 生成（克隆现有 PDF 文档结构，见脚本内注释）。
 
 ## 中转站 `relay/`
 

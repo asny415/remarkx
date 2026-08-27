@@ -33,6 +33,7 @@ class Fetcher:
                          str(config.get("browser", "brave")).split(",")
                          if b.strip()]
         self._client = None
+        self._timeline = None
 
     # ------------------------------------------------------------------ #
     # 会话恢复
@@ -105,13 +106,32 @@ class Fetcher:
     # ------------------------------------------------------------------ #
 
     async def poll(self) -> int:
-        """拉取一页时间线，入库新推文并下载图片，返回新推文数。"""
+        """拉取最新一页时间线，入库新推文并下载图片，返回新推文数。"""
         client = await self.ensure_client()
         try:
             result = await client.get_latest_timeline(self.poll_count)
         except Exception as e:
             raise self._classify(e) from e
+        self._timeline = result
+        return await self._ingest(client, result)
 
+    async def poll_extend(self) -> int:
+        """续抓更早的时间线（cursor 向后翻），用于"书读不完"。
+
+        首次 extend 时从最近一次 poll 的结果继续向后翻。
+        """
+        client = await self.ensure_client()
+        try:
+            if self._timeline is None:
+                result = await client.get_latest_timeline(self.poll_count)
+            else:
+                result = await self._timeline.next()
+        except Exception as e:
+            raise self._classify(e) from e
+        self._timeline = result
+        return await self._ingest(client, result)
+
+    async def _ingest(self, client, result) -> int:
         new_count = 0
         for tweet in result:
             item = self._normalize(tweet)
@@ -156,13 +176,15 @@ class Fetcher:
 
             media = []
             for m in (orig.media or []):
-                if getattr(m, "type", "") != "photo":
-                    continue  # 只要静态图片；视频/GIF 跳过
+                mtype = getattr(m, "type", "") or "photo"
+                if mtype not in ("photo", "video", "animated_gif"):
+                    continue
                 media.append({
                     "url": m.media_url or m.url,
                     "w": int(m.width or 0),
                     "h": int(m.height or 0),
                     "path": "",
+                    "type": "video" if mtype != "photo" else "photo",
                 })
 
             return {

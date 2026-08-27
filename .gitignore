@@ -15,3 +15,17 @@ venv/
 
 # 本地渲染产物
 page*.png
+
+# 构建产物（Qt 交叉编译输出）
+xreader-app/build/
+*.o
+
+# 设备软件包
+device/*.ipk
+
+# 实验性目录（临时探索用，不入库）
+hello-experiment/
+
+# 日志
+*.log
+nohup.out

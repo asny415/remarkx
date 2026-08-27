@@ -233,17 +233,29 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
         "fetching": False,
         "cache": {},        # page -> (version, png bytes)
         "inflight": set(),  # 正在预渲染的页码
+        "layout": None,
+        "layout_v": None,
     }
 
-    async def ensure_fresh() -> None:
-        """服务首页前确保数据新鲜：过期才抓；已有抓取在进行则等它完成。"""
-        if fetcher is None or not _is_stale(store, cfg):
+    def get_layout():
+        version = _data_version(store)
+        if state.get("layout_v") != version:
+            tweets = store.fetch_page(0, 10 ** 6)
+            state["layout"] = renderer.paginate(tweets)
+            state["layout_v"] = version
+        return state["layout"]
+
+    async def ensure_fresh(force: bool = False) -> None:
+        """服务首页前确保数据新鲜：过期才抓（force=1 则强制抓）；已有抓取则等它。"""
+        if fetcher is None:
+            return
+        if not force and not _is_stale(store, cfg):
             return
         if state["lock"].locked():
             async with state["lock"]:
                 pass  # 等进行中的抓取结束，下面会重新判断是否还过期
         async with state["lock"]:
-            if not _is_stale(store, cfg):
+            if not force and not _is_stale(store, cfg):
                 return
             state["fetching"] = True
             log.info("数据已过期，按需从 X 抓取 ...")
@@ -259,12 +271,38 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
             finally:
                 state["fetching"] = False
 
+    async def extend_older() -> None:
+        """读者接近书尾时向 X 续抓更早内容（低频，让书永远翻不完）。"""
+        if fetcher is None or state["fetching"]:
+            return
+        m = store.get_meta("last_extend")
+        if m:
+            try:
+                t0 = time.mktime(time.strptime(m, "%Y-%m-%d %H:%M:%S"))
+                if time.time() - t0 < 30:
+                    return
+            except ValueError:
+                pass
+        async with state["lock"]:
+            if state["fetching"]:
+                return
+            state["fetching"] = True
+            try:
+                n = await fetcher.poll_extend()
+                log.info("续抓更早内容 %d 条", n)
+                store.set_meta("last_extend",
+                               time.strftime("%Y-%m-%d %H:%M:%S"))
+                store.set_meta("last_poll", time.strftime("%Y-%m-%d %H:%M:%S"))
+            except XError as e:
+                log.warning("续抓失败: %s", e)
+            except Exception as e:  # noqa: BLE001
+                log.exception("续抓异常")
+            finally:
+                state["fetching"] = False
+
     async def render_png(page: int, per: int) -> bytes:
-        total_pages = max(1, -(-store.count() // per))
-        tweets = store.fetch_page(page, per)
-        status = store.status()
-        img = await asyncio.to_thread(
-            renderer.render_page, tweets, page, total_pages, status)
+        pages = get_layout()
+        img = await asyncio.to_thread(renderer.render_page, pages, page)
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=True)
         return buf.getvalue()
@@ -290,28 +328,32 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
         except ValueError:
             p = 0
         p = max(0, p)
-        per = int(cfg["page_size"])
+        force = request.query.get("force", "") == "1"
         if p == 0:
-            await ensure_fresh()
-        total_pages = max(1, -(-store.count() // per))
-        if p > total_pages:
-            p = total_pages - 1
+            await ensure_fresh(force=force)
+        pages = get_layout()
+        total_pages = len(pages)
+        if p > total_pages - 1:
+            p = max(0, total_pages - 1)
+        # 读到接近书尾时，异步续抓更早内容
+        if fetcher is not None and total_pages > 0 and p >= total_pages - 2:
+            asyncio.create_task(extend_older())
         version = _data_version(store)
         hit = state["cache"].get(p)
         if hit and hit[0] == version:
             data = hit[1]
         else:
-            data = await render_png(p, per)
+            data = await render_png(p, int(cfg["page_size"]))
             if len(state["cache"]) > 32:
                 state["cache"].clear()
             state["cache"][p] = (version, data)
-        # 预渲染下一页：翻页秒开（旧版本残留条目不算命中）
+        # 预渲染下一页：翻页秒开
         nxt = p + 1
         nhit = state["cache"].get(nxt)
         if (nxt < total_pages
                 and not (nhit and nhit[0] == version)
                 and nxt not in state["inflight"]):
-            asyncio.create_task(prerender(nxt, per))
+            asyncio.create_task(prerender(nxt, int(cfg["page_size"])))
         return web.Response(body=data, content_type="image/png",
                             headers={"Cache-Control": "no-store"})
 
@@ -319,7 +361,23 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
         s = store.status()
         s["fetching"] = state["fetching"]
         s["stale"] = fetcher is not None and _is_stale(store, cfg)
+        s["pages"] = len(get_layout())
+        s["version"] = _data_version(store)
         return web.json_response(s)
+
+    async def h_layout(request: web.Request) -> web.Response:
+        try:
+            p = int(request.query.get("p", "0"))
+        except ValueError:
+            p = 0
+        pages = get_layout()
+        total = len(pages)
+        p = min(max(p, 0), max(0, total - 1))
+        return web.json_response({
+            "pages": total,
+            "p": p,
+            "cards": renderer.card_rects(pages)[p] if total else [],
+        })
 
     async def h_feed(request: web.Request) -> web.Response:
         try:
@@ -362,6 +420,7 @@ time        {s['now']}
     app.router.add_get("/page", h_page)
     app.router.add_get("/api/status", h_status)
     app.router.add_get("/api/feed", h_feed)
+    app.router.add_get("/api/layout", h_layout)
     app.router.add_get("/media/{path:.+}", h_media)
     app.router.add_get("/healthz", h_health)
     return app
@@ -438,11 +497,11 @@ def cmd_render(args) -> None:
     renderer = Renderer(cfg["media_dir"], cfg["title"], cfg.get("font", ""))
     if store.count() == 0:
         seed_mock(store, cfg["media_dir"])
-    tweets = store.fetch_page(0, int(cfg["page_size"]))
-    status = store.status()
-    img = renderer.render_page(tweets, 0, 1, status)
+    tweets = store.fetch_page(0, 10 ** 6)
+    pages = renderer.paginate(tweets)
+    img = renderer.render_page(pages, 0)
     img.save(args.out)
-    log.info("已渲染 %s (%dx%d)", args.out, W, H)
+    log.info("已渲染 %s (%dx%d)，共 %d 页", args.out, W, H, len(pages))
 
 
 def cmd_mockseed(args) -> None:

@@ -1,0 +1,11 @@
+[Unit]
+Description=Hello hotkey daemon
+After=multi-user.target
+
+[Service]
+ExecStart=/home/root/hello-launch/hello-hotkey
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

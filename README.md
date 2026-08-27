@@ -36,7 +36,25 @@ cmake -B build && cmake --build build   # 在 SDK 环境中
 scp build/xr root@<rm2>:/home/root/xreader/xr
 ```
 
-设备端启动脚本 `/home/root/xreader/run.sh`（负责环境变量与锁清理）。
+### 启动机制（`device/launcher/`）
+
+设备主用途是读电子书，因此不做常驻阅读器，采用**原生观感的确认菜单**方案：
+
+```
+长按顶部中央(≥0.7s, 位移≤40px)
+  → hello-hotkey(常驻小进程, 只听手指触摸, 笔迹免疫)
+  → run-reader.sh: 先弹确认菜单 [启动阅读器] [取消]（10s 自动取消）
+  → 确认后进入阅读器；退出/取消均自动拉回原生 xochitl
+```
+
+误触率归零： accidental 碰撞需要"长按住 + 再点一次按钮"两个刻意动作。
+安装：
+
+```bash
+${CC} -O2 -o hello-hotkey device/launcher/hello-hotkey.c   # SDK 交叉编译
+scp device/launcher/{hello-hotkey,run-reader.sh} ...
+# hello-hotkey 放 /home/root/hello-launch/，服务 hello-hotkey.service 开机自启
+```
 
 ## 中转站 `relay/`
 
@@ -63,12 +81,14 @@ curl http://<pc>:8788/api/status
 ## 仓库结构
 
 ```
-relay/          中转站（aiohttp 服务 + 抓取器 + 渲染器）
-xreader-app/    设备端 Qt6 应用源码
-device/         设备侧安装/卸载脚本
-deploy/         systemd 单元等部署资产
-hello-experiment/ 本地实验残留（已 ignore）
+relay/            中转站（aiohttp 服务 + 抓取器 + 渲染器 + 可选翻译管线）
+xreader-app/      设备端 Qt6 应用源码（阅读器 + 启动确认菜单 --menu 模式）
+device/launcher/  启动机制：hello-hotkey 长按守护 + run-reader.sh + 服务单元
+deploy/           systemd 单元等部署资产（remarkx-relay.service）
 ```
+
+> 历史遗留：早期 rM1（rmkit/simple）与 rm2fb 方案的脚本已删除，
+> 如需追溯见 git 历史。
 
 ## 安全说明
 

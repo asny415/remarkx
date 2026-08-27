@@ -298,9 +298,9 @@ class Renderer:
             ensure_page()
             chunk = {"t": t, "x": col_x(cur.col), "w": COL_W,
                      "col": cur.col, "y": cur.y, "h": 0,
-                     "is_cont": is_cont, "ops": []}
-            # 顶部留白；续排块额外给“┆续”标记留一行高
-            chunk["h"] += PAD_TOP + (24 if is_cont else 0)
+                     "is_cont": is_cont, "has_cont": False, "ops": []}
+            # 顶部留白（续排块同样只留标准内边距，无标记字符）
+            chunk["h"] = PAD_TOP
             cur.y = chunk["y"] + chunk["h"]
             pages[cur.p]["cards"].append(chunk)
             return chunk
@@ -359,6 +359,7 @@ class Renderer:
             def close():
                 nonlocal chunk
                 if chunk is not None:
+                    chunk["has_cont"] = True     # 后面还有续排段：无下边框
                     chunk_was_split[0] = True
                 chunk = None
 
@@ -424,18 +425,34 @@ class Renderer:
     # 绘制单个 chunk
     # ------------------------------------------------------------------ #
 
+    def _card_border(self, draw, x, y0, y1, w, top: bool, bottom: bool):
+        """卡片边框：续接段按需省略上/下边框（左右边线始终保留）。"""
+        l, r = x + 1, x + w - 1
+        rad = 10
+        draw.line([l, y0, l, y1], fill=CARD_BORDER, width=2)
+        draw.line([r, y0, r, y1], fill=CARD_BORDER, width=2)
+        if top:
+            draw.line([l, y0, r, y0], fill=CARD_BORDER, width=2)
+            draw.arc([l, y0, l + 2 * rad, y0 + 2 * rad], 180, 270,
+                     fill=CARD_BORDER, width=2)
+            draw.arc([r - 2 * rad, y0, r, y0 + 2 * rad], 270, 360,
+                     fill=CARD_BORDER, width=2)
+        if bottom:
+            draw.line([l, y1, r, y1], fill=CARD_BORDER, width=2)
+            draw.arc([l, y1 - 2 * rad, l + 2 * rad, y1], 90, 180,
+                     fill=CARD_BORDER, width=2)
+            draw.arc([r - 2 * rad, y1 - 2 * rad, r, y1], 0, 90,
+                     fill=CARD_BORDER, width=2)
+
     def draw_card(self, page: Image.Image, draw, card: dict):
         t = card["t"]
         x, y, w, h = card["x"], card["y"], card["w"], card["h"]
-
-        draw.rounded_rectangle([x + 1, y + 1, x + w - 1, y + max(h, MIN_CHUNK_H) - 1],
-                               radius=10, outline=CARD_BORDER, width=2)
+        has_top = not card.get("is_cont")     # 续前段 → 无上边框
+        has_bot = not card.get("has_cont")    # 有后续段 → 无下边框
+        if y1 := y + max(h, 4):
+            self._card_border(draw, x, y, y1, w, has_top, has_bot)
 
         px = x + PAD
-
-        if card.get("is_cont"):
-            fc = self.font(20)
-            draw.text((px, y + PAD_TOP - 18), "┆续", font=fc, fill=FG_FAINT)
 
         for kind, payload in card["ops"]:
             if kind == "head":
@@ -445,9 +462,9 @@ class Renderer:
             elif kind == "line":
                 yy, ln = payload
                 if ln:
-                    f_text = self.font(30)
-                    safe = self._ellipsize(draw, ln, f_text, TEXT_W)
-                    draw.text((px, yy), safe, font=f_text, fill=FG)
+                    # 行文本由 wrap_text 保证宽度（悬挂标点除外，属有意超宽），
+                    # 直接绘制，不做二次省略
+                    draw.text((px, yy), ln, font=self.font(30), fill=FG)
 
     def _avatar(self, t: dict):
         """加载作者头像并做圆形裁剪；无图返回 None。"""

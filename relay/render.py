@@ -55,6 +55,8 @@ _EMOJI_RE = re.compile(
     "]"
 )
 _URL_RE = re.compile(r"https?://\S+")
+# 行首禁则：闭合标点不出现在行首 → 悬挂到上一行行尾（允许轻微超宽）
+_CLOSING_PUNCT = "，。、；：！？）》〉」』】〕”’…％℃"
 
 _FONT_CANDIDATES = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -132,45 +134,69 @@ class Renderer:
             text = text[:-1]
         return text + "…"
 
+    @staticmethod
+    def _wrap_units(text: str) -> list:
+        """把文本拆成断行原子：
+        - 连续英文字母/数字（含 don't、e-mail 这类内联符号）为一个原子，
+          保证英文单词永不截断；
+        - CJK 汉字及标点逐字成原子（中文允许任意断行，填满每一行）；
+        - 空白串为一个原子（行尾悬挂丢弃，不留到下一行行首）。
+        """
+        units = []
+        for m in re.finditer(r"[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*|\s+|\S",
+                             text):
+            units.append(m.group(0))
+        return units
+
     def wrap_text(self, draw, text: str, font, max_width: float,
                   max_lines: int) -> list:
-        """按像素宽度折行；CJK 逐字断行，ASCII 优先按空格断行。"""
+        """按像素宽度贪心折行。
+
+        中英混排策略：英文单词作为整体不可拆；汉字逐字断行，
+        因此行尾遇到放不下的英文单词时，前面的中文仍会继续
+        填充当前行，不留大片空白。
+        """
         lines = []
-        for raw in text.splitlines():
-            if not raw:
+
+        def emit(line):
+            line = line.rstrip()
+            if line:
+                lines.append(line)
+            elif not lines or lines[-1] != "":
+                # 保留有意的空行（段落间隔），但不叠加
                 lines.append("")
+
+        for raw in text.splitlines():
+            if not raw.strip():
+                emit("")
                 continue
             line = ""
-            for token in re.findall(r"\S+|\s+", raw):
-                if re.match(r"^\s+$", token):
-                    line += token
+            for u in self._wrap_units(raw):
+                if self._text_width(draw, line + u, font) <= max_width:
+                    line += u
                     continue
-                if self._text_width(draw, token, font) > max_width:
-                    for ch in token:
-                        if line and self._text_width(draw, line + ch, font) \
-                                > max_width:
-                            lines.append(line)
-                            line = ""
-                        line += ch
+                # 放不下该原子
+                if u.isspace():
+                    continue                       # 行尾空格直接悬挂丢弃
+                # 行首禁则：闭合标点悬挂到本行行尾（略超宽也保留）
+                if u in _CLOSING_PUNCT and line:
+                    line += u
                     continue
-                if self._text_width(draw, line + token, font) <= max_width:
-                    line += token
-                    continue
-                r = line.rstrip().rsplit(" ", 1)
-                if len(r) == 2:
-                    lines.append(r[0])
-                    line = r[1] + " "
-                else:
-                    lines.append(line.rstrip())
+                if line.rstrip():
+                    emit(line)
                     line = ""
-                if line and self._text_width(draw, line + token, font) \
-                        <= max_width:
-                    line += token
-                else:
-                    lines.append(token)
-                    line = ""
-            if line.rstrip():
-                lines.append(line.rstrip())
+                    # 新行放得下则直接放（整词/CJK 单字都适用）
+                    if self._text_width(draw, u, font) <= max_width:
+                        line = u
+                        continue
+                # 空行仍放不下（超长英文单词）→ 逐字符硬拆
+                for ch in u:
+                    if line and self._text_width(draw, line + ch,
+                                                 font) > max_width:
+                        emit(line)
+                        line = ""
+                    line += ch
+            emit(line)
             if len(lines) >= max_lines + 1:
                 break
         if len(lines) > max_lines:

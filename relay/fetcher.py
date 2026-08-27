@@ -137,6 +137,7 @@ class Fetcher:
             if item is None:
                 continue
             await self._download_media(client, item)
+            await self._download_avatar(client, item)
             if self.store.upsert_tweet(item):
                 new_items.append(item)
         # 机翻中文（仅新推文；失败不影响主流程）
@@ -209,6 +210,10 @@ class Fetcher:
                 ),
                 "media": media,
                 "url": f"https://x.com/{handle}/status/{t.id}",
+                "avatar": (
+                    (getattr(author, "profile_image_url", "") or "")
+                    .replace("_normal.", "_bigger.")
+                ),
             }
         except Exception as e:
             log.warning("跳过无法解析的推文: %s", e)
@@ -239,6 +244,35 @@ class Fetcher:
         # 下载完成后更新数据库里的 media 列表（含本地路径）
         import json
         self._update_media(item)
+
+    async def _download_avatar(self, client, item: dict) -> None:
+        """下载作者头像（按用户名缓存），成功后把相对路径写回 item。"""
+        url = item.get("avatar") or ""
+        if not url or self._client is None:
+            return
+        handle = item.get("author_handle") or "unknown"
+        av_dir = os.path.join(self.media_dir, "avatars")
+        os.makedirs(av_dir, exist_ok=True)
+        ext = ".jpg"
+        for e in (".png", ".webp"):
+            if url.lower().endswith(e):
+                ext = e
+                break
+        path = os.path.join(av_dir, f"{handle}{ext}")
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            item["avatar"] = os.path.relpath(path, self.media_dir)
+            return
+        try:
+            resp = await client.http.get(url, timeout=30)
+            if resp.status_code != 200:
+                log.warning("头像下载 %s -> HTTP %s", url[:80],
+                            resp.status_code)
+                return
+            with open(path, "wb") as f:
+                f.write(resp.content)
+            item["avatar"] = os.path.relpath(path, self.media_dir)
+        except Exception as e:
+            log.warning("头像下载失败 %s: %s", url[:80], e)
 
     def _update_media(self, item: dict) -> None:
         import json

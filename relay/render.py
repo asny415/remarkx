@@ -96,6 +96,9 @@ class Renderer:
         self._fonts = {}
         self._measure_img = Image.new("RGB", (2, 2))
         self._measure_draw = ImageDraw.Draw(self._measure_img)
+        self._avatar_cache = {}          # path -> (circle_img, size)
+        self.avatar_d = 56               # 头像直径
+        self.avatar_gap = 14             # 头像与文字间距
 
     def font(self, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         key = (size, bold)
@@ -420,6 +423,28 @@ class Renderer:
                     safe = self._ellipsize(draw, ln, f_text, TEXT_W)
                     draw.text((px, yy), safe, font=f_text, fill=FG)
 
+    def _avatar(self, t: dict):
+        """加载作者头像并做圆形裁剪；无图返回 None。"""
+        rel = t.get("avatar") or ""
+        if not rel:
+            return None
+        if rel in self._avatar_cache:
+            return self._avatar_cache[rel]
+        path = os.path.join(self.media_dir, rel)
+        try:
+            img = Image.open(path).convert("RGB")
+            d = self.avatar_d
+            img = img.resize((d, d), Image.LANCZOS)
+            mask = Image.new("L", (d, d), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, d - 1, d - 1], fill=255)
+            out = Image.new("RGB", (d, d), "#ffffff")
+            out.paste(img, (0, 0), mask)
+            self._avatar_cache[rel] = out
+            return out
+        except Exception as e:
+            log.warning("头像加载失败 %s: %s", rel, e)
+            return None
+
     def _draw_head(self, page, draw, t, px, py):
         f_name = self.font(26, bold=True)
         f_dim = self.font(24)
@@ -429,20 +454,40 @@ class Renderer:
         if t.get("is_retweet"):
             prefix = "RT @" + (t.get("rt_handle") or "?") + " "
 
+        # 头像（有图用图，无图画名字首字占位），文字整体右移
+        av = self._avatar(t)
+        tx = px
+        if av:
+            page.paste(av, (px, py + 2))
+            tx = px + self.avatar_d + self.avatar_gap
+        else:
+            d = self.avatar_d
+            cy = py + 2 + d // 2
+            draw.ellipse([px, py + 2, px + d, py + 2 + d],
+                         fill="#e8e8e8")
+            ch = (name or "?")[0]
+            f_av = self.font(30, bold=True)
+            w = self._text_width(draw, ch, f_av)
+            draw.text((px + (d - w) / 2, cy - 18), ch,
+                      font=f_av, fill="#666666")
+            tx = px + d + self.avatar_gap
+
+        # 名字行从头像右侧开始；单行可用宽度相应收缩
+        name_w = TEXT_W - self.avatar_d - self.avatar_gap
         combo_plain = (prefix + name + "  " + handle)
-        if self._text_width(draw, combo_plain, f_name) <= TEXT_W:
-            wx = 0
+        if self._text_width(draw, combo_plain, f_name) <= name_w:
+            wx = tx
             if prefix:
                 wp = int(self._text_width(draw, prefix, f_dim))
-                draw.text((px + wx, py + 4), prefix, font=f_dim, fill=FG_FAINT)
+                draw.text((wx, py + 6), prefix, font=f_dim, fill=FG_FAINT)
                 wx += wp
-            draw.text((px + wx, py), name, font=f_name, fill=FG)
+            draw.text((wx, py + 2), name, font=f_name, fill=FG)
             wn = int(self._text_width(draw, name, f_name))
-            draw.text((px + wx + wn + 10, py + 5), handle,
+            draw.text((wx + wn + 10, py + 7), handle,
                       font=f_dim, fill=FG_DIM)
         else:
-            combo = self._ellipsize(draw, combo_plain, f_dim, TEXT_W)
-            draw.text((px, py), combo, font=f_dim, fill=FG_DIM)
+            combo = self._ellipsize(draw, combo_plain, f_dim, name_w)
+            draw.text((tx, py + 2), combo, font=f_dim, fill=FG_DIM)
         py += NAME_H + 6
 
         f_meta = self.font(22)
@@ -455,7 +500,8 @@ class Renderer:
         if n_imgs:
             metas.append(f"{n_imgs} 图")
         meta_line = " · ".join(x for x in metas if x)
-        draw.text((px, py), self._ellipsize(draw, meta_line, f_meta, TEXT_W),
+        draw.text((tx, py),
+                  self._ellipsize(draw, meta_line, f_meta, name_w),
                   font=f_meta, fill=FG_FAINT)
 
     def _draw_img(self, page, draw, info, px):

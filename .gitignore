@@ -29,3 +29,6 @@ hello-experiment/
 # 日志
 *.log
 nohup.out
+
+# 杂物
+*.apk

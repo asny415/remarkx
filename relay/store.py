@@ -28,9 +28,10 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-# 旧库平滑迁移：tweets 增加译文列（已存在则忽略）
+# 旧库平滑迁移：tweets 增加扩展列（已存在则忽略）
 _MIGRATIONS = [
     "ALTER TABLE tweets ADD COLUMN translated TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE tweets ADD COLUMN avatar TEXT NOT NULL DEFAULT ''",
 ]
 
 
@@ -80,8 +81,8 @@ class Store:
             cur = self._db.execute(
                 "INSERT OR IGNORE INTO tweets "
                 "(id, created_at, author_name, author_handle, text, "
-                " is_retweet, rt_handle, media, url) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                " is_retweet, rt_handle, media, url, avatar) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     str(t["id"]),
                     t.get("created_at", ""),
@@ -92,6 +93,7 @@ class Store:
                     t.get("rt_handle", ""),
                     json.dumps(t.get("media", []), ensure_ascii=False),
                     t.get("url", ""),
+                    t.get("avatar", ""),
                 ),
             )
             self._db.commit()
@@ -136,7 +138,7 @@ class Store:
         with self._lock:
             rows = self._db.execute(
                 "SELECT id, created_at, author_name, author_handle, text, "
-                "       is_retweet, rt_handle, media, url, translated "
+                "       is_retweet, rt_handle, media, url, translated, avatar "
                 "FROM tweets ORDER BY CAST(id AS INTEGER) DESC "
                 "LIMIT ? OFFSET ?",
                 (per_page, lo),
@@ -154,6 +156,7 @@ class Store:
                 "media": json.loads(r[7] or "[]"),
                 "url": r[8],
                 "translated": r[9] or "",
+                "avatar": r[10] or "",
             }
             out.append(d)
         return out

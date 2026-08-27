@@ -199,7 +199,9 @@ class Fetcher:
                 "created_at": t.created_at,
                 "author_name": name,
                 "author_handle": handle,
-                "text": (orig.text or "").strip(),
+                # 长推(note_tweet)用全文，避免 X 时间线接口返回的截断文本
+                "text": (getattr(orig, "full_text", None)
+                         or orig.text or "").strip(),
                 "is_retweet": t.retweeted_tweet is not None,
                 "rt_handle": (
                     (t.user.screen_name if t.user else "").lstrip("@")

@@ -59,6 +59,9 @@ _URL_RE = re.compile(r"https?://\S+")
 _CLOSING_PUNCT = "，。、；：！？）》〉」』】〕”’…％℃"
 
 _FONT_CANDIDATES = [
+    # 设备同款字体（方正书宋，GBK 全覆盖），与 reMarkable 阅读体验一致；
+    # 放 relay/fonts/（不入库，见 .gitignore），由 device 上复制而来
+    "fonts/fangzhengshusong.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
@@ -71,9 +74,10 @@ _FONT_CANDIDATES = [
 
 
 def find_cjk_font() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
     for p in _FONT_CANDIDATES:
-        if os.path.exists(p):
-            return p
+        if os.path.exists(p) or os.path.exists(os.path.join(here, p)):
+            return p if os.path.isabs(p) else os.path.join(here, p)
     return ""
 
 
@@ -101,6 +105,7 @@ class Renderer:
         self._avatar_cache = {}          # path -> (circle_img, size)
         self.avatar_d = 56               # 头像直径
         self.avatar_gap = 14             # 头像与文字间距
+        self._coverage = self._load_coverage(self.font_path)
 
     def font(self, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         key = (size, bold)
@@ -118,6 +123,32 @@ class Renderer:
     # ------------------------------------------------------------------ #
     # 文本工具
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _load_coverage(font_path: str):
+        """用 fontTools 读取字体 cmap，返回支持的码点集合；失败返回 None（不过滤）。"""
+        try:
+            from fontTools.ttLib import TTFont
+            f = TTFont(font_path, lazy=True, fontNumber=0)
+            cov = set()
+            for table in f["cmap"].tables:
+                if table.isUnicode():
+                    cov |= set(table.cmap.keys())
+            f.close()
+            log.info("字体覆盖集: %s (%d 码点)", font_path, len(cov))
+            return cov
+        except Exception as e:
+            log.warning("字体覆盖集加载失败，跳过缺字过滤: %s", e)
+            return None
+
+    def _filter_glyphs(self, text: str) -> str:
+        """剥离当前字体不支持的字形，杜绝方块。"""
+        if self._coverage is None or not text:
+            return text
+        cov = self._coverage
+        return "".join(
+            ch for ch in text
+            if ch in "\n\t " or ord(ch) in cov)
 
     @staticmethod
     def _text_width(draw, text, font) -> float:
@@ -249,8 +280,8 @@ class Renderer:
     def _card_text(self, t: dict) -> str:
         # 配置开启翻译且该推有中文译文 → 显示译文；否则原文
         if self.prefer_zh and t.get("translated"):
-            return clean_text(t["translated"])
-        return clean_text(t.get("text", ""))
+            return clean_text(self._filter_glyphs(t["translated"]))
+        return clean_text(self._filter_glyphs(t.get("text", "")))
 
     def _card_media(self, t: dict) -> list:
         return [m for m in t.get("media", []) if m.get("path")]
@@ -491,8 +522,8 @@ class Renderer:
     def _draw_head(self, page, draw, t, px, py):
         f_name = self.font(26, bold=True)
         f_dim = self.font(24)
-        name = t.get("author_name") or "?"
-        handle = "@" + (t.get("author_handle") or "")
+        name = self._filter_glyphs(t.get("author_name") or "?") or "?"
+        handle = "@" + self._filter_glyphs(t.get("author_handle") or "")
         prefix = ""
         if t.get("is_retweet"):
             prefix = "RT @" + (t.get("rt_handle") or "?") + " "
@@ -542,7 +573,7 @@ class Renderer:
         n_imgs = len(media) - len(videos)
         if n_imgs:
             metas.append(f"{n_imgs} 图")
-        meta_line = " · ".join(x for x in metas if x)
+        meta_line = self._filter_glyphs(" · ".join(x for x in metas if x))
         draw.text((tx, py),
                   self._ellipsize(draw, meta_line, f_meta, name_w),
                   font=f_meta, fill=FG_FAINT)

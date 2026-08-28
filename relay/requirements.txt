@@ -6,3 +6,4 @@ aiohttp>=3.9
 yt-dlp>=2024.8.6
 # Linux 下解密 Chrome/Brave 的 v11 加密 Cookie 需要读系统 keyring（GNOME/KWallet）
 secretstorage>=3.3
+fontTools>=4.0

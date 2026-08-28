@@ -322,6 +322,12 @@ def build_app(cfg: dict, store: MemStore, renderer: Renderer, fetcher=None):
 
     async def render_png(page: int, per: int) -> bytes:
         pages = get_layout()
+        if pages:
+            page = min(max(page, 0), len(pages) - 1)
+        # 媒体懒加载：渲染该页前并发补下本页推文的图片/头像（已缓存跳过）
+        if fetcher is not None and pages:
+            await fetcher.ensure_media(
+                [c["t"] for c in pages[page]["cards"]])
         img = await asyncio.to_thread(renderer.render_page, pages, page)
         buf = io.BytesIO()
         img.save(buf, format="PNG", optimize=True)

@@ -234,21 +234,24 @@ class Fetcher:
         return await self._ingest(items)
 
     async def _ingest(self, items: list) -> tuple:
+        # 媒体改为按页懒加载（见 ensure_media）：抓取阶段只入库不下载，
+        # 渲染某页前才并发补下该页推文的图片/头像，首屏不再被全量下载拖慢。
         new = 0
-        # 媒体图片经代理串行下载是最慢的环节（实测占单次抓取 ~12s/35条），
-        # 并行下载大幅缩短首次抓取耗时；已缓存的图片在 _download_media 里直接跳过。
-        sem = asyncio.Semaphore(4)
-
-        async def one(item):
-            async with sem:
-                await self._download_media(item)
-                await self._download_avatar(item)
-
-        await asyncio.gather(*(one(it) for it in items))
         for item in items:
             if self.store.upsert_tweet(item):
                 new += 1
         return items, new
+
+    async def ensure_media(self, tweets: list) -> None:
+        """按需下载给定推文的缺失媒体/头像（已缓存自动跳过）。"""
+        sem = asyncio.Semaphore(4)
+
+        async def one(t):
+            async with sem:
+                await self._download_media(t)
+                await self._download_avatar(t)
+
+        await asyncio.gather(*(one(t) for t in tweets if t))
 
     # ------------------------------------------------------------------ #
     # 响应解析

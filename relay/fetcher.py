@@ -235,9 +235,17 @@ class Fetcher:
 
     async def _ingest(self, items: list) -> tuple:
         new = 0
+        # 媒体图片经代理串行下载是最慢的环节（实测占单次抓取 ~12s/35条），
+        # 并行下载大幅缩短首次抓取耗时；已缓存的图片在 _download_media 里直接跳过。
+        sem = asyncio.Semaphore(4)
+
+        async def one(item):
+            async with sem:
+                await self._download_media(item)
+                await self._download_avatar(item)
+
+        await asyncio.gather(*(one(it) for it in items))
         for item in items:
-            await self._download_media(item)
-            await self._download_avatar(item)
             if self.store.upsert_tweet(item):
                 new += 1
         return items, new
@@ -488,7 +496,18 @@ class Fetcher:
         os.makedirs(self.media_dir, exist_ok=True)
         cli = self._dl_client()
         for i, (m, pre) in enumerate(jobs):
-            path = os.path.join(self.media_dir, f"{item['id']}_{pre}{i}.jpg")
+            # 文件名按 tweet id 稳定，已存在的直接复用，避免每次 force 拉取都重下
+            base = os.path.join(self.media_dir, f"{item['id']}_{pre}{i}")
+            cached = None
+            for ext in (".jpg", ".png"):
+                p = base + ext
+                if os.path.exists(p) and os.path.getsize(p) > 0:
+                    cached = p
+                    break
+            if cached:
+                m["path"] = os.path.relpath(cached, self.media_dir)
+                continue
+            path = base + ".jpg"
             try:
                 resp = await cli.get(m["url"])
                 if resp.status_code != 200:
@@ -497,8 +516,7 @@ class Fetcher:
                     continue
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 if "png" in ctype:
-                    path = os.path.join(self.media_dir,
-                                        f"{item['id']}_{pre}{i}.png")
+                    path = base + ".png"
                 with open(path, "wb") as f:
                     f.write(resp.content)
                 m["path"] = os.path.relpath(path, self.media_dir)

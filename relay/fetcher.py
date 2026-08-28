@@ -31,6 +31,8 @@ _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 # count/includePromotedContent 与网页端真实请求一致（无头浏览器抓包对比：
 # 网页端 count=20, includePromotedContent=true，程序此前写成了 30/false）
 _OP_PATH = "wp06oo3fRGU4P1sK8rECqQ/HomeTimeline"
+# Following（正在关注）时间线：queryId 取自网页端 JS bundle（2026-08）
+_OP_FOLLOWING = "BLQWpfVqtgBqAqwRRJcJjA/HomeLatestTimeline"
 _VARIABLES = {"count": 20, "includePromotedContent": True,
               "requestContext": "launch", "withCommunity": True}
 _FEATURES = {
@@ -97,7 +99,8 @@ class Fetcher:
                          if b.strip()]
         self._api = None          # 带 Cookie 的 API 客户端
         self._dl = None           # 无 Cookie 的下载客户端（pbs.twimg.com 等）
-        self._cursor = None       # 向后翻页游标（内存态，重启即失）
+        self._cursor = None       # For You 向后翻页游标（内存态，重启即失）
+        self._cursor_following = None  # Following 向后翻页游标
 
     # ------------------------------------------------------------------ #
     # 会话
@@ -182,10 +185,14 @@ class Fetcher:
     # 抓取
     # ------------------------------------------------------------------ #
 
-    async def _fetch_page(self, cursor: str = None) -> dict:
+    async def _fetch_page(self, cursor: str = None,
+                          op: str = _OP_PATH,
+                          variables_extra: dict = None) -> dict:
         cli = await self.ensure_client()
         variables = dict(_VARIABLES)
         variables["count"] = max(1, min(self.poll_count, 50))
+        if variables_extra:
+            variables.update(variables_extra)
         if cursor:
             variables["cursor"] = cursor
         params = {
@@ -193,7 +200,7 @@ class Fetcher:
             "features": json.dumps(_FEATURES, separators=(",", ":")),
         }
         try:
-            r = await cli.get(f"https://x.com/i/api/graphql/{_OP_PATH}",
+            r = await cli.get(f"https://x.com/i/api/graphql/{op}",
                               params=params)
         except httpx.HTTPError as e:
             raise XError(f"网络错误: {e}") from e
@@ -210,28 +217,67 @@ class Fetcher:
         except ValueError as e:
             raise XError(f"响应不是 JSON: {r.text[:200]}") from e
 
-    async def poll(self) -> tuple:
-        """拉取最新一页 For You 时间线，入库新推文+图片。
+    async def _fetch_following(self, cursor: str = None) -> dict:
+        """拉取 Following（正在关注）时间线，顺时序。"""
+        return await self._fetch_page(
+            cursor=cursor, op=_OP_FOLLOWING,
+            variables_extra={"includePromotedContent": False})
 
-        返回 (本轮时间线全部条目, 新入库条数)。刷新即阅读内容的重建。
+    @staticmethod
+    def _merge(fy: list, fl: list) -> list:
+        """For You + Following 按推文 id 去重后 1:1 交错合并。
+
+        两组内容在书里交错排列，翻页一起翻；同一条推文只出现一次。
         """
-        data = await self._fetch_page()
-        items, self._cursor = self._parse_timeline(data)
-        return await self._ingest(items)
+        seen = set()
+        out = []
+        i = j = 0
+        while i < len(fy) or j < len(fl):
+            if i < len(fy):
+                t = fy[i]
+                if t["id"] not in seen:
+                    seen.add(t["id"])
+                    out.append(t)
+                i += 1
+            if j < len(fl):
+                t = fl[j]
+                if t["id"] not in seen:
+                    seen.add(t["id"])
+                    out.append(t)
+                j += 1
+        return out
+
+    async def poll(self) -> tuple:
+        """拉取最新一页 For You + Following 时间线，合并入库。
+
+        返回 (合并后本轮全部条目, 新入库条数)。刷新即阅读内容的重建。
+        """
+        fy_data = await self._fetch_page()
+        fy_items, self._cursor = self._parse_timeline(fy_data)
+        fl_data = await self._fetch_following()
+        fl_items, self._cursor_following = self._parse_timeline(fl_data)
+        merged = self._merge(fy_items, fl_items)
+        return await self._ingest(merged)
 
     async def poll_extend(self) -> tuple:
-        """续抓更早的 For You 时间线（cursor 向后翻），用于"书读不完"。
+        """续抓 For You + Following 更早内容（各自 cursor 向后翻），合并追加。
 
         返回同 poll()。
         """
-        cursor = self._cursor
-        if cursor:
-            data = await self._fetch_page(cursor=cursor)
-        else:
-            log.info("尚无翻页游标，本次拉取最新一页")
-            data = await self._fetch_page()
-        items, self._cursor = self._parse_timeline(data)
-        return await self._ingest(items)
+        if self._cursor or self._cursor_following:
+            fy_batch, fl_batch = [], []
+            if self._cursor:
+                data = await self._fetch_page(cursor=self._cursor)
+                fy_batch, self._cursor = self._parse_timeline(data)
+            if self._cursor_following:
+                data = await self._fetch_following(
+                    cursor=self._cursor_following)
+                fl_batch, self._cursor_following = self._parse_timeline(data)
+            merged = self._merge(fy_batch, fl_batch)
+            if merged:
+                return await self._ingest(merged)
+        log.info("尚无翻页游标，本次拉取最新一页")
+        return await self.poll()
 
     async def _ingest(self, items: list) -> tuple:
         # 媒体改为按页懒加载（见 ensure_media）：抓取阶段只入库不下载，

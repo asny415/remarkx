@@ -246,16 +246,45 @@ Window {
         Column {
             anchors.centerIn: parent
             spacing: 40
-            Text {
+
+            Row {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "⏼ 正在休眠"
-                font.pixelSize: 64
-                font.bold: true
-                color: "#1a1a1a"
+                spacing: 30
+
+                // 电源图标（圆环+竖线），避免依赖系统字体的特殊字形
+                Canvas {
+                    width: 64
+                    height: 64
+                    anchors.verticalCenter: parent.verticalCenter
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.strokeStyle = "#1a1a1a"
+                        ctx.lineWidth = 7
+                        ctx.lineCap = "round"
+                        var cx = width / 2, cy = height / 2 + 6, r = 22
+                        ctx.beginPath()
+                        ctx.arc(cx, cy, r, -Math.PI / 2 + 0.55,
+                                -Math.PI / 2 - 0.55, false)
+                        ctx.stroke()
+                        ctx.beginPath()
+                        ctx.moveTo(cx, cy - r - 8)
+                        ctx.lineTo(cx, cy - r + 10)
+                        ctx.stroke()
+                    }
+                }
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "正在休眠"
+                    font.pixelSize: 64
+                    font.bold: true
+                    color: "#1a1a1a"
+                }
             }
+
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "按电源键唤醒，阅读进度已保存"
+                text: "即将自动休眠，按电源键唤醒，阅读进度已保存"
                 font.pixelSize: 30
                 color: "#666666"
             }

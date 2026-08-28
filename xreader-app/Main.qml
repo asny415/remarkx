@@ -30,7 +30,10 @@ Window {
         id: gest
         anchors.fill: parent
         property point pressPt
-        onPressed: (mouse) => pressPt = Qt.point(mouse.x, mouse.y)
+        onPressed: (mouse) => {
+            idleTimer.restart()
+            pressPt = Qt.point(mouse.x, mouse.y)
+        }
         onReleased: (mouse) => {
             const dx = mouse.x - pressPt.x
             const dy = mouse.y - pressPt.y
@@ -269,6 +272,30 @@ Window {
         }
     }
 
+    // 空闲自动休眠：60s 无手势/笔/页面活动 → 与电源键相同的休眠流程
+    Timer {
+        id: idleTimer
+        interval: 60000
+        running: true
+        onTriggered: {
+            if (sleepOverlay.visible)
+                return
+            sleepOverlay.visible = true
+            suspendDelay.restart()
+        }
+    }
+    Connections {
+        target: stylusObj
+        function onPenDown(x, y, p) { idleTimer.restart() }
+        function onPenMove(x, y, p) { idleTimer.restart() }
+        function onEraserDown(x, y, p) { idleTimer.restart() }
+        function onEraserMove(x, y, p) { idleTimer.restart() }
+    }
+    Connections {
+        target: pageStore
+        function onStateChanged() { idleTimer.restart() }
+    }
+
     Timer {
         id: suspendDelay
         interval: 1600          // 等提示刷上墨水屏
@@ -282,7 +309,10 @@ Window {
     Timer {
         id: wakeClear
         interval: 6000
-        onTriggered: sleepOverlay.visible = false
+        onTriggered: {
+            sleepOverlay.visible = false
+            idleTimer.restart()
+        }
     }
 
     // 置顶边缘手势：任何时候可用（含加载/错误/任意页面状态）
@@ -294,7 +324,10 @@ Window {
         width: parent.width
         height: 140
         enabled: stylusObj.calibrated
-        onPressed: (m) => p0 = Qt.point(m.x, m.y)
+        onPressed: (m) => {
+            idleTimer.restart()
+            p0 = Qt.point(m.x, m.y)
+        }
         onReleased: (m) => {
             if (m.y - p0.y >= 90)
                 pageStore.quit()
@@ -307,7 +340,10 @@ Window {
         width: parent.width
         height: 140
         enabled: stylusObj.calibrated
-        onPressed: (m) => p1 = Qt.point(m.x, m.y)
+        onPressed: (m) => {
+            idleTimer.restart()
+            p1 = Qt.point(m.x, m.y)
+        }
         onReleased: (m) => {
             if (p1.y - m.y >= 90)
                 pageStore.refresh()

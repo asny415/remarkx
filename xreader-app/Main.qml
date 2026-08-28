@@ -301,10 +301,10 @@ Window {
         }
     }
 
-    // 空闲自动休眠：60s 无手势/笔/页面活动 → 与电源键相同的休眠流程
+    // 空闲自动休眠：5 分钟无手势/笔/页面活动 → 与电源键相同的休眠流程
     Timer {
         id: idleTimer
-        interval: 60000
+        interval: 300000
         running: true
         onTriggered: {
             if (sleepOverlay.visible)

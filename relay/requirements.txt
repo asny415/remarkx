@@ -1,6 +1,5 @@
-# twifork = twikit 的维护版 fork（drop-in 替换，import twikit 不变）
-# 上游 twikit 已停更且被 X 2026 新客户端（x-web）打破，twifork 持续跟进
-twifork>=2.3.5
+# fetcher 已改为直接发带 Cookie 的 GraphQL 请求，不再依赖 twikit
+httpx>=0.27
 pillow>=10.0
 aiohttp>=3.9
 yt-dlp>=2024.8.6

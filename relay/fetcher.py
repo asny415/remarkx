@@ -1,15 +1,76 @@
-"""X (Twitter) 抓取器：基于 twikit，登录小号，拉取 Home -> For You 时间线。
+"""X (Twitter) 抓取器：直接发带 Cookie 的 GraphQL 请求拉 For You 时间线。
+
+不走 twikit——X 网页端的自动翻译（Grok 译文）直接内嵌在时间线响应里
+（tweet_results.result.grok_translated_post_with_availability），本抓取器
+优先保存译文，没有译文时才用原文。
 
 用法（在 relay.py 中）：
-  await fetcher.login(...)   # 首次：交互式登录，保存会话
-  await fetcher.poll()       # 按需调用：拉取新推文 + 下载图片 + 机翻中文
+  await fetcher.poll()        # 拉取新推文 + 下载图片（译文优先）
+  await fetcher.poll_extend() # 用 cursor 续抓更早内容
+会话来自 data/session.json（{cookie名: 值}），可由 cookies_browser
+从本机浏览器自动导入；也可 python3 relay.py login 触发导入。
 """
 
 import asyncio
+import json
 import logging
 import os
 
+import httpx
+
 log = logging.getLogger("remarkx.fetch")
+
+# x.com 网页端公开 Bearer Token（所有匿名/登录请求共用；2026-08 已轮换，
+# 失效时从浏览器 DevTools 里 authorization 头重新复制）
+_BEARER = ("Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
+           "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA")
+_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+# For You 时间线（2026-08 从网页端实测捕获；queryId 变了就重新抓包）
+_OP_PATH = "wp06oo3fRGU4P1sK8rECqQ/HomeTimeline"
+_VARIABLES = {"count": 20, "includePromotedContent": False,
+              "requestContext": "launch", "withCommunity": True}
+_FEATURES = {
+    "rweb_video_screen_enabled": False,
+    "rweb_cashtags_enabled": True,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+    "responsive_web_profile_redirect_enabled": True,
+    "rweb_tipjar_consumption_enabled": False,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "premium_content_api_read_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": True,
+    "rweb_cashtags_composer_attachment_enabled": True,
+    "responsive_web_jetfuel_frame": True,
+    "responsive_web_grok_share_attachment_enabled": True,
+    "responsive_web_grok_annotations_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "rweb_conversational_replies_downvote_enabled": False,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "content_disclosure_indicator_enabled": True,
+    "content_disclosure_ai_generated_indicator_enabled": True,
+    "responsive_web_grok_show_grok_translated_post": True,
+    "responsive_web_grok_analysis_button_from_backend": True,
+    "post_ctas_fetch_enabled": False,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": False,
+    "responsive_web_grok_image_annotation_enabled": True,
+    "responsive_web_grok_imagine_annotation_enabled": True,
+    "responsive_web_grok_community_note_auto_translation_is_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+}
 
 
 class XError(Exception):
@@ -32,11 +93,12 @@ class Fetcher:
         self.browsers = [b.strip() for b in
                          str(config.get("browser", "brave")).split(",")
                          if b.strip()]
-        self._client = None
-        self._timeline = None
+        self._api = None          # 带 Cookie 的 API 客户端
+        self._dl = None           # 无 Cookie 的下载客户端（pbs.twimg.com 等）
+        self._cursor = None       # 向后翻页游标
 
     # ------------------------------------------------------------------ #
-    # 会话恢复
+    # 会话
     # ------------------------------------------------------------------ #
 
     def refresh_session(self) -> bool:
@@ -49,206 +111,305 @@ class Fetcher:
 
         if not try_import(self.browsers, self.session_file):
             return False
-        self._client = None
-        client = self._new_client()
-        client.load_cookies(self.session_file)
-        self._client = client
+        self._api = None
         return True
 
-    # ------------------------------------------------------------------ #
-    # 客户端
-    # ------------------------------------------------------------------ #
-
-    def _new_client(self):
-        import twikit
-
-        return twikit.Client(proxy=self.proxy)
-
-    async def ensure_client(self):
-        if self._client is not None:
-            return self._client
-        if not os.path.exists(self.session_file):
-            # 尚未登录也归为 SessionError：可尝试从浏览器导入 Cookie 自愈
-            raise SessionError("尚未登录（无会话文件）。"
-                               "可运行 python3 relay.py login，"
-                               "或在浏览器登录 x.com 后刷新首页自动导入")
-        client = self._new_client()
-        client.load_cookies(self.session_file)
-        self._client = client
-        return client
-
-    async def login(self, username: str, email: str = None,
+    async def login(self, username: str = "", email: str = None,
                     password: str = None, totp_secret: str = None):
-        """交互式登录（2FA 验证码在终端输入）。成功后保存会话文件。"""
-        import getpass
+        """兼容旧的 login 入口：直连 Cookie 模式不再支持密码登录，
+        改为从浏览器导入 Cookie。"""
+        if self.refresh_session():
+            log.info("已从浏览器导入 X Cookie: %s", self.session_file)
+            return
+        raise XError("无法获取登录态：请在浏览器登录 x.com 后重试"
+                     "（或确认 config.json 的 browser 指向已登录的浏览器）")
 
-        client = self._new_client()
-        username = username or input("账号(用户名/邮箱/手机号): ").strip()
-        email = email or input("备用邮箱(可选, 回车跳过): ").strip() or None
-        password = password or getpass.getpass("密码: ")
-        totp_secret = totp_secret or input(
-            "2FA secret(可选, 回车跳过): ").strip() or None
+    # ------------------------------------------------------------------ #
+    # HTTP 客户端
+    # ------------------------------------------------------------------ #
 
-        log.info("登录中，如出现 2FA 请在提示后输入验证码 ...")
-        await client.login(
-            auth_info_1=username,
-            auth_info_2=email,
-            password=password,
-            totp_secret=totp_secret,
-            cookies_file=self.session_file,
+    def _load_cookies(self) -> dict:
+        if not os.path.exists(self.session_file):
+            raise SessionError(
+                "尚未登录（无会话文件）。"
+                "可在浏览器登录 x.com 后运行 python3 relay.py login，"
+                "或刷新首页自动导入")
+        with open(self.session_file, encoding="utf-8") as f:
+            data = json.load(f)
+        # 兼容 twikit 会话文件（{"cookies": {...}} 或平铺 {名: 值}）
+        if isinstance(data, dict) and isinstance(data.get("cookies"), dict):
+            data = data["cookies"]
+        if "auth_token" not in data or "ct0" not in data:
+            raise SessionError("会话文件缺少 auth_token/ct0，登录态无效，"
+                               "请从浏览器重新导入 Cookie")
+        return data
+
+    def _cookie_header(self, c: dict) -> str:
+        parts = [f"{k}={c[k]}" for k in
+                 ("auth_token", "ct0", "twid", "guest_id") if c.get(k)]
+        return "; ".join(parts)
+
+    async def ensure_client(self) -> httpx.AsyncClient:
+        if self._api is not None:
+            return self._api
+        cookies = self._load_cookies()
+        self._api = httpx.AsyncClient(
+            proxy=self.proxy, timeout=30,
+            headers={
+                "User-Agent": _UA,
+                "Authorization": _BEARER,
+                "X-Csrf-Token": cookies["ct0"],
+                "X-Twitter-Auth-Type": "OAuth2Session",
+                "X-Twitter-Active-User": "yes",
+                "Cookie": self._cookie_header(cookies),
+                "Accept": "*/*",
+                "Referer": "https://x.com/",
+                "Origin": "https://x.com",
+            },
         )
-        self._client = client
-        log.info("登录成功，会话已保存: %s", self.session_file)
-        return client
+        return self._api
+
+    def _dl_client(self) -> httpx.AsyncClient:
+        """媒体下载用独立客户端，不携带 X 会话 Cookie。"""
+        if self._dl is None:
+            self._dl = httpx.AsyncClient(proxy=self.proxy, timeout=30,
+                                         headers={"User-Agent": _UA})
+        return self._dl
 
     # ------------------------------------------------------------------ #
     # 抓取
     # ------------------------------------------------------------------ #
 
-    async def poll(self) -> int:
-        """拉取最新一页 For You 时间线，入库新推文+图片+译文，返回新推文数。"""
-        client = await self.ensure_client()
+    async def _fetch_page(self, cursor: str = None) -> dict:
+        cli = await self.ensure_client()
+        variables = dict(_VARIABLES)
+        variables["count"] = max(1, min(self.poll_count, 50))
+        if cursor:
+            variables["cursor"] = cursor
+        params = {
+            "variables": json.dumps(variables, separators=(",", ":")),
+            "features": json.dumps(_FEATURES, separators=(",", ":")),
+        }
         try:
-            result = await client.get_timeline(self.poll_count)
-        except Exception as e:
-            raise self._classify(e) from e
-        self._timeline = result
-        return await self._ingest(client, result)
+            r = await cli.get(f"https://x.com/i/api/graphql/{_OP_PATH}",
+                              params=params)
+        except httpx.HTTPError as e:
+            raise XError(f"网络错误: {e}") from e
+        if r.status_code in (401, 403):
+            raise SessionError(f"登录态失效 (HTTP {r.status_code})，"
+                               "将从浏览器重新导入 Cookie")
+        if r.status_code == 429:
+            raise XError("被限流(429)，请把 poll_seconds 调大")
+        if r.status_code != 200:
+            raise XError(f"拉取时间线失败: HTTP {r.status_code} "
+                         f"{r.text[:200]}")
+        try:
+            return r.json()
+        except ValueError as e:
+            raise XError(f"响应不是 JSON: {r.text[:200]}") from e
+
+    async def poll(self) -> int:
+        """拉取最新一页 For You 时间线，入库新推文+图片，返回新推文数。
+
+        文本优先取 X（Grok）自动翻译的译文，没有译文才用原文。
+        """
+        data = await self._fetch_page()
+        items, self._cursor = self._parse_timeline(data)
+        return await self._ingest(items)
 
     async def poll_extend(self) -> int:
         """续抓更早的 For You 时间线（cursor 向后翻），用于"书读不完"。"""
-        client = await self.ensure_client()
-        try:
-            if self._timeline is None:
-                result = await client.get_timeline(self.poll_count)
-            else:
-                result = await self._timeline.next()
-        except Exception as e:
-            raise self._classify(e) from e
-        self._timeline = result
-        return await self._ingest(client, result)
+        cursor = self._cursor
+        if cursor:
+            data = await self._fetch_page(cursor=cursor)
+        else:
+            log.info("尚无翻页游标，本次拉取最新一页")
+            data = await self._fetch_page()
+        items, self._cursor = self._parse_timeline(data)
+        return await self._ingest(items)
 
-    async def _ingest(self, client, result) -> int:
-        from translator import Translator
-
+    async def _ingest(self, items: list) -> int:
         new_items = []
-        for tweet in result:
-            item = self._normalize(tweet)
-            if item is None:
-                continue
-            await self._download_media(client, item)
-            await self._download_avatar(client, item)
+        for item in items:
+            await self._download_media(item)
+            await self._download_avatar(item)
             if self.store.upsert_tweet(item):
                 new_items.append(item)
-        # 机翻中文（仅新推文；失败不影响主流程）
-        tr = Translator(self.cfg)
-        if tr.enabled and new_items:
-            try:
-                await tr.translate_items(
-                    new_items, lambda i, zh: self.store.update_translation(i, zh))
-            except Exception as e:
-                log.warning("翻译批次失败: %s", e)
         return len(new_items)
 
-    def _classify(self, e: Exception) -> XError:
-        """把底层异常翻译成对用户友好的错误（会话失效 -> SessionError）。"""
-        if isinstance(e, XError):
-            return e
-        try:
-            from twikit import errors as te
-        except ImportError:
-            te = None
-        if te is not None and isinstance(e, te.TwitterException):
-            if isinstance(e, (te.Unauthorized, te.Forbidden)):
-                return SessionError(f"登录态失效: {e}")
-            if isinstance(e, te.AccountLocked):
-                return XError("账号被临时锁定（可能触发风控），"
-                              "稍后再试或检查该账号是否异常")
-            if isinstance(e, te.AccountSuspended):
-                return XError("账号已被停用")
-            if isinstance(e, te.TooManyRequests):
-                return XError("被限流(429)，请把 poll_seconds 调大")
-        return XError(f"拉取时间线失败: {str(e)[:200]}")
-
     # ------------------------------------------------------------------ #
-    # 数据规整
+    # 响应解析
     # ------------------------------------------------------------------ #
 
-    def _normalize(self, t) -> dict:
-        """twikit.Tweet -> 内部 dict。retweeted 展开为原推文。"""
-        try:
-            orig = t.retweeted_tweet if t.retweeted_tweet is not None else t
-            author = orig.user or t.user
-            name = author.name if author else ""
-            handle = (author.screen_name if author else "").lstrip("@")
+    @staticmethod
+    def _unwrap_result(result: dict):
+        """TweetWithVisibilityResults -> 内层 Tweet。"""
+        if not isinstance(result, dict):
+            return None
+        if result.get("__typename") == "TweetWithVisibilityResults":
+            result = result.get("tweet") or {}
+        return result if result.get("__typename") == "Tweet" else None
 
-            media = []
-            for m in (orig.media or []):
-                mtype = getattr(m, "type", "") or "photo"
-                if mtype not in ("photo", "video", "animated_gif"):
+    def _parse_timeline(self, data: dict) -> tuple:
+        """GraphQL HomeTimeline JSON -> (items, bottom_cursor)。"""
+        items, cursor = [], None
+        try:
+            instructions = (data["data"]["home"]
+                            ["home_timeline_urt"]["instructions"])
+        except (KeyError, TypeError):
+            raise XError("时间线响应结构变化，无法解析")
+        for ins in instructions:
+            if ins.get("type") != "TimelineAddEntries":
+                continue
+            for entry in ins.get("entries", []):
+                eid = entry.get("entryId", "")
+                content = entry.get("content", {})
+                if eid.startswith("cursor-bottom") or \
+                        content.get("entryType") == "TimelineTimelineCursor":
+                    if "bottom" in eid or cursor is None:
+                        cursor = content.get("value") or cursor
                     continue
-                media.append({
-                    "url": m.media_url or m.url,
-                    "w": int(m.width or 0),
-                    "h": int(m.height or 0),
-                    "path": "",
-                    "type": "video" if mtype != "photo" else "photo",
-                })
+                if eid.startswith("promoted"):
+                    continue  # 广告
+                # TimelineTimelineItem: content.itemContent
+                # TimelineTimelineModule(线程): content.items[].item.itemContent
+                contents = [content.get("itemContent")]
+                if not contents[0] and isinstance(content.get("items"), list):
+                    contents = [it.get("item", {}).get("itemContent")
+                                for it in content["items"]]
+                for ic in contents:
+                    if not ic or ic.get("__typename") != "TimelineTweet":
+                        continue
+                    item = self._normalize(ic.get("tweet_results", {})
+                                           .get("result"))
+                    if item:
+                        items.append(item)
+        return items, cursor
 
+    def _normalize(self, result) -> dict:
+        """GraphQL tweet result -> 内部 dict；retweeted 展开为原推文。"""
+        try:
+            outer = self._unwrap_result(result)
+            if outer is None:
+                return None
+            legacy = outer.get("legacy", {})
+            rt = legacy.get("retweeted_status_result")
+            if rt:
+                orig = self._unwrap_result(rt.get("result"))
+                if orig is None:
+                    return None
+            else:
+                orig = outer
+
+            core = orig.get("core", {}).get("user_results", {}).get("result")
+            if not isinstance(core, dict):
+                core = {}
+            ucore = core.get("core") or {}       # 2026 版：name/screen_name 在 core
+            ulegacy = core.get("legacy") or {}   # 旧版兼容
+            name = ucore.get("name") or ulegacy.get("name", "")
+            handle = ((ucore.get("screen_name")
+                       or ulegacy.get("screen_name", "")) or "").lstrip("@")
+            avatar = ((core.get("avatar") or {}).get("image_url")
+                      or ulegacy.get("profile_image_url_https", "") or "")
+
+            # 译文优先：Grok 自动翻译内嵌在响应里
+            grok = (orig.get("grok_translated_post_with_availability") or {})
+            data = grok.get("data") or {}
+            translation = (data.get("translation") or "").strip()
+            olegacy = orig.get("legacy", {})
+            original = (self._note_text(orig)
+                        or olegacy.get("full_text", "")).strip()
+            if not original:
+                return None
+
+            media = self._media_list(orig)
             return {
-                "id": str(t.id),
-                "created_at": t.created_at,
+                "id": str(outer.get("rest_id")
+                          or legacy.get("id_str", "")),
+                "created_at": (outer.get("legacy", {}).get("created_at")
+                               or legacy.get("created_at", "")),
                 "author_name": name,
                 "author_handle": handle,
-                # 长推(note_tweet)用全文，避免 X 时间线接口返回的截断文本
-                "text": (getattr(orig, "full_text", None)
-                         or orig.text or "").strip(),
-                "is_retweet": t.retweeted_tweet is not None,
+                # 译文优先，无译文用原文
+                "text": translation or original,
+                "original_text": original,
+                "is_retweet": rt is not None,
                 "rt_handle": (
-                    (t.user.screen_name if t.user else "").lstrip("@")
-                    if t.retweeted_tweet is not None else ""
+                    (outer.get("core", {}).get("user_results", {})
+                     .get("result", {}).get("legacy", {})
+                     .get("screen_name", "") or "").lstrip("@")
+                    if rt else ""
                 ),
                 "media": media,
-                "url": f"https://x.com/{handle}/status/{t.id}",
-                "avatar": (
-                    (getattr(author, "profile_image_url", "") or "")
-                    .replace("_normal.", "_bigger.")
-                ),
+                "url": f"https://x.com/{handle}/status/"
+                       f"{outer.get('rest_id', legacy.get('id_str', ''))}",
+                "avatar": avatar.replace("_normal.", "_bigger."),
+                "lang": olegacy.get("lang", ""),
+                "source_lang": data.get("source_language", ""),
+                "dest_lang": data.get("destination_language", ""),
             }
         except Exception as e:
             log.warning("跳过无法解析的推文: %s", e)
             return None
 
-    async def _download_media(self, client, item: dict) -> None:
+    @staticmethod
+    def _note_text(tweet: dict) -> str:
+        """长推文（note_tweet）全文。"""
+        note = (tweet.get("note_tweet") or {}).get("note_tweet_results", {})
+        return ((note.get("result") or {}).get("text") or "").strip()
+
+    @staticmethod
+    def _media_list(tweet: dict) -> list:
+        media = ((tweet.get("legacy", {}).get("extended_entities") or {})
+                 .get("media") or [])
+        out = []
+        for m in media:
+            mtype = m.get("type", "") or "photo"
+            if mtype not in ("photo", "video", "animated_gif"):
+                continue
+            size = m.get("original_info", {}) or {}
+            out.append({
+                "url": m.get("media_url_https") or m.get("media_url", ""),
+                "w": int(size.get("width") or 0),
+                "h": int(size.get("height") or 0),
+                "path": "",
+                "type": "video" if mtype != "photo" else "photo",
+            })
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 媒体下载
+    # ------------------------------------------------------------------ #
+
+    async def _download_media(self, item: dict) -> None:
         """下载推文图片到 media_dir，成功后把本地相对路径写回 item。"""
         if not item["media"]:
             return
         os.makedirs(self.media_dir, exist_ok=True)
+        cli = self._dl_client()
         for i, m in enumerate(item["media"]):
             path = os.path.join(self.media_dir, f"{item['id']}_{i}.jpg")
             try:
-                resp = await client.http.get(m["url"], timeout=30)
+                resp = await cli.get(m["url"])
                 if resp.status_code != 200:
                     log.warning("媒体下载 %s -> HTTP %s", m["url"][:80],
                                 resp.status_code)
                     continue
-                data = resp.content
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 if "png" in ctype:
-                    path = os.path.join(self.media_dir, f"{item['id']}_{i}.png")
+                    path = os.path.join(self.media_dir,
+                                        f"{item['id']}_{i}.png")
                 with open(path, "wb") as f:
-                    f.write(data)
+                    f.write(resp.content)
                 m["path"] = os.path.relpath(path, self.media_dir)
             except Exception as e:
                 log.warning("媒体下载失败 %s: %s", m["url"][:80], e)
-        # 下载完成后更新数据库里的 media 列表（含本地路径）
-        import json
         self._update_media(item)
 
-    async def _download_avatar(self, client, item: dict) -> None:
+    async def _download_avatar(self, item: dict) -> None:
         """下载作者头像（按用户名缓存），成功后把相对路径写回 item。"""
         url = item.get("avatar") or ""
-        if not url or self._client is None:
+        if not url:
             return
         handle = item.get("author_handle") or "unknown"
         av_dir = os.path.join(self.media_dir, "avatars")
@@ -263,7 +424,7 @@ class Fetcher:
             item["avatar"] = os.path.relpath(path, self.media_dir)
             return
         try:
-            resp = await client.http.get(url, timeout=30)
+            resp = await self._dl_client().get(url)
             if resp.status_code != 200:
                 log.warning("头像下载 %s -> HTTP %s", url[:80],
                             resp.status_code)
@@ -275,6 +436,5 @@ class Fetcher:
             log.warning("头像下载失败 %s: %s", url[:80], e)
 
     def _update_media(self, item: dict) -> None:
-        import json
         self.store.update_media(
             item["id"], json.dumps(item["media"], ensure_ascii=False))

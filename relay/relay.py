@@ -163,7 +163,9 @@ def seed_mock(store: Store, media_dir: str, n: int = 14) -> None:
          "欢迎加入，GitHub 上认领 issue 即可。",
          [], False, 13),
     ]
-    for i, (name, handle, text, media, is_rt, mins) in enumerate(texts[:n]):
+    # 倒序插入：越新的推文越晚入库（seq 越大），渲染时排在最前
+    for i, (name, handle, text, media, is_rt, mins) in enumerate(
+            reversed(texts[:n])):
         dt = now - timedelta(minutes=mins * 7 + i)
         store.upsert_tweet({
             "id": str(1900000000000000000 + (len(texts[:n]) - 1 - i)),

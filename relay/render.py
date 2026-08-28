@@ -301,7 +301,10 @@ class Renderer:
         return clean_text(self._filter_glyphs(t.get("text", "")))
 
     def _card_media(self, t: dict) -> list:
-        return [m for m in t.get("media", []) if m.get("path")]
+        # 按 url（媒体是否存在于推文中）判断，而非 path（是否已下载）。
+        # 媒体改懒加载后，path 由 ensure_media 在渲染前补上；按 path 过滤会
+        # 在 paginate 阶段把媒体整体丢掉，导致页面不画图。
+        return [m for m in t.get("media", []) if m.get("url")]
 
     # ------------------------------------------------------------------ #
     # 分页（原子化流式布局）
@@ -329,7 +332,7 @@ class Renderer:
         排版阶段零 IO：用元数据宽高推算显示尺寸，真正的图片加载/缩放
         推迟到绘制阶段（带缓存）。ind>0 表示引用块内的缩进图。
         """
-        media = [m for m in media if m.get("path")]
+        media = [m for m in media if m.get("url")]
         if not media:
             return None
         m0 = media[0]
@@ -348,7 +351,8 @@ class Renderer:
         if not dhp:
             return None
         payload = {
-            "path": m0.get("path", ""), "dw": dwp, "dh": dhp,
+            # 持有媒体 dict 引用，绘制阶段读实时 path（懒加载下载完成后才非空）
+            "m": m0, "path": m0.get("path", ""), "dw": dwp, "dh": dhp,
             "is_video": m0.get("type") == "video",
             "n_media": len(media), "tw": tw, "ind": ind, "y": 0,
         }
@@ -711,10 +715,16 @@ class Renderer:
         py = info["y"]
         tw = info.get("tw") or TEXT_W
         ind = info.get("ind") or 0
-        key = (info["path"], dw_, dh)
+        # 懒加载：path 由 ensure_media 在渲染前写入媒体 dict，绘制时读实时值
+        m = info.get("m")
+        path = (m.get("path") if isinstance(m, dict) else "") \
+            or info.get("path", "")
+        if not path:
+            return  # 媒体尚未下载，留白（正常流程渲染前已下载，不应走到）
+        key = (path, dw_, dh)
         photo = self._resize_cache.get(key)
         if photo is None:
-            img = self._load_photo({"path": info["path"]})
+            img = self._load_photo({"path": path})
             if img is None:
                 return
             rz, dw_, dh = self._fit(img, tw, IMG_MAX_H)

@@ -28,8 +28,10 @@ _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 # For You 时间线（2026-08 从网页端实测捕获；queryId 变了就重新抓包）
+# count/includePromotedContent 与网页端真实请求一致（无头浏览器抓包对比：
+# 网页端 count=20, includePromotedContent=true，程序此前写成了 30/false）
 _OP_PATH = "wp06oo3fRGU4P1sK8rECqQ/HomeTimeline"
-_VARIABLES = {"count": 20, "includePromotedContent": False,
+_VARIABLES = {"count": 20, "includePromotedContent": True,
               "requestContext": "launch", "withCommunity": True}
 _FEATURES = {
     "rweb_video_screen_enabled": False,
@@ -267,9 +269,8 @@ class Fetcher:
             for entry in ins.get("entries", []):
                 eid = entry.get("entryId", "")
                 content = entry.get("content", {})
-                if eid.startswith("cursor-bottom") or \
-                        content.get("entryType") == "TimelineTimelineCursor":
-                    if "bottom" in eid or cursor is None:
+                if content.get("entryType") == "TimelineTimelineCursor":
+                    if "cursor-bottom" in eid:
                         cursor = content.get("value") or cursor
                     continue
                 if eid.startswith("promoted"):

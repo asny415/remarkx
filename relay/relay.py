@@ -264,7 +264,14 @@ def build_app(cfg: dict, store: MemStore, renderer: Renderer, fetcher=None):
             state["fetching"] = True
             log.info("数据已过期，按需从 X 抓取 ...")
             try:
+                # X 的 For You 时间线会轮流返回几份预计算的缓存排序；若这次
+                # 抓到与当前展示相同的变体（顶部 id 一致），再拉一次换一份，
+                # 模拟网页每次刷新内容都不同的体验。
                 batch, n = await poll_once()
+                old_top = store.latest().get("id") if store.count() else None
+                if batch and old_top and str(batch[0]["id"]) == old_top:
+                    log.info("本次排序与当前相同，再拉一次换一批")
+                    batch, n = await poll_once()
                 log.info("按需抓取完成，本次时间线 %d 条，新入库 %d 条",
                          len(batch), n)
                 if batch:

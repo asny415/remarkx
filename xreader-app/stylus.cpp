@@ -7,6 +7,7 @@
 #include <QtGui/6.8.2/QtGui/qpa/qwindowsysteminterface.h>
 #include <QGuiApplication>
 #include <QElapsedTimer>
+#include <QTimer>
 #include <linux/input.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -17,7 +18,16 @@ static const int SCREEN_H = 1872;
 static const qint64 TAP_MAX_MS = 400;
 static const qreal TAP_MAX_TRAVEL = 24.0;
 
-Stylus::Stylus(QObject *parent) : QObject(parent) {}
+Stylus::Stylus(QObject *parent) : QObject(parent)
+{
+    // 合成点击的鼠标事件在事件循环里稍后处理；期间保持 penActive，
+    // 避免被手势逻辑误判成手指滑动
+    m_tapTimer = new QTimer(this);
+    m_tapTimer->setSingleShot(true);
+    m_tapTimer->setInterval(300);
+    connect(m_tapTimer, &QTimer::timeout, this,
+            [this]() { setPenActive(false); });
+}
 
 Stylus::~Stylus()
 {
@@ -105,6 +115,14 @@ void Stylus::synthesizeTap(int x, int y)
     qInfo() << "TAP synthesized" << x << y;
 }
 
+void Stylus::setPenActive(bool active)
+{
+    if (m_penActive == active)
+        return;
+    m_penActive = active;
+    emit penActiveChanged();
+}
+
 void Stylus::touchPoint(bool eraser)
 {
     QPointF s = rawToScreen(m_lastX, m_lastY);
@@ -129,6 +147,7 @@ void Stylus::onData()
             } else if (ev.code == BTN_TOUCH) {
                 if (ev.value) {
                     m_touching = true;
+                    setPenActive(true);
                 } else if (m_touching) {
                     m_touching = false;
                     m_started = false;
@@ -139,9 +158,13 @@ void Stylus::onData()
                     if (!m_eraser && m_tapEnabled && m_calibrated
                         && dur < TAP_MAX_MS && m_travel < TAP_MAX_TRAVEL) {
                         synthesizeTap(int(m_pressPt.x()), int(m_pressPt.y()));
+                        // 合成的鼠标事件稍后处理：期间保持 penActive，
+                        // 笔抬起后再延时清除，防止手势误判
+                        m_tapTimer->start();
                         emit penUp();
                         return;
                     }
+                    setPenActive(false);
                     if (m_eraser)
                         emit eraserUp();
                     else

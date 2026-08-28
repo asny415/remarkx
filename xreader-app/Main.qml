@@ -36,25 +36,33 @@ Window {
         }
     }
 
+    // 全屏左右滑翻页（上下滑移交给顶部/底部边缘条，避免中间误触）
     MouseArea {
         id: gest
         anchors.fill: parent
         property point pressPt
+        property bool armed: false
         onPressed: (mouse) => {
             idleTimer.restart()
+            // 手写笔触摸不算手势
+            if (stylusObj.penActive)
+                return
+            armed = true
             pressPt = Qt.point(mouse.x, mouse.y)
         }
         onReleased: (mouse) => {
+            idleTimer.restart()
+            if (!armed)
+                return
+            armed = false
             const dx = mouse.x - pressPt.x
             const dy = mouse.y - pressPt.y
             const adx = Math.abs(dx)
             const ady = Math.abs(dy)
-            if (adx < 90 && ady < 90)
+            // 有效距离 + 主方向水平，移动一点点不算
+            if (adx < 90 || adx <= ady)
                 return
-            if (adx > ady)
-                dx < 0 ? pageStore.next() : pageStore.prev()
-            else
-                dy < 0 ? pageStore.refresh() : pageStore.quit()
+            dx < 0 ? pageStore.next() : pageStore.prev()
         }
     }
 
@@ -356,8 +364,10 @@ Window {
 
     // 置顶边缘手势：任何时候可用（含加载/错误/任意页面状态）
     // 顶部从上往下滑 → 退出；底部从下往上滑 → 刷新
+    // 只认从边缘开始的、距离足够的、手指（非手写笔）的垂直滑动
     MouseArea {
         property point p0
+        property bool armed: false
         x: 0
         y: 0
         width: parent.width
@@ -365,15 +375,26 @@ Window {
         enabled: stylusObj.calibrated
         onPressed: (m) => {
             idleTimer.restart()
+            if (stylusObj.penActive)
+                return
+            armed = true
             p0 = Qt.point(m.x, m.y)
         }
         onReleased: (m) => {
-            if (m.y - p0.y >= 90)
-                pageStore.quit()
+            idleTimer.restart()
+            if (!armed)
+                return
+            armed = false
+            const ady = m.y - p0.y
+            const adx = Math.abs(m.x - p0.x)
+            if (ady < 90 || ady <= adx)
+                return
+            pageStore.quit()
         }
     }
     MouseArea {
         property point p1
+        property bool armed: false
         x: 0
         y: parent.height - 140
         width: parent.width
@@ -381,11 +402,21 @@ Window {
         enabled: stylusObj.calibrated
         onPressed: (m) => {
             idleTimer.restart()
+            if (stylusObj.penActive)
+                return
+            armed = true
             p1 = Qt.point(m.x, m.y)
         }
         onReleased: (m) => {
-            if (p1.y - m.y >= 90)
-                pageStore.refresh()
+            idleTimer.restart()
+            if (!armed)
+                return
+            armed = false
+            const ady = p1.y - m.y
+            const adx = Math.abs(m.x - p1.x)
+            if (ady < 90 || ady <= adx)
+                return
+            pageStore.refresh()
         }
     }
 }

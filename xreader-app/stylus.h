@@ -3,6 +3,7 @@
 #include <QSocketNotifier>
 
 struct input_event;
+class QTimer;
 
 class Stylus : public QObject {
     Q_OBJECT
@@ -11,7 +12,10 @@ public:
     ~Stylus() override;
 
     Q_PROPERTY(bool calibrated READ calibrated NOTIFY calibChanged)
+    Q_PROPERTY(bool penActive READ penActive NOTIFY penActiveChanged)
     bool calibrated() const { return m_calibrated; }
+    // 手写笔是否处于使用中（笔按下，或刚合成过点击）。手势只在非 penActive 时生效。
+    bool penActive() const { return m_penActive; }
 
     bool start();
     Q_INVOKABLE void setCalib(qreal a, qreal b, qreal c,
@@ -23,6 +27,7 @@ public:
 
 signals:
     void calibChanged();
+    void penActiveChanged();
     void penDown(int x, int y, int pressure);
     void penMove(int x, int y, int pressure);
     void penUp();
@@ -35,10 +40,13 @@ private:
     void onData();
     void touchPoint(bool eraser);
     void synthesizeTap(int x, int y);
+    void setPenActive(bool active);
 
     int m_fd = -1;
     QSocketNotifier *m_not = nullptr;
+    QTimer *m_tapTimer = nullptr;
     bool m_touching = false;
+    bool m_penActive = false;
     bool m_eraser = false;
     bool m_started = false;
     int m_lastX = 0, m_lastY = 0, m_lastP = 0;

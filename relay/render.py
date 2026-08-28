@@ -103,6 +103,8 @@ class Renderer:
         self._measure_img = Image.new("RGB", (2, 2))
         self._measure_draw = ImageDraw.Draw(self._measure_img)
         self._avatar_cache = {}          # path -> (circle_img, size)
+        self._resize_cache = {}          # (path,dw,dh) -> resized photo
+        self._atom_cache = {}            # tweet id -> (lines, img_payload, img_h)
         self.avatar_d = 56               # 头像直径
         self.avatar_gap = 14             # 头像与文字间距
         self._coverage = self._load_coverage(self.font_path)
@@ -359,27 +361,43 @@ class Renderer:
             if not (t.get("text") or self._card_media(t)):
                 continue
 
-            # ---- 预生成原子与度量 ----
-            lines = []
-            text = self._card_text(t)
-            if text:
-                lines = self.wrap_text(draw, text, self.font(30),
-                                       TEXT_W, 100000)
-
-            img_payload = None
-            img_h = 0
-            media = self._card_media(t)
-            if media:
-                img = self._load_photo(media[0])
-                if img:
-                    rz, dwp, dhp = self._fit(img, TEXT_W, IMG_MAX_H)
-                    img_h = dhp + IMG_GAP
-                    img_payload = {
-                        "photo": rz, "dw": dwp, "dh": dhp,
-                        "is_video": media[0].get("type") == "video",
-                        "n_media": len(media),
-                        "y": 0,
-                    }
+            # ---- 原子准备（带 per-tweet 缓存：跨版本只测新推） ----
+            key = str(t.get("id") or id(t))
+            cached = self._atom_cache.get(key)
+            if cached is None:
+                lines = []
+                text = self._card_text(t)
+                if text:
+                    lines = self.wrap_text(draw, text, self.font(30),
+                                           TEXT_W, 100000)
+                img_payload = None
+                img_h = 0
+                media = self._card_media(t)
+                if media:
+                    # 排版阶段零 IO：用元数据宽高推算显示尺寸，
+                    # 真正的图片加载/缩放推迟到绘制阶段（带缓存）
+                    m0 = media[0]
+                    w0, h0 = int(m0.get("w") or 0), int(m0.get("h") or 0)
+                    if w0 > 0 and h0 > 0:
+                        scale = min(TEXT_W / w0, IMG_MAX_H / h0, 1.0)
+                        dwp = max(1, int(w0 * scale))
+                        dhp = max(1, int(h0 * scale))
+                    else:
+                        img = self._load_photo(m0)
+                        if img:
+                            _, dwp, dhp = self._fit(img, TEXT_W, IMG_MAX_H)
+                        else:
+                            dwp = dhp = 0
+                    if dhp:
+                        img_h = dhp + IMG_GAP
+                        img_payload = {
+                            "path": m0.get("path", ""), "dw": dwp, "dh": dhp,
+                            "is_video": m0.get("type") == "video",
+                            "n_media": len(media), "y": 0,
+                        }
+                cached = (lines, img_payload, img_h)
+                self._atom_cache[key] = cached
+            lines, img_payload, img_h = cached
 
             # ---- 放置：head(不可拆) → img(不可拆)? → 文本行逐行 ----
             # 需求必须包含“若需新开块”的顶部留白（续排块含┆续标记行高）
@@ -579,8 +597,17 @@ class Renderer:
                   font=f_meta, fill=FG_FAINT)
 
     def _draw_img(self, page, draw, info, px):
-        photo, dw_, dh = info["photo"], info["dw"], info["dh"]
+        dw_, dh = info["dw"], info["dh"]
         py = info["y"]
+        key = (info["path"], dw_, dh)
+        photo = self._resize_cache.get(key)
+        if photo is None:
+            img = self._load_photo({"path": info["path"]})
+            if img is None:
+                return
+            rz, dw_, dh = self._fit(img, TEXT_W, IMG_MAX_H)
+            photo = rz
+            self._resize_cache[key] = photo
         ix = px + (TEXT_W - dw_) // 2
         draw.rectangle([ix - 3, py - 3, ix + dw_ + 3, py + dh + 3],
                        outline=CARD_BORDER, width=2)

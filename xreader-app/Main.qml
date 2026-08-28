@@ -8,6 +8,8 @@ Window {
     height: Screen.height
     visible: true
     color: "white"
+    // 全屏刷新计数：每 3 页触发一次强制刷新
+    property int refreshCount: 0
 
     Image {
         id: pageImage
@@ -15,9 +17,12 @@ Window {
         source: pageStore.currentFile
         cache: false
         fillMode: Image.PreserveAspectFit
-        // 每页图片就绪后请求一次全屏强制刷新，清除墨水屏残影
+        // 每 3 页全屏强制刷新一次，清除墨水屏残影（每次都刷太慢）
         onStatusChanged: {
-            if (status === Image.Ready)
+            if (status !== Image.Ready)
+                return
+            root.refreshCount += 1
+            if (root.refreshCount % 3 === 0)
                 pageStore.requestFullRefresh()
         }
     }

@@ -4,6 +4,7 @@
 #include <QQuickPaintedItem>
 #include <QRect>
 
+class QTimer;
 class Stylus;
 
 class InkItem : public QQuickPaintedItem {
@@ -37,10 +38,21 @@ private slots:
 private:
     void strokeDown(int x, int y, int pressure, bool eraser);
     void strokeMove(int x, int y, int pressure, bool eraser);
+    // 笔迹段的紧致脏区（线段包围盒 + 笔宽半径），避免整块大矩形闪烁
+    QRect segmentRect(const QPointF &a, const QPointF &b) const;
+    // 直接写 8-bit pen 缓冲 + DU 快速波形下发，绕过框架慢路径；失败返回 false
+    bool fastSubmit(const QRect &region);
+    // 节流定时器到点：把近段时间累积的笔迹段合并成一次小区域提交
+    void flushInk();
+    // 翻页/清空时同步清掉 8-bit pen 叠加层，防止旧笔迹叠到新页上
+    void clearPenBuffer();
+
     QImage m_img;
     QPointF m_last;
     bool m_stroke = false;
     bool m_erase = false;
     qreal m_width = 4.0;
     bool m_hasInk = false;
+    QTimer *m_flushTimer = nullptr;
+    QRect m_pending;
 };

@@ -57,6 +57,7 @@ _EMOJI_RE = re.compile(
 _URL_RE = re.compile(r"https?://\S+")
 # 行首禁则：闭合标点不出现在行首 → 悬挂到上一行行尾（允许轻微超宽）
 _CLOSING_PUNCT = "，。、；：！？）》〉」』】〕”’…％℃"
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 
 _FONT_CANDIDATES = [
     # 设备同款字体（方正书宋，GBK 全覆盖），与 reMarkable 阅读体验一致；
@@ -87,6 +88,15 @@ def clean_text(text: str) -> str:
     text = _EMOJI_RE.sub("", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
+
+
+def _cjk_dominant(text: str) -> bool:
+    """中文字符占比是否足以采用两端对齐排版。"""
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) < 8:
+        return False
+    cjk = sum(1 for c in letters if _CJK_CHAR_RE.match(c))
+    return cjk / max(len(letters), 1) >= 0.3
 
 
 class Renderer:
@@ -395,9 +405,9 @@ class Renderer:
                             "is_video": m0.get("type") == "video",
                             "n_media": len(media), "y": 0,
                         }
-                cached = (lines, img_payload, img_h)
+                cached = (lines, img_payload, img_h, _cjk_dominant(text))
                 self._atom_cache[key] = cached
-            lines, img_payload, img_h = cached
+            lines, img_payload, img_h, justify = cached
 
             # ---- 放置：head(不可拆) → img(不可拆)? → 文本行逐行 ----
             # 需求必须包含“若需新开块”的顶部留白（续排块含┆续标记行高）
@@ -443,7 +453,8 @@ class Renderer:
                     chunk = open_chunk(bool(chunk_was_split[0]), t)
                 yy = grow(chunk, TEXT_LH)
                 ln = lines[li]
-                chunk["ops"].append(("line", (yy, ln)))
+                chunk["ops"].append(
+                    ("line", (yy, ln, justify, li == len(lines) - 1)))
                 li += 1
                 return True
 
@@ -509,11 +520,15 @@ class Renderer:
             elif kind == "img":
                 self._draw_img(page, draw, payload, px)
             elif kind == "line":
-                yy, ln = payload
+                yy, ln, justify, para_end = payload
                 if ln:
-                    # 行文本由 wrap_text 保证宽度（悬挂标点除外，属有意超宽），
-                    # 直接绘制，不做二次省略
-                    draw.text((px, yy), ln, font=self.font(30), fill=FG)
+                    # 行文本由 wrap_text 保证宽度（悬挂标点除外，属有意超宽）
+                    # 中文为主段落：除末行外两端对齐；其余语言左对齐
+                    if justify and not para_end:
+                        self._draw_justified(draw, px, yy, ln,
+                                             self.font(30), TEXT_W, FG)
+                    else:
+                        draw.text((px, yy), ln, font=self.font(30), fill=FG)
 
     def _avatar(self, t: dict):
         """加载作者头像并做圆形裁剪；无图返回 None。"""
@@ -536,6 +551,20 @@ class Renderer:
         except Exception as e:
             log.warning("头像加载失败 %s: %s", rel, e)
             return None
+
+    def _draw_justified(self, draw, x, y, line, font, max_w, fill):
+        """两端对齐：把剩余空间均摊到相邻字符间（分散对齐）。"""
+        w = self._text_width(draw, line, font)
+        extra = max_w - w
+        n = len(line)
+        if extra <= 0.5 or n < 2:
+            draw.text((x, y), line, font=font, fill=fill)
+            return
+        gap = extra / (n - 1)
+        cx = x
+        for ch in line:
+            draw.text((cx, y), ch, font=font, fill=fill)
+            cx += self._text_width(draw, ch, font) + gap
 
     def _draw_head(self, page, draw, t, px, py):
         f_name = self.font(26, bold=True)

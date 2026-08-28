@@ -38,6 +38,11 @@ PAD_TOP = 18
 PAD_BOTTOM = 18
 HEAD_H = NAME_H + 6 + META_H + 8        # 头部块内容高（不含顶部留白）
 MIN_CHUNK_H = 24
+QIND = 30                               # 引用块缩进
+QHEAD_H = 36                            # 引用块作者行高
+TEXT_LH_Q = 38                          # 引用块文本行高（26 号字）
+STATS_GAP_TOP = 28                      # 统计行与正文的距离
+STATS_H = 30                            # 统计行文字行高
 
 BG = "#ffffff"
 FG = "#1a1a1a"
@@ -314,7 +319,105 @@ class Renderer:
     #   {"t":tweet, "x":..., "w":COL_W, "col":..., "y":起始, "h":高度,
     #    "is_cont":bool, "ops":[(kind, payload)...]}
     # op kind: "head" | "img"(payload=dict) | "line"(str)
+    #          | "qhead"((name,handle)) | "qline"(str) | "qimg"(payload)
+    #          | "stats"(str)
     # ops 按序存放，渲染时从 y0 开始顺序消耗竖直空间。
+
+    def _img_atom(self, media: list, ind: int = 0):
+        """媒体列表 -> 单个图片原子 (kind, payload, h)；无可用图返回 None。
+
+        排版阶段零 IO：用元数据宽高推算显示尺寸，真正的图片加载/缩放
+        推迟到绘制阶段（带缓存）。ind>0 表示引用块内的缩进图。
+        """
+        media = [m for m in media if m.get("path")]
+        if not media:
+            return None
+        m0 = media[0]
+        tw = TEXT_W - ind
+        w0, h0 = int(m0.get("w") or 0), int(m0.get("h") or 0)
+        if w0 > 0 and h0 > 0:
+            scale = min(tw / w0, IMG_MAX_H / h0, 1.0)
+            dwp = max(1, int(w0 * scale))
+            dhp = max(1, int(h0 * scale))
+        else:
+            img = self._load_photo(m0)
+            if img:
+                _, dwp, dhp = self._fit(img, tw, IMG_MAX_H)
+            else:
+                dwp = dhp = 0
+        if not dhp:
+            return None
+        payload = {
+            "path": m0.get("path", ""), "dw": dwp, "dh": dhp,
+            "is_video": m0.get("type") == "video",
+            "n_media": len(media), "tw": tw, "ind": ind, "y": 0,
+        }
+        return ("qimg" if ind else "img", payload, dhp + IMG_GAP)
+
+    @staticmethod
+    def _fmt_count(n) -> str:
+        n = int(n or 0)
+        if n >= 10000:
+            return f"{n / 10000:.1f}".rstrip("0").rstrip(".") + "万"
+        return str(n)
+
+    def _stats_line(self, t: dict):
+        """统计行 -> (左侧文本, 右侧文本)：转/赞/评靠左，阅读数靠右。"""
+        s = t.get("stats") or {}
+        if not s:
+            return ""
+        left = self._filter_glyphs(
+            f"转 {self._fmt_count(s.get('reposts'))}"
+            f" · 赞 {self._fmt_count(s.get('likes'))}"
+            f" · 评 {self._fmt_count(s.get('replies'))}")
+        right = self._filter_glyphs(f"阅 {self._fmt_count(s.get('views'))}")
+        return left, right
+
+    def _build_atoms(self, t: dict, draw) -> list:
+        """tweet -> 排版原子列表 [(kind, payload, h)]。
+
+        - 普通推文：head → 主图 → 文本行 → stats
+        - 纯转推：head（转发者，meta 行标「转发了」）→ 引用块（原帖
+          作者行/文本/图）→ 原帖 stats
+        - 引用推文：head → 评论行 → 自己的图 → 引用块 → 自己 stats
+        """
+        atoms = [("head", None, HEAD_H)]
+        q = t.get("quoted")
+        if q:
+            if not t.get("is_retweet"):
+                # 引用推文：转发者的评论 + 自己的媒体
+                text = self._card_text(t)
+                if text:
+                    for ln in self.wrap_text(draw, text, self.font(30),
+                                             TEXT_W, 100000):
+                        atoms.append(("line", ln, TEXT_LH))
+                a = self._img_atom(t.get("media") or [])
+                if a:
+                    atoms.append(a)
+            # 引用块（原帖内容）
+            atoms.append(("qhead", (q.get("author_name") or "?",
+                                    q.get("author_handle") or ""), QHEAD_H))
+            qtext = clean_text(self._filter_glyphs(q.get("text") or ""))
+            if qtext:
+                for ln in self.wrap_text(draw, qtext, self.font(26),
+                                         TEXT_W - QIND, 100000):
+                    atoms.append(("qline", ln, TEXT_LH_Q))
+            a = self._img_atom(q.get("media") or [], ind=QIND)
+            if a:
+                atoms.append(a)
+        else:
+            text = self._card_text(t)
+            if text:
+                for ln in self.wrap_text(draw, text, self.font(30),
+                                         TEXT_W, 100000):
+                    atoms.append(("line", ln, TEXT_LH))
+            a = self._img_atom(t.get("media") or [])
+            if a:
+                atoms.append(a)
+        st = self._stats_line(t)
+        if st:
+            atoms.append(("stats", st, STATS_GAP_TOP + STATS_H))
+        return atoms
 
     def paginate(self, tweets: list) -> list:
         pages = [{"cards": []}]
@@ -368,52 +471,23 @@ class Renderer:
             return BOTTOM_Y - cur.y
 
         for t in tweets:
-            if not (t.get("text") or self._card_media(t)):
+            if not (t.get("text") or t.get("comment")
+                    or self._card_media(t) or t.get("quoted")):
                 continue
 
             # ---- 原子准备（带 per-tweet 缓存：跨版本只测新推） ----
             key = str(t.get("id") or id(t))
-            cached = self._atom_cache.get(key)
-            if cached is None:
-                lines = []
-                text = self._card_text(t)
-                if text:
-                    lines = self.wrap_text(draw, text, self.font(30),
-                                           TEXT_W, 100000)
-                img_payload = None
-                img_h = 0
-                media = self._card_media(t)
-                if media:
-                    # 排版阶段零 IO：用元数据宽高推算显示尺寸，
-                    # 真正的图片加载/缩放推迟到绘制阶段（带缓存）
-                    m0 = media[0]
-                    w0, h0 = int(m0.get("w") or 0), int(m0.get("h") or 0)
-                    if w0 > 0 and h0 > 0:
-                        scale = min(TEXT_W / w0, IMG_MAX_H / h0, 1.0)
-                        dwp = max(1, int(w0 * scale))
-                        dhp = max(1, int(h0 * scale))
-                    else:
-                        img = self._load_photo(m0)
-                        if img:
-                            _, dwp, dhp = self._fit(img, TEXT_W, IMG_MAX_H)
-                        else:
-                            dwp = dhp = 0
-                    if dhp:
-                        img_h = dhp + IMG_GAP
-                        img_payload = {
-                            "path": m0.get("path", ""), "dw": dwp, "dh": dhp,
-                            "is_video": m0.get("type") == "video",
-                            "n_media": len(media), "y": 0,
-                        }
-                cached = (lines, img_payload, img_h)
-                self._atom_cache[key] = cached
-            lines, img_payload, img_h = cached
+            atoms = self._atom_cache.get(key)
+            if atoms is None:
+                atoms = self._build_atoms(t, draw)
+                self._atom_cache[key] = atoms
 
-            # ---- 放置：head(不可拆) → img(不可拆)? → 文本行逐行 ----
+            # ---- 放置：逐原子顺序放置；不满足则关闭当前块跳槽重试 ----
             # 需求必须包含“若需新开块”的顶部留白（续排块含┆续标记行高）
             chunk = None
-            li = 0
             chunk_was_split = [False]
+            last_kind = [""]
+            ai = 0
 
             def close():
                 nonlocal chunk
@@ -425,58 +499,44 @@ class Renderer:
             def open_cont_needed():
                 return PAD_TOP + (24 if chunk_was_split[0] else 0)
 
-            def place(kind):
+            def place_atom():
                 """返回 True 表示成功放置；False 表示需先跳槽重试。"""
-                nonlocal chunk, li
+                nonlocal chunk, ai
+                kind, payload, h = atoms[ai]
                 extra = 0 if chunk is not None else open_cont_needed()
-                if kind == "head":
-                    need = HEAD_H + extra
-                    if free() < need:
-                        return False
-                    if chunk is None:
-                        chunk = open_chunk(False, t)
-                    chunk["ops"].append(("head", grow(chunk, HEAD_H)))
-                    return True
-                if kind == "img":
-                    need = img_h + extra
-                    if free() < need:
-                        return False
-                    if chunk is None:
-                        chunk = open_chunk(False, t)
-                    img_payload["y"] = grow(chunk, img_h)
-                    chunk["ops"].append(("img", img_payload))
-                    return True
-                need = TEXT_LH + extra
+                need = h + extra
                 if free() < need:
                     return False
                 if chunk is None:
-                    chunk = open_chunk(bool(chunk_was_split[0]), t)
-                yy = grow(chunk, TEXT_LH)
-                ln = lines[li]
-                chunk["ops"].append(("line", (yy, ln)))
-                li += 1
+                    # 文本类原子可续排；其他原子跳槽后重开完整块
+                    chunk = open_chunk(
+                        chunk_was_split[0] and kind in ("line", "qline"), t)
+                if kind == "head":
+                    chunk["ops"].append(("head", grow(chunk, HEAD_H)))
+                elif kind in ("img", "qimg"):
+                    payload["y"] = grow(chunk, h)
+                    chunk["ops"].append((kind, payload))
+                elif kind == "stats":
+                    chunk["ops"].append(("stats",
+                                         (grow(chunk, h), payload)))
+                else:  # line / qline
+                    yy = grow(chunk, h)
+                    chunk["ops"].append((kind, (yy, payload)))
+                last_kind[0] = kind
+                ai += 1
                 return True
 
-            # 1) head（首块不会是续排；首次跳槽不设 split 标记）
-            while not place("head"):
-                jump()
-            # 2) img
-            if img_payload:
-                while not place("img"):
-                    close()
-                    jump()
-            # 3) 文本行
-            while li < len(lines):
-                if not place("txt"):
+            while ai < len(atoms):
+                if not place_atom():
                     close()
                     jump()
 
             # 4) 底部内边距 + 卡间距（计入最后一个块的边界框）
-            pad_needed = PAD_BOTTOM + CARD_GAP
+            # 统计行本身贴近底部：其后只留卡间距，不再叠加底部内边距
+            pad_needed = (CARD_GAP if last_kind[0] == "stats"
+                          else PAD_BOTTOM + CARD_GAP)
             if chunk is not None and cur.y + pad_needed <= BOTTOM_Y:
                 grow(chunk, pad_needed)
-
-        return [pg for pg in pages if pg["cards"]]
 
         return [pg for pg in pages if pg["cards"]]
 
@@ -518,6 +578,51 @@ class Renderer:
                 self._draw_head(page, draw, t, px, payload)
             elif kind == "img":
                 self._draw_img(page, draw, payload, px)
+            elif kind == "qimg":
+                rx = x + 10
+                draw.line([rx, payload["y"] - 2, rx,
+                           payload["y"] + payload["dh"] + IMG_GAP + 2],
+                          fill=FG_FAINT, width=2)
+                self._draw_img(page, draw, payload, px)
+            elif kind == "qhead":
+                yy, (qname, qhandle) = payload
+                rx = x + 10
+                draw.line([rx, yy - 2, rx, yy + QHEAD_H + 2],
+                          fill=FG_FAINT, width=2)
+                qx = px + QIND
+                f_n = self.font(24, bold=True)
+                f_h = self.font(22)
+                combo = qname + "  @" + qhandle
+                if self._text_width(draw, combo, f_n) <= TEXT_W - QIND:
+                    draw.text((qx, yy + 2), qname, font=f_n, fill=FG)
+                    wn = int(self._text_width(draw, qname, f_n))
+                    draw.text((qx + wn + 8, yy + 4), "@" + qhandle,
+                              font=f_h, fill=FG_FAINT)
+                else:
+                    combo = self._ellipsize(draw, combo, f_h, TEXT_W - QIND)
+                    draw.text((qx, yy + 4), combo, font=f_h, fill=FG_DIM)
+            elif kind == "qline":
+                yy, ln = payload
+                if ln:
+                    rx = x + 10
+                    draw.line([rx, yy - 2, rx, yy + TEXT_LH_Q + 2],
+                              fill=FG_FAINT, width=2)
+                    draw.text((px + QIND, yy), ln,
+                              font=self.font(26), fill=FG_DIM)
+            elif kind == "stats":
+                yy, (sleft, sright) = payload
+                f_s = self.font(22)
+                yy += STATS_GAP_TOP
+                if sright:
+                    rw = int(self._text_width(draw, sright, f_s))
+                    rx = x + w - PAD - rw
+                    lw = TEXT_W - rw - 14
+                    if lw > 0 and self._text_width(draw, sleft, f_s) > lw:
+                        sleft = self._ellipsize(draw, sleft, f_s, lw)
+                    if sright:
+                        draw.text((rx, yy), sright, font=f_s, fill=FG_FAINT)
+                if sleft:
+                    draw.text((px, yy), sleft, font=f_s, fill=FG_FAINT)
             elif kind == "line":
                 yy, ln = payload[:2]
                 if ln:
@@ -551,9 +656,6 @@ class Renderer:
         f_dim = self.font(24)
         name = self._filter_glyphs(t.get("author_name") or "?") or "?"
         handle = "@" + self._filter_glyphs(t.get("author_handle") or "")
-        prefix = ""
-        if t.get("is_retweet"):
-            prefix = "RT @" + (t.get("rt_handle") or "?") + " "
 
         # 头像（有图用图，无图画名字首字占位），文字整体右移
         av = self._avatar(t)
@@ -575,13 +677,9 @@ class Renderer:
 
         # 名字行从头像右侧开始；单行可用宽度相应收缩
         name_w = TEXT_W - self.avatar_d - self.avatar_gap
-        combo_plain = (prefix + name + "  " + handle)
+        combo_plain = (name + "  " + handle)
         if self._text_width(draw, combo_plain, f_name) <= name_w:
             wx = tx
-            if prefix:
-                wp = int(self._text_width(draw, prefix, f_dim))
-                draw.text((wx, py + 6), prefix, font=f_dim, fill=FG_FAINT)
-                wx += wp
             draw.text((wx, py + 2), name, font=f_name, fill=FG)
             wn = int(self._text_width(draw, name, f_name))
             draw.text((wx + wn + 10, py + 7), handle,
@@ -594,7 +692,10 @@ class Renderer:
         f_meta = self.font(22)
         media = self._card_media(t)
         videos = [m for m in media if m.get("type") == "video"]
-        metas = [self.abs_time(t.get("created_at", ""))]
+        metas = []
+        if t.get("is_retweet"):
+            metas.append("转发了")
+        metas.append(self.abs_time(t.get("created_at", "")))
         if videos:
             metas.append("▶ 视频")
         n_imgs = len(media) - len(videos)
@@ -608,16 +709,18 @@ class Renderer:
     def _draw_img(self, page, draw, info, px):
         dw_, dh = info["dw"], info["dh"]
         py = info["y"]
+        tw = info.get("tw") or TEXT_W
+        ind = info.get("ind") or 0
         key = (info["path"], dw_, dh)
         photo = self._resize_cache.get(key)
         if photo is None:
             img = self._load_photo({"path": info["path"]})
             if img is None:
                 return
-            rz, dw_, dh = self._fit(img, TEXT_W, IMG_MAX_H)
+            rz, dw_, dh = self._fit(img, tw, IMG_MAX_H)
             photo = rz
             self._resize_cache[key] = photo
-        ix = px + (TEXT_W - dw_) // 2
+        ix = px + ind + (tw - dw_) // 2
         draw.rectangle([ix - 3, py - 3, ix + dw_ + 3, py + dh + 3],
                        outline=CARD_BORDER, width=2)
         page.paste(photo, (ix, py))
@@ -630,10 +733,10 @@ class Renderer:
         if info["n_media"] > 1:
             tag = f"共 {info['n_media']} 图"
             tf = self.font(20, bold=True)
-            tw = int(self._text_width(draw, tag, tf))
-            tx = ix + dw_ - tw - 22
+            tgw = int(self._text_width(draw, tag, tf))
+            tx = ix + dw_ - tgw - 22
             ty = py + dh - 36
-            draw.rounded_rectangle([tx - 8, ty - 4, tx + tw + 8, ty + 28],
+            draw.rounded_rectangle([tx - 8, ty - 4, tx + tgw + 8, ty + 28],
                                    radius=8, fill="#333333")
             draw.text((tx, ty), tag, font=tf, fill="#ffffff")
 

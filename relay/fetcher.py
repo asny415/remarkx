@@ -95,7 +95,7 @@ class Fetcher:
                          if b.strip()]
         self._api = None          # 带 Cookie 的 API 客户端
         self._dl = None           # 无 Cookie 的下载客户端（pbs.twimg.com 等）
-        self._cursor = None       # 向后翻页游标
+        self._cursor = None       # 向后翻页游标（内存态，重启即失）
 
     # ------------------------------------------------------------------ #
     # 会话
@@ -208,17 +208,20 @@ class Fetcher:
         except ValueError as e:
             raise XError(f"响应不是 JSON: {r.text[:200]}") from e
 
-    async def poll(self) -> int:
-        """拉取最新一页 For You 时间线，入库新推文+图片，返回新推文数。
+    async def poll(self) -> tuple:
+        """拉取最新一页 For You 时间线，入库新推文+图片。
 
-        文本优先取 X（Grok）自动翻译的译文，没有译文才用原文。
+        返回 (本轮时间线全部条目, 新入库条数)。刷新即阅读内容的重建。
         """
         data = await self._fetch_page()
         items, self._cursor = self._parse_timeline(data)
         return await self._ingest(items)
 
-    async def poll_extend(self) -> int:
-        """续抓更早的 For You 时间线（cursor 向后翻），用于"书读不完"。"""
+    async def poll_extend(self) -> tuple:
+        """续抓更早的 For You 时间线（cursor 向后翻），用于"书读不完"。
+
+        返回同 poll()。
+        """
         cursor = self._cursor
         if cursor:
             data = await self._fetch_page(cursor=cursor)
@@ -228,14 +231,14 @@ class Fetcher:
         items, self._cursor = self._parse_timeline(data)
         return await self._ingest(items)
 
-    async def _ingest(self, items: list) -> int:
-        new_items = []
+    async def _ingest(self, items: list) -> tuple:
+        new = 0
         for item in items:
             await self._download_media(item)
             await self._download_avatar(item)
             if self.store.upsert_tweet(item):
-                new_items.append(item)
-        return len(new_items)
+                new += 1
+        return items, new
 
     # ------------------------------------------------------------------ #
     # 响应解析
@@ -287,70 +290,158 @@ class Fetcher:
         return items, cursor
 
     def _normalize(self, result) -> dict:
-        """GraphQL tweet result -> 内部 dict；retweeted 展开为原推文。"""
+        """GraphQL tweet result -> 内部 dict。
+
+        - 纯转推：外层=转发者（header 展示转发者），原帖进 quoted 块；
+          id 归一到原帖 id，转推件与原推同屏时自然去重；
+        - 引用推文：外层文本=转发者评论，被引用原帖进 quoted 块；
+        - 普通推文：无 quoted 块。
+        各级都带 stats（转发/点赞/评论/阅读数）。
+        """
         try:
             outer = self._unwrap_result(result)
             if outer is None:
                 return None
             legacy = outer.get("legacy", {})
             rt = legacy.get("retweeted_status_result")
+            quoted_res = (outer.get("quoted_status_result")
+                          or legacy.get("quoted_status_result"))
             if rt:
                 orig = self._unwrap_result(rt.get("result"))
                 if orig is None:
                     return None
+                quoted_src = orig
+            elif quoted_res:
+                quoted_src = self._unwrap_result(quoted_res.get("result"))
             else:
-                orig = outer
+                quoted_src = None
 
-            core = orig.get("core", {}).get("user_results", {}).get("result")
-            if not isinstance(core, dict):
-                core = {}
-            ucore = core.get("core") or {}       # 2026 版：name/screen_name 在 core
-            ulegacy = core.get("legacy") or {}   # 旧版兼容
-            name = ucore.get("name") or ulegacy.get("name", "")
-            handle = ((ucore.get("screen_name")
-                       or ulegacy.get("screen_name", "")) or "").lstrip("@")
-            avatar = ((core.get("avatar") or {}).get("image_url")
-                      or ulegacy.get("profile_image_url_https", "") or "")
+            name, handle, avatar = self._author_info(outer)
 
-            # 译文优先：Grok 自动翻译内嵌在响应里
-            grok = (orig.get("grok_translated_post_with_availability") or {})
-            data = grok.get("data") or {}
-            translation = (data.get("translation") or "").strip()
-            olegacy = orig.get("legacy", {})
-            original = (self._note_text(orig)
-                        or olegacy.get("full_text", "")).strip()
-            if not original:
+            def _raw_text(r):
+                lg = r.get("legacy", {}) or {}
+                return (self._note_text(r)
+                        or lg.get("full_text", "")).strip()
+
+            def _text_of(r):
+                """译文优先：Grok 自动翻译内嵌在各级响应里。"""
+                g = (r.get("grok_translated_post_with_availability") or {})
+                d = g.get("data") or {}
+                return (d.get("translation") or "").strip() or _raw_text(r)
+
+            if rt:
+                comment = ""                       # 纯转推无评论
+                main_text = _text_of(orig)
+                main_raw = _raw_text(orig)
+                media = self._media_list(orig)
+                stats = self._stats_of(orig)
+                q_media = media                    # 同一列表对象：下载路径共享
+                q_stats = stats
+                q_created = ((orig.get("legacy") or {}).get("created_at") or "")
+            elif quoted_src:
+                comment = _text_of(outer)          # 引用者的评论
+                main_text = comment
+                main_raw = _raw_text(outer)
+                media = self._media_list(outer)
+                stats = self._stats_of(outer)
+                q_media = self._media_list(quoted_src)
+                q_stats = self._stats_of(quoted_src)
+                q_created = ((quoted_src.get("legacy") or {})
+                             .get("created_at") or "")
+            else:
+                comment = ""
+                main_text = _text_of(outer)
+                main_raw = _raw_text(outer)
+                media = self._media_list(outer)
+                stats = self._stats_of(outer)
+                q_media = []
+                q_stats = {}
+                q_created = ""
+
+            if rt:
+                # 原帖 id：转推件与原推同屏时按原帖 id 去重
+                oid = (orig.get("rest_id")
+                       or (orig.get("legacy") or {}).get("id_str", "")
+                       or outer.get("rest_id") or legacy.get("id_str", ""))
+            else:
+                oid = (outer.get("rest_id") or legacy.get("id_str", ""))
+            if not (main_text or comment):
                 return None
 
-            media = self._media_list(orig)
+            quoted = None
+            if quoted_src is not None:
+                qname, qhandle, _ = self._author_info(quoted_src)
+                quoted = {
+                    "author_name": qname,
+                    "author_handle": qhandle,
+                    "text": _text_of(quoted_src),
+                    "created_at": q_created,
+                    "media": q_media,
+                    "stats": q_stats,
+                }
+
             return {
-                "id": str(outer.get("rest_id")
-                          or legacy.get("id_str", "")),
-                "created_at": (outer.get("legacy", {}).get("created_at")
-                               or legacy.get("created_at", "")),
+                "id": str(oid),
+                "created_at": legacy.get("created_at", ""),
                 "author_name": name,
                 "author_handle": handle,
                 # 译文优先，无译文用原文
-                "text": translation or original,
-                "original_text": original,
+                "text": main_text,
+                "original_text": main_raw,
+                "comment": comment,
                 "is_retweet": rt is not None,
-                "rt_handle": (
-                    (outer.get("core", {}).get("user_results", {})
-                     .get("result", {}).get("legacy", {})
-                     .get("screen_name", "") or "").lstrip("@")
-                    if rt else ""
-                ),
+                "rt_handle": handle if rt else "",
+                "quoted": quoted,
+                "stats": stats,
                 "media": media,
-                "url": f"https://x.com/{handle}/status/"
-                       f"{outer.get('rest_id', legacy.get('id_str', ''))}",
+                "url": f"https://x.com/{handle}/status/{oid}",
                 "avatar": avatar.replace("_normal.", "_bigger."),
-                "lang": olegacy.get("lang", ""),
-                "source_lang": data.get("source_language", ""),
-                "dest_lang": data.get("destination_language", ""),
+                "lang": ((orig if rt else outer).get("legacy") or {})
+                        .get("lang", ""),
+                "source_lang": ((outer.get(
+                    "grok_translated_post_with_availability") or {})
+                    .get("data") or {}).get("source_language", ""),
+                "dest_lang": ((outer.get(
+                    "grok_translated_post_with_availability") or {})
+                    .get("data") or {}).get("destination_language", ""),
             }
         except Exception as e:
             log.warning("跳过无法解析的推文: %s", e)
             return None
+
+    @staticmethod
+    def _author_info(r: dict) -> tuple:
+        """tweet result -> (name, handle, avatar)。"""
+        core = r.get("core", {}).get("user_results", {}).get("result")
+        if not isinstance(core, dict):
+            core = {}
+        ucore = core.get("core") or {}       # 2026 版：name/screen_name 在 core
+        ulegacy = core.get("legacy") or {}   # 旧版兼容
+        name = ucore.get("name") or ulegacy.get("name", "")
+        handle = ((ucore.get("screen_name")
+                   or ulegacy.get("screen_name", "")) or "").lstrip("@")
+        avatar = ((core.get("avatar") or {}).get("image_url")
+                  or ulegacy.get("profile_image_url_https", "") or "")
+        return name, handle, avatar
+
+    @staticmethod
+    def _stats_of(r: dict) -> dict:
+        """tweet result -> 互动数（转发/点赞/评论/阅读）。"""
+        lg = r.get("legacy", {}) or {}
+        views = r.get("views") or r.get("ext_views") or {}
+
+        def _i(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "reposts": _i(lg.get("retweet_count")),
+            "likes": _i(lg.get("favorite_count")),
+            "replies": _i(lg.get("reply_count")),
+            "views": _i(views.get("count")),
+        }
 
     @staticmethod
     def _note_text(tweet: dict) -> str:
@@ -382,13 +473,21 @@ class Fetcher:
     # ------------------------------------------------------------------ #
 
     async def _download_media(self, item: dict) -> None:
-        """下载推文图片到 media_dir，成功后把本地相对路径写回 item。"""
-        if not item["media"]:
+        """下载推文图片到 media_dir，成功后把本地相对路径写回 item。
+
+        引用块（quoted）的原帖媒体一并下载；纯转推时两者是同一列表对象，
+        只下载一份。引用块文件名带 _q 前缀，避免与转发者自己的图片冲突。
+        """
+        jobs = [(m, "") for m in (item.get("media") or [])]
+        qm = (item.get("quoted") or {}).get("media") or []
+        if qm and qm is not item.get("media"):
+            jobs += [(m, "q") for m in qm]
+        if not jobs:
             return
         os.makedirs(self.media_dir, exist_ok=True)
         cli = self._dl_client()
-        for i, m in enumerate(item["media"]):
-            path = os.path.join(self.media_dir, f"{item['id']}_{i}.jpg")
+        for i, (m, pre) in enumerate(jobs):
+            path = os.path.join(self.media_dir, f"{item['id']}_{pre}{i}.jpg")
             try:
                 resp = await cli.get(m["url"])
                 if resp.status_code != 200:
@@ -398,7 +497,7 @@ class Fetcher:
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 if "png" in ctype:
                     path = os.path.join(self.media_dir,
-                                        f"{item['id']}_{i}.png")
+                                        f"{item['id']}_{pre}{i}.png")
                 with open(path, "wb") as f:
                     f.write(resp.content)
                 m["path"] = os.path.relpath(path, self.media_dir)

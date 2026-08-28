@@ -186,7 +186,8 @@ void PageStore::refresh()
 {
     saveInkNow();
     m_version.clear();
-    goPage(0, true);       // 刷新总是落在新内容第 1 页
+    // 重新拉取 status：更新 totalPages / version 后由 onStatus 进入第 0 页
+    fetchStatus();
 }
 
 void PageStore::next()
@@ -442,6 +443,14 @@ void PageStore::onLayoutDownloaded(QNetworkReply *reply, const QString &number)
     if (reply->error() != QNetworkReply::NoError)
         return;
     const QJsonObject o = QJsonDocument::fromJson(reply->readAll()).object();
+    // layout 响应自带总页数：每次下载页面后校正标签，避免陈旧值卡住
+    const int pages = o["pages"].toInt(-1);
+    if (pages > 0 && pages != m_totalPages) {
+        qInfo() << "totalPages corrected:" << m_totalPages << "->" << pages;
+        m_totalPages = pages;
+        updateLabel();
+        emit stateChanged();
+    }
     const QJsonArray cards = o["cards"].toArray();
     QJsonArray ids;
     for (const QJsonValue &c : cards)

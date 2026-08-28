@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """remarkx relay — 家中转站：抓 X 首页时间线 -> 缓存 -> 渲染 -> 提供给 reMarkable。
 
-数据获取策略：不做定时轮询。只有设备请求第 0 页（最新）且数据超过
-poll_seconds 秒未更新时才抓一次 X（single-flight，并发请求只等不重复抓）；
-第 1 页及以后永远直接读缓存，翻页不产生任何 X 请求。渲染结果按数据版本
-缓存并预渲染下一页，翻页秒开。
+内存模型：不做本地持久化，进程内存里只保留"当前阅读内容"（本次刷新抓到
+的批 + 顺着 cursor 向后续抓的更早批），API 与渲染全部直接读内存。设备回
+首页且距上次抓取超过 poll_seconds 时刷新一次（single-flight，并发只等不
+重复抓），内容整体重建；翻到书尾时按 cursor 续抓，内容往后追加。第 1 页
+及以后永远直接读缓存，翻页不产生任何 X 请求。渲染结果按数据版本缓存并
+预渲染下一页，翻页秒开。
 
 用法:
   python3 relay.py login              # 首次：登录小号（交互式）
   python3 relay.py run                # 启动服务（按需抓取 + HTTP）
   python3 relay.py run --mock         # 用模拟数据跑（调试/演示用）
   python3 relay.py render out.png     # 把第 0 页渲染成 PNG（检查排版）
-  python3 relay.py mockseed           # 往库里塞一批模拟数据
 """
 
 import argparse
@@ -25,7 +26,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from store import Store  # noqa: E402
+from memstore import MemStore  # noqa: E402
 from fetcher import Fetcher, XError, SessionError  # noqa: E402
 from render import Renderer, W, H  # noqa: E402
 
@@ -60,7 +61,6 @@ def load_config(path: str) -> dict:
     cfg["data_dir"] = os.path.abspath(cfg["data_dir"])
     cfg["media_dir"] = os.path.join(cfg["data_dir"], "media")
     cfg["session_file"] = os.path.join(cfg["data_dir"], "session.json")
-    cfg["db_file"] = os.path.join(cfg["data_dir"], "tweets.db")
     os.makedirs(cfg["media_dir"], exist_ok=True)
     return cfg
 
@@ -82,7 +82,7 @@ def _mock_img(media_dir: str, name: str, w: int, h: int, c1, c2) -> str:
     return os.path.basename(p)
 
 
-def seed_mock(store: Store, media_dir: str, n: int = 14) -> None:
+def seed_mock(store: MemStore, media_dir: str, n: int = 14) -> None:
     """塞入一批模拟推文（含中文、RT、图片），供无账号时调试。"""
     from datetime import datetime, timedelta, timezone
 
@@ -163,12 +163,12 @@ def seed_mock(store: Store, media_dir: str, n: int = 14) -> None:
          "欢迎加入，GitHub 上认领 issue 即可。",
          [], False, 13),
     ]
-    # 倒序插入：越新的推文越晚入库（seq 越大），渲染时排在最前
+    # 按新→旧顺序插入：展示顺序 = 插入顺序，第 0 页是最新一条
     for i, (name, handle, text, media, is_rt, mins) in enumerate(
-            reversed(texts[:n])):
+            texts[:n]):
         dt = now - timedelta(minutes=mins * 7 + i)
         store.upsert_tweet({
-            "id": str(1900000000000000000 + (len(texts[:n]) - 1 - i)),
+            "id": str(1900000000000000000 + i),
             "created_at": dt.strftime("%a %b %d %H:%M:%S %z %Y"),
             "author_name": name,
             "author_handle": handle,
@@ -178,9 +178,6 @@ def seed_mock(store: Store, media_dir: str, n: int = 14) -> None:
             "media": [{"url": "", "w": 0, "h": 0, "path": p} for p in media],
             "url": "",
         })
-    store.set_meta("mock", "1")
-    store.set_meta("last_poll", time.strftime("%Y-%m-%d %H:%M:%S"))
-    store.set_meta("last_poll_ok", "1")
     log.info("mock 数据已写入 %d 条", n)
 
 
@@ -188,49 +185,12 @@ def seed_mock(store: Store, media_dir: str, n: int = 14) -> None:
 # HTTP 服务
 # ---------------------------------------------------------------------- #
 
-def _is_stale(store: Store, cfg: dict) -> bool:
-    """数据是否过期：无数据，或上次抓取距今超过 poll_seconds 秒。"""
-    if store.count() == 0:
-        return True
-    m = store.get_meta("last_poll")
-    if not m:
-        return True
-    try:
-        t = time.mktime(time.strptime(m, "%Y-%m-%d %H:%M:%S"))
-    except ValueError:
-        return True
-    return time.time() - t > int(cfg["poll_seconds"])
 
-
-def _data_version(store: Store) -> str:
-    """数据版本号：refetch 后 count/最新推文 id 变化，渲染缓存随之失效。"""
-    return f"{store.count()}:{store.latest().get('id', '')}"
-
-
-async def do_poll(cfg: dict, store: Store, fetcher: Fetcher) -> int:
-    """抓一次 X（含会话自愈）。返回新增条数；失败抛 XError。"""
-    try:
-        n = await fetcher.poll()
-    except SessionError as e:
-        # 会话失效（或尚未登录）-> 从浏览器导入 Cookie 自愈
-        log.warning("会话失效，尝试从浏览器 [%s] 自动恢复 ...", cfg.get("browser"))
-        store.set_meta("last_error", "会话失效，正在自动恢复…")
-        ok = await asyncio.to_thread(fetcher.refresh_session)
-        if not ok:
-            raise XError("会话失效，且浏览器 Cookie 导入失败"
-                         "（浏览器未安装/未登录 X？）。"
-                         "请在浏览器登录 x.com 后刷新首页重试") from e
-        n = await fetcher.poll()
-    store.set_meta("last_poll", time.strftime("%Y-%m-%d %H:%M:%S"))
-    store.set_meta("last_poll_ok", "1")
-    store.set_meta("last_error", "")
-    return n
-
-
-def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
+def build_app(cfg: dict, store: MemStore, renderer: Renderer, fetcher=None):
     from aiohttp import web
 
-    # 每个 app 一份运行时状态：抓取锁 / 抓取中标志 / 渲染缓存
+    # 每个 app 一份运行时状态：抓取锁 / 抓取中标志 / 渲染缓存 / 运行元信息
+    # （全部内存态，进程重启即清空）
     state = {
         "lock": asyncio.Lock(),
         "fetching": False,
@@ -238,10 +198,51 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
         "inflight": set(),  # 正在预渲染的页码
         "layout": None,
         "layout_v": None,
+        # 渲染纪元：每次启动重新生成，进入版本号 -> 重启后设备/本端
+        # 的旧页缓存全部失配，强制按新版式重下
+        "epoch": str(int(time.time())),
+        "gen": 0,           # 内容代数：每次重建/追加成功后 +1，进版本号
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_poll": "",
+        "last_poll_ok": "",
+        "last_error": "",
+        "last_extend": "",
     }
 
+    def data_version() -> str:
+        return (f"{state['epoch']}:{state['gen']}:"
+                f"{store.count()}:{store.latest().get('id', '')}")
+
+    def is_stale() -> bool:
+        """无内容，或距上次抓取超过 poll_seconds。"""
+        if store.count() == 0:
+            return True
+        m = state["last_poll"]
+        if not m:
+            return True
+        try:
+            t = time.mktime(time.strptime(m, "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            return True
+        return time.time() - t > int(cfg["poll_seconds"])
+
+    async def poll_once() -> tuple:
+        """抓一次 X；会话失效时自动从浏览器导入 Cookie 重试一次。"""
+        try:
+            return await fetcher.poll()
+        except SessionError as e:
+            log.warning("会话失效，尝试从浏览器 [%s] 自动恢复 ...",
+                        cfg.get("browser"))
+            state["last_error"] = "会话失效，正在自动恢复…"
+            ok = await asyncio.to_thread(fetcher.refresh_session)
+            if not ok:
+                raise XError("会话失效，且浏览器 Cookie 导入失败"
+                             "（浏览器未安装/未登录 X？）。"
+                             "请在浏览器登录 x.com 后刷新首页重试") from e
+            return await fetcher.poll()
+
     def get_layout():
-        version = _data_version(store)
+        version = data_version()
         if state.get("layout_v") != version:
             tweets = store.fetch_page(0, 10 ** 6)
             state["layout"] = renderer.paginate(tweets)
@@ -252,25 +253,33 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
         """服务首页前确保数据新鲜：过期才抓（force=1 则强制抓）；已有抓取则等它。"""
         if fetcher is None:
             return
-        if not force and not _is_stale(store, cfg):
+        if not force and not is_stale():
             return
         if state["lock"].locked():
             async with state["lock"]:
                 pass  # 等进行中的抓取结束，下面会重新判断是否还过期
         async with state["lock"]:
-            if not force and not _is_stale(store, cfg):
+            if not force and not is_stale():
                 return
             state["fetching"] = True
             log.info("数据已过期，按需从 X 抓取 ...")
             try:
-                n = await do_poll(cfg, store, fetcher)
-                log.info("按需抓取完成，新增 %d 条", n)
+                batch, n = await poll_once()
+                log.info("按需抓取完成，本次时间线 %d 条，新入库 %d 条",
+                         len(batch), n)
+                if batch:
+                    # 刷新 = 重建阅读内容：整体替换为本次抓到的批
+                    store.reset(batch)
+                    state["gen"] += 1
+                state["last_poll"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                state["last_poll_ok"] = "1"
+                state["last_error"] = ""
             except XError as e:
                 log.error("按需抓取失败: %s", e)
-                store.set_meta("last_error", str(e))
+                state["last_error"] = str(e)
             except Exception as e:  # noqa: BLE001
                 log.exception("按需抓取异常")
-                store.set_meta("last_error", repr(e)[:300])
+                state["last_error"] = repr(e)[:300]
             finally:
                 state["fetching"] = False
 
@@ -278,7 +287,7 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
         """读者接近书尾时向 X 续抓更早内容（低频，让书永远翻不完）。"""
         if fetcher is None or state["fetching"]:
             return
-        m = store.get_meta("last_extend")
+        m = state["last_extend"]
         if m:
             try:
                 t0 = time.mktime(time.strptime(m, "%Y-%m-%d %H:%M:%S"))
@@ -291,11 +300,12 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
                 return
             state["fetching"] = True
             try:
-                n = await fetcher.poll_extend()
+                batch, n = await fetcher.poll_extend()
                 log.info("续抓更早内容 %d 条", n)
-                store.set_meta("last_extend",
-                               time.strftime("%Y-%m-%d %H:%M:%S"))
-                store.set_meta("last_poll", time.strftime("%Y-%m-%d %H:%M:%S"))
+                if batch and store.add_batch(batch):
+                    state["gen"] += 1
+                state["last_extend"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                state["last_poll"] = time.strftime("%Y-%m-%d %H:%M:%S")
             except XError as e:
                 log.warning("续抓失败: %s", e)
             except Exception as e:  # noqa: BLE001
@@ -312,11 +322,11 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
 
     async def prerender(page: int, per: int) -> None:
         """后台预渲染一页（渲染期间数据变了则丢弃结果）。"""
-        version = _data_version(store)
+        version = data_version()
         state["inflight"].add(page)
         try:
             data = await render_png(page, per)
-            if _data_version(store) == version:
+            if data_version() == version:
                 if len(state["cache"]) > 32:
                     state["cache"].clear()
                 state["cache"][page] = (version, data)
@@ -332,7 +342,7 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
             p = 0
         p = max(0, p)
         force = request.query.get("force", "") == "1"
-        if p == 0:
+        if p == 0 or store.count() == 0:
             await ensure_fresh(force=force)
         pages = get_layout()
         total_pages = len(pages)
@@ -341,7 +351,7 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
         # 读到接近书尾时，异步续抓更早内容
         if fetcher is not None and total_pages > 0 and p >= total_pages - 2:
             asyncio.create_task(extend_older())
-        version = _data_version(store)
+        version = data_version()
         hit = state["cache"].get(p)
         if hit and hit[0] == version:
             data = hit[1]
@@ -361,11 +371,19 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
                             headers={"Cache-Control": "no-store"})
 
     async def h_status(request: web.Request) -> web.Response:
-        s = store.status()
+        s = {
+            "count": store.count(),
+            "latest": store.latest(),
+            "last_poll": state["last_poll"],
+            "last_poll_ok": state["last_poll_ok"],
+            "last_error": state["last_error"],
+            "started": state["started"],
+            "now": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
         s["fetching"] = state["fetching"]
-        s["stale"] = fetcher is not None and _is_stale(store, cfg)
+        s["stale"] = fetcher is not None and is_stale()
         s["pages"] = len(get_layout())
-        s["version"] = _data_version(store)
+        s["version"] = data_version()
         return web.json_response(s)
 
     async def h_layout(request: web.Request) -> web.Response:
@@ -400,17 +418,18 @@ def build_app(cfg: dict, store: Store, renderer: Renderer, fetcher=None):
         return web.FileResponse(full)
 
     async def h_index(request: web.Request) -> web.Response:
-        s = store.status()
+        window_pages = len(get_layout())
         return web.Response(
             content_type="text/html",
             text=f"""<!doctype html><meta charset=utf-8>
 <h2>remarkx relay</h2>
 <pre>
-count       {s['count']}
-latest id   {s['latest'].get('id', '-')}
-last poll   {s['last_poll'] or '-'}
-last error  {s['last_error'] or '-'}
-time        {s['now']}
+count         {store.count()}
+window pages {window_pages}
+latest id     {store.latest().get('id', '-')}
+last poll     {state['last_poll'] or '-'}
+last error    {state['last_error'] or '-'}
+time          {time.strftime('%Y-%m-%d %H:%M:%S')}
 </pre>
 <p><a href="/page?p=0">第 0 页 PNG</a> · <a href="/api/status">status JSON</a></p>
 """)
@@ -436,7 +455,7 @@ time        {s['now']}
 def cmd_login(args) -> None:
     logging.basicConfig(level=logging.INFO)
     cfg = load_config(args.config)
-    fetcher = Fetcher(cfg, Store(cfg["db_file"]))
+    fetcher = Fetcher(cfg, MemStore())
     asyncio.run(fetcher.login(
         username=args.user, email=args.email, password=args.password))
 
@@ -447,8 +466,7 @@ def cmd_run(args) -> None:
     cfg = load_config(args.config)
     if args.mock:
         cfg["mock"] = True
-    store = Store(cfg["db_file"])
-    store.set_meta("started", time.strftime("%Y-%m-%d %H:%M:%S"))
+    store = MemStore()
     renderer = Renderer(cfg["media_dir"], cfg["title"], cfg.get("font", ""), prefer_zh=bool(cfg.get("translate", "")))
 
     if cfg["mock"]:
@@ -496,7 +514,7 @@ def cmd_run(args) -> None:
 
 def cmd_render(args) -> None:
     cfg = load_config(args.config)
-    store = Store(cfg["db_file"])
+    store = MemStore()
     renderer = Renderer(cfg["media_dir"], cfg["title"], cfg.get("font", ""), prefer_zh=bool(cfg.get("translate", "")))
     if store.count() == 0:
         seed_mock(store, cfg["media_dir"])
@@ -505,13 +523,6 @@ def cmd_render(args) -> None:
     img = renderer.render_page(pages, 0)
     img.save(args.out)
     log.info("已渲染 %s (%dx%d)，共 %d 页", args.out, W, H, len(pages))
-
-
-def cmd_mockseed(args) -> None:
-    logging.basicConfig(level=logging.INFO)
-    cfg = load_config(args.config)
-    store = Store(cfg["db_file"])
-    seed_mock(store, cfg["media_dir"])
 
 
 def main() -> None:
@@ -533,9 +544,6 @@ def main() -> None:
     p_render = sub.add_parser("render", help="渲染第 0 页到 PNG")
     p_render.add_argument("out", nargs="?", default="page0.png")
     p_render.set_defaults(fn=cmd_render)
-
-    p_seed = sub.add_parser("mockseed", help="写入模拟数据")
-    p_seed.set_defaults(fn=cmd_mockseed)
 
     args = ap.parse_args()
     if not getattr(args, "cmd", None):

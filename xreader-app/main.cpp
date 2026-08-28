@@ -2,6 +2,7 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QQuickWindow>
 
 #include "inkitem.h"
 #include "pagestore.h"
@@ -78,8 +79,10 @@ int main(int argc, char *argv[])
                      [&](QObject *obj, const QUrl &url) {
                          Q_UNUSED(obj);
                          qInfo() << "objectCreated:" << url;
-                         if (url.toString().endsWith("Main.qml"))
+                         if (url.toString().endsWith("Main.qml")) {
+                             pageStore.setWindow(qobject_cast<QQuickWindow *>(obj));
                              pageStore.start();
+                         }
                      });
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
                      &app, []() { QCoreApplication::exit(-1); },

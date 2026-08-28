@@ -6,6 +6,7 @@
 
 class InkItem;
 class QNetworkReply;
+class QQuickWindow;
 class QTimer;
 
 class PageStore : public QObject {
@@ -21,6 +22,7 @@ public:
     explicit PageStore(QObject *parent = nullptr);
 
     void configure(const QString &relayBase, const QString &baseDir);
+    void setWindow(QQuickWindow *window);
     Q_INVOKABLE void setInk(InkItem *ink);
     void loadCalib(const QString &file);
 
@@ -42,6 +44,8 @@ public slots:
     Q_INVOKABLE void suspendNow();
     Q_INVOKABLE void menuExit(int code);
     Q_INVOKABLE void setCalib(const QString &file);
+    // 页面展示后请求一次全屏强制刷新，清除墨水屏残影
+    Q_INVOKABLE void requestFullRefresh();
 
 signals:
     void currentFileChanged();
@@ -67,6 +71,8 @@ private:
     int entryIndex(const QString &version, int feedPage) const;
     void setStatus(const QString &s);
     void updateLabel();
+    void doFullRefresh();
+    void forceEpdFullRefresh();
     // 收藏（带笔迹）页相关
     QList<QString> favNumbers() const;
     int favCount() const;
@@ -81,6 +87,9 @@ private:
     QNetworkAccessManager m_nam;
     InkItem *m_ink = nullptr;
     QTimer *m_pollTimer = nullptr;
+    QQuickWindow *m_window = nullptr;
+    QMetaObject::Connection m_refreshConn;
+    bool m_refreshArmed = false;
 
     QJsonArray m_entries;
     QString m_date;

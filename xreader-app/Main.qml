@@ -15,6 +15,11 @@ Window {
         source: pageStore.currentFile
         cache: false
         fillMode: Image.PreserveAspectFit
+        // 每页图片就绪后请求一次全屏强制刷新，清除墨水屏残影
+        onStatusChanged: {
+            if (status === Image.Ready)
+                pageStore.requestFullRefresh()
+        }
     }
 
     InkItem {

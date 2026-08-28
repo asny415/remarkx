@@ -10,10 +10,14 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLibraryInfo>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QProcess>
+#include <QQuickWindow>
 #include <QTimer>
+
+#include <dlfcn.h>
 
 #include "inkitem.h"
 
@@ -42,6 +46,7 @@ void PageStore::configure(const QString &relayBase, const QString &baseDir)
 }
 
 void PageStore::setInk(InkItem *ink) { m_ink = ink; }
+void PageStore::setWindow(QQuickWindow *window) { m_window = window; }
 void PageStore::loadCalib(const QString &file) { Q_UNUSED(file); }
 
 void PageStore::setCalib(const QString &file)
@@ -55,6 +60,67 @@ void PageStore::setStatus(const QString &s)
         m_status = s;
         emit stateChanged();
     }
+}
+
+// 页面展示完成后请求一次全屏强制刷新（等待下一帧真正画上墨水屏后再执行），
+// 消除多次翻页累积的残影。通过 dlsym 调用 libqsgepaper 的
+// EPFramebuffer::ghostControl(BlinkNow)，它会对全屏做一次 FullUpdate。
+void PageStore::requestFullRefresh()
+{
+    if (!m_window || m_refreshArmed)
+        return;
+    m_refreshArmed = true;
+    m_refreshConn = connect(m_window, &QQuickWindow::frameSwapped, this,
+                            [this]() {
+                                QObject::disconnect(m_refreshConn);
+                                m_refreshConn = {};
+                                doFullRefresh();
+                            },
+                            Qt::QueuedConnection);
+    m_window->update();
+}
+
+void PageStore::doFullRefresh()
+{
+    m_refreshArmed = false;
+    forceEpdFullRefresh();
+}
+
+void PageStore::forceEpdFullRefresh()
+{
+    // Qt 以绝对路径加载场景图插件，先按插件目录定位已加载的 libqsgepaper.so
+    void *so = dlopen("libqsgepaper.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!so) {
+        const QStringList names = {"libqsgepaper.so", "libqsgepaper.so.6"};
+        const QStringList dirs = {
+            QLibraryInfo::path(QLibraryInfo::PluginsPath) + "/scenegraph",
+            "/usr/lib/plugins/scenegraph",
+            "/usr/lib/qt6/plugins/scenegraph",
+        };
+        for (const QString &name : names) {
+            for (const QString &dir : dirs) {
+                so = dlopen((dir + '/' + name).toUtf8().constData(),
+                            RTLD_NOW | RTLD_NOLOAD);
+                if (so)
+                    break;
+            }
+            if (so)
+                break;
+        }
+    }
+    if (!so)
+        return;
+    using InstanceFn = void *(*)();
+    using GhostControlFn = void (*)(void *, int);
+    auto inst = reinterpret_cast<InstanceFn>(
+        dlsym(so, "_ZN13EPFramebuffer8instanceEv"));
+    auto ghost = reinterpret_cast<GhostControlFn>(
+        dlsym(so, "_ZN13EPFramebuffer12ghostControlENS_16GhostControlModeE"));
+    if (!inst || !ghost)
+        return;
+    void *fb = inst();
+    if (fb)
+        ghost(fb, 0); // EPFramebuffer::GhostControlMode::BlinkNow
 }
 
 void PageStore::start()

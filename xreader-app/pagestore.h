@@ -15,6 +15,7 @@ class PageStore : public QObject {
     Q_PROPERTY(int feedPage READ feedPage NOTIFY stateChanged)
     Q_PROPERTY(int totalPages READ totalPages NOTIFY stateChanged)
     Q_PROPERTY(bool loading READ loading NOTIFY stateChanged)
+    Q_PROPERTY(bool favMode READ favMode NOTIFY stateChanged)
     Q_PROPERTY(QString status READ status NOTIFY stateChanged)
     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
     Q_PROPERTY(QString bookLabel READ bookLabel NOTIFY stateChanged)
@@ -30,6 +31,7 @@ public:
     int feedPage() const { return m_feedPage; }
     int totalPages() const { return m_totalPages; }
     bool loading() const { return m_loading; }
+    bool favMode() const { return m_mode == FavMode; }
     QString status() const { return m_status; }
     QString error() const { return m_error; }
     QString bookLabel() const { return m_bookLabel; }
@@ -44,6 +46,8 @@ public slots:
     Q_INVOKABLE void suspendNow();
     Q_INVOKABLE void menuExit(int code);
     Q_INVOKABLE void setCalib(const QString &file);
+    // 收藏页长按删除当前页（笔迹+缓存+索引一并移除）
+    Q_INVOKABLE void deleteCurrentFav();
     // 页面展示后请求一次全屏强制刷新，清除墨水屏残影
     Q_INVOKABLE void requestFullRefresh();
 

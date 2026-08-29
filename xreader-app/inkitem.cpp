@@ -153,7 +153,7 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
                       Qt::RoundCap, Qt::RoundJoin));
     } else {
         p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        m_width = 1.8 + qreal(pressure) / 4095.0 * 6.0;
+        m_width = 1.2 + qreal(pressure) / 4095.0 * 3.5;
         // 纯黑：让 libqsgepaper 的灰度扫描把笔迹区域判为"非灰度"，走快速波形
         p.setPen(QPen(QColor(0, 0, 0), m_width, Qt::SolidLine,
                       Qt::RoundCap, Qt::RoundJoin));
@@ -183,7 +183,7 @@ void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
                       Qt::RoundCap, Qt::RoundJoin));
     } else {
         p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        m_width = 1.8 + qreal(pressure) / 4095.0 * 6.0;
+        m_width = 1.2 + qreal(pressure) / 4095.0 * 3.5;
         // 纯黑：让 libqsgepaper 的灰度扫描把笔迹区域判为"非灰度"，走快速波形
         p.setPen(QPen(QColor(0, 0, 0), m_width, Qt::SolidLine,
                       Qt::RoundCap, Qt::RoundJoin));

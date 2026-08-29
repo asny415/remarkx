@@ -248,6 +248,38 @@ void PageStore::enterFav(int index)
     emit stateChanged();
 }
 
+// 删除当前收藏页：移除笔迹图与页面缓存，从索引剔除，跳到下一张收藏
+void PageStore::deleteCurrentFav()
+{
+    if (m_mode != FavMode)
+        return;
+    const QList<QString> nums = favNumbers();
+    if (nums.isEmpty() || m_favIndex < 0 || m_favIndex >= nums.size())
+        return;
+    const QString number = nums.at(m_favIndex);
+    qInfo() << "deleteFav" << number;
+    // 先清笔迹与编号，避免 enterFav 里的 saveInkNow 把已删笔迹又写回
+    if (m_ink)
+        m_ink->clear();
+    m_currentNumber.clear();
+    QFile::remove(m_bookDir + "/" + number + ".draw.png");
+    QFile::remove(m_bookDir + "/" + number + ".png");
+    for (int i = 0; i < m_entries.size(); ++i) {
+        QJsonObject e = m_entries.at(i).toObject();
+        if (e["number"].toString() == number) {
+            m_entries.removeAt(i);
+            break;
+        }
+    }
+    persistBook();
+    if (favCount() > 0)
+        enterFav(qMin(m_favIndex, favCount() - 1));
+    else {
+        m_mode = FeedMode;
+        goPage(0, false);
+    }
+}
+
 void PageStore::refresh()
 {
     saveInkNow();

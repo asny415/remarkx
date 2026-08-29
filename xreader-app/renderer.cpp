@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include "crashctx.h"
 
 #include <QDate>
 #include <QDateTime>
@@ -43,6 +44,10 @@ static const int AVATAR_GAP = 14;
 // 卡片文本最大行数：超出截断并显示"显示全文"按钮（长文/长译文都适用）
 static const int BODY_MAX_LINES = 6;
 static const int QUOTED_MAX_LINES = 4;
+
+// 窄图卡片（FloatCard）：图片与文字的间距、总高上限（超限回退普通布局）
+static const int FLOAT_GAP = 14;
+static const int FLOAT_MAX_H = 1600;
 
 QString Renderer::langName(const QString &code)
 {
@@ -289,11 +294,92 @@ Renderer::Atom Renderer::imgAtom(const QVector<XTweet> &feed, int ti,
     return a;
 }
 
+Renderer::Atom Renderer::makeFloatCard(const XTweet &t, const Atom &img)
+{
+    remarkxSetCtx("render:makeFloatCard");
+    Atom bad;
+    bad.kind = -1;
+    const QString text = cleanText(t.text);
+    if (text.isEmpty())
+        return bad;
+    const int dw = img.dw, dh = img.dh;
+    const int floatTextW = TEXT_W - dw - FLOAT_GAP;
+    if (floatTextW < 200)
+        return bad;   // 图相对太宽，环绕意义不大
+
+    // 先按"图旁窄宽"包裹全部文本，取前 K 行放在图片旁；剩余文本重新全宽包裹
+    const int K = (dh + TEXT_LH - 1) / TEXT_LH;   // ceil(dh / TEXT_LH)
+    const QStringList allNarrow = wrapText(font(30), text, floatTextW, 100000);
+    const QStringList beside = allNarrow.mid(0, K);
+    QStringList below;
+    if (allNarrow.size() > K) {
+        const QString rest = allNarrow.mid(K).join(QLatin1Char('\n'));
+        below = wrapText(font(30), rest, TEXT_W, 100000);
+    }
+
+    // 统计行
+    QString statsLeft, statsRight;
+    const QString st = statsText(t);
+    if (!st.isEmpty()) {
+        const int sep = st.indexOf(QChar(1));
+        statsLeft = st.left(sep);
+        statsRight = st.mid(sep + 1);
+    }
+
+    // 卡片内"显示全文"按钮：长文（is_expandable）时提供完整内容
+    const QString btnLabel = t.isExpandable ? QStringLiteral("显示全文")
+                                            : QString();
+
+    const int besideH = beside.size() * TEXT_LH;
+    const int belowH = below.size() * TEXT_LH;
+    const int btnH = btnLabel.isEmpty() ? 0 : TEXT_LH;
+    const int statsH = st.isEmpty() ? 0 : (STATS_GAP_TOP + STATS_H);
+    const int contentH = qMax(dh, besideH) + belowH + 8;
+    const int totalH = HEAD_H + 8 + contentH + btnH + statsH;
+    if (totalH > FLOAT_MAX_H)
+        return bad;   // 太高 → 回退普通布局（可跨页拆分）
+
+    Atom fb;
+    fb.kind = Op::FloatCard;
+    fb.h = totalH;
+    fb.tweetIndex = img.tweetIndex;
+    fb.dw = dw;
+    fb.dh = dh;
+    fb.mediaIndex = img.mediaIndex;
+    fb.video = img.video;
+    fb.nMedia = img.nMedia;
+    fb.floatLines = beside;
+    fb.belowLines = below;
+    fb.btnLabel = btnLabel;
+    fb.statsLeft = statsLeft;
+    fb.statsRight = statsRight;
+    return fb;
+}
+
 QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
                                              int ti)
 {
+    remarkxSetCtx("render:buildAtoms");
     const XTweet &t = feed[ti];
     QVector<Atom> atoms;
+
+    const bool hasQuoted = !t.quoted.authorName.isEmpty()
+                           || !t.quoted.text.trimmed().isEmpty()
+                           || !t.quoted.media.isEmpty();
+
+    // 窄图卡片（FloatCard）：简单卡片（无引用/转推、有窄主图、有正文）尝试
+    // "右上图 + 文字环绕"布局，消除窄图两侧大片空白。
+    // FloatCard 是原子块（头部+图+文字+统计一体），不可拆分，随列整体移动。
+    if (!hasQuoted && !t.isRetweet) {
+        const Atom img = imgAtom(feed, ti, false, 0);
+        if (img.kind == Op::Img && img.dw < TEXT_W / 2) {
+            Atom fb = makeFloatCard(t, img);
+            if (fb.kind == Op::FloatCard) {
+                atoms.append(fb);
+                return atoms;
+            }
+        }
+    }
 
     Atom head;
     head.kind = Op::Head;
@@ -301,9 +387,6 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     head.tweetIndex = ti;
     atoms.append(head);
 
-    const bool hasQuoted = !t.quoted.authorName.isEmpty()
-                           || !t.quoted.text.trimmed().isEmpty()
-                           || !t.quoted.media.isEmpty();
     // 卡片显示 API 默认文本（译文或 full_text 预览），但统一限制行数
     // （"不需要总是显示全文"，长文/长译文都截断）。
     // "显示全文"触发：卡片被行数截断，或（非译文时）显示的是长推文预览
@@ -409,6 +492,7 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
 
 QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
 {
+    remarkxSetCtx("render:paginate");
     QVector<RenderPage> pages;
     pages.append(RenderPage());
 
@@ -498,6 +582,45 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             case Op::Head:
                 op.y = grow(HEAD_H);
                 break;
+            case Op::FloatCard: {
+                op.y = grow(a.h);
+                // 右上图槽位
+                const int y0 = op.y + HEAD_H + 8;
+                const int imgX = colX(col) + PAD + TEXT_W - a.dw;
+                ImageSlot s;
+                s.x = imgX;
+                s.y = y0;
+                s.w = a.dw;
+                s.h = a.dh;
+                s.tweetIndex = a.tweetIndex;
+                s.isQuoted = false;
+                s.mediaIndex = a.mediaIndex;
+                s.video = a.video;
+                s.nMedia = a.nMedia;
+                pages[p].images.append(s);
+                op.slotIndex = pages[p].images.size() - 1;
+                op.imgW = a.dw;
+                op.imgH = a.dh;
+                op.floatLines = a.floatLines;
+                op.belowLines = a.belowLines;
+                op.btnLabel = a.btnLabel;
+                op.statsLeft = a.statsLeft;
+                op.statsRight = a.statsRight;
+                // 卡片内"显示全文"按钮热区
+                if (!a.btnLabel.isEmpty()) {
+                    const int besideH = a.floatLines.size() * TEXT_LH;
+                    const int belowH = a.belowLines.size() * TEXT_LH;
+                    const int btnY = op.y + HEAD_H + 8
+                                     + qMax(a.dh, besideH) + belowH;
+                    TextButton btn;
+                    btn.rect = QRect(colX(col) + PAD, btnY,
+                                     int(textWidth(font(26, true), a.btnLabel)),
+                                     TEXT_LH);
+                    btn.tweetIndex = ti;
+                    pages[p].buttons.append(btn);
+                }
+                break;
+            }
             case Op::Line:
             case Op::QLine:
                 op.y = grow(a.h);
@@ -547,7 +670,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 break;
             }
             ch.ops.append(op);
-            lastKind = a.kind;
+            lastKind = (a.kind == Op::FloatCard) ? Op::Stats : a.kind;
             ++ai;
             return true;
         };
@@ -575,6 +698,7 @@ QImage Renderer::renderPage(const QVector<XTweet> &feed,
                             const QVector<RenderPage> &pages, int pageIndex,
                             bool withPhotos)
 {
+    remarkxSetCtx("render:renderPage");
     QImage img(W, H, QImage::Format_RGB32);
     img.fill(BG);
     QPainter p(&img);
@@ -663,6 +787,9 @@ QImage Renderer::avatar(const XTweet &t) const
         op.drawImage(0, 0, mask);
     }
     m_avatarCache.insert(full, out);
+    // 有界缓存：防长时间阅读导致内存无限增长
+    if (m_avatarCache.size() > 256)
+        m_avatarCache.clear();
     return out;
 }
 
@@ -789,6 +916,9 @@ void Renderer::drawPhoto(QPainter &p, const XTweet &t, const ImageSlot &s,
                            Qt::FastTransformation)
                      .convertToFormat(QImage::Format_RGB32);
         m_photoCache.insert(key, photo);
+        // 有界缓存：防长时间阅读导致内存无限增长
+        if (m_photoCache.size() > 96)
+            m_photoCache.clear();
     }
     p.drawImage(ix, py, photo);
     if (s.video) {
@@ -847,6 +977,9 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
                         const RenderChunk &chunk, const RenderPage &page,
                         bool withPhotos)
 {
+    // 防越界：feed 重建后可能残留旧索引
+    if (chunk.tweetIndex < 0 || chunk.tweetIndex >= feed.size())
+        return;
     const QRect &r = chunk.rect;
     const XTweet &t = feed.at(chunk.tweetIndex);
     const int px = r.x() + PAD;
@@ -865,9 +998,13 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
             drawLine(p, op.text, px + QIND, op.y, font(26), FG_DIM);
             break;
         case Op::Img:
+            if (op.slotIndex < 0 || op.slotIndex >= page.images.size())
+                break;
             drawPhoto(p, t, page.images.at(op.slotIndex), withPhotos);
             break;
         case Op::QImg: {
+            if (op.slotIndex < 0 || op.slotIndex >= page.images.size())
+                break;
             const ImageSlot &s = page.images.at(op.slotIndex);
             drawQuotedBar(p, r.x() + 10, s.y - 2, s.y + s.h + IMG_GAP + 2);
             drawPhoto(p, t, s, withPhotos);
@@ -902,6 +1039,61 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
         case Op::Stats:
             drawStats(p, op, chunk);
             break;
+        case Op::FloatCard: {
+            // 头部
+            drawHead(p, t, px, op.y);
+            const int y0 = op.y + HEAD_H + 8;
+            // 右上图（占位/已下载）
+            if (op.slotIndex >= 0 && op.slotIndex < page.images.size())
+                drawPhoto(p, t, page.images.at(op.slotIndex), withPhotos);
+            // 图片旁侧窄行（左侧）
+            int ly = y0;
+            for (const QString &ln : op.floatLines) {
+                drawLine(p, ln, px, ly, font(30), FG);
+                ly += TEXT_LH;
+            }
+            // 下方全宽行（超过图片高度后扩展环绕）
+            int by = y0 + qMax(op.imgH, int(op.floatLines.size()) * TEXT_LH);
+            for (const QString &ln : op.belowLines) {
+                drawLine(p, ln, px, by, font(30), FG);
+                by += TEXT_LH;
+            }
+            // 卡片内"显示全文"按钮
+            if (!op.btnLabel.isEmpty()) {
+                const QFont fb = font(26, true);
+                p.setFont(fb);
+                p.setPen(QColor("#1a6b9c"));
+                p.drawText(QRectF(px, by, TEXT_W, TEXT_LH),
+                           Qt::AlignLeft | Qt::AlignTop, op.btnLabel);
+                const int tw = int(textWidth(fb, op.btnLabel));
+                p.drawLine(px, by + TEXT_LH - 8, px + tw, by + TEXT_LH - 8);
+                by += TEXT_LH;
+            }
+            // 统计行
+            if (!op.statsLeft.isEmpty()) {
+                const int yy = by + STATS_GAP_TOP;
+                const QFont fs = font(22);
+                p.setFont(fs);
+                p.setPen(FG_FAINT);
+                if (!op.statsRight.isEmpty()) {
+                    const int rw = int(textWidth(fs, op.statsRight));
+                    const int rx = r.x() + r.width() - PAD - rw;
+                    const int lw = TEXT_W - rw - 14;
+                    QString left = op.statsLeft;
+                    if (lw > 0 && textWidth(fs, left) > lw)
+                        left = ellipsize(fs, left, lw);
+                    p.drawText(QRectF(rx, yy, rw + 4, STATS_H),
+                               Qt::AlignLeft | Qt::AlignTop, op.statsRight);
+                    if (lw > 0)
+                        p.drawText(QRectF(px, yy, lw, STATS_H),
+                                   Qt::AlignLeft | Qt::AlignTop, left);
+                } else {
+                    p.drawText(QRectF(px, yy, TEXT_W, STATS_H),
+                               Qt::AlignLeft | Qt::AlignTop, op.statsLeft);
+                }
+            }
+            break;
+        }
         case Op::FullText: {
             const QFont fb = font(26, true);
             p.setFont(fb);
@@ -928,6 +1120,7 @@ static bool tweetHasQuoted(const XTweet &t)
 
 QImage Renderer::renderTextPage(const XTweet &t, int pageIndex, int *totalPages)
 {
+    remarkxSetCtx("render:renderTextPage");
     struct Ln {
         int page = 0;
         int y = 0;

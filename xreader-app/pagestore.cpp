@@ -4,6 +4,7 @@
 #include <QDate>
 #include <QDateTime>
 #include <QDebug>
+#include <cstdio>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -16,6 +17,7 @@
 
 #include <dlfcn.h>
 
+#include "crashctx.h"
 #include "inkitem.h"
 
 static const int SCREEN_W = 1404;
@@ -158,6 +160,7 @@ void PageStore::forceEpdFullRefresh()
 
 void PageStore::start()
 {
+    remarkxSetCtx("start");
     // 读取 state.json（日期 + 当日序号）
     QFile sf(m_stateFile);
     if (sf.open(QIODevice::ReadOnly)) {
@@ -220,12 +223,11 @@ void PageStore::syncFeed()
 
 void PageStore::rebuildPages(bool resetPageNumbers)
 {
+    remarkxSetCtx("rebuildPages");
     syncFeed();
     m_pages = m_renderer->paginate(m_feed);
     m_totalPages = qMax(1, m_pages.size());
     m_version = QStringLiteral("s%1").arg(++m_sessionSeq);
-    m_pageCache.clear();
-    m_cacheOrder.clear();
     // 只有整批刷新（homeReady）才清收藏编号映射；续抓（extend）只是尾部追加，
     // 已展示页面不变，编号必须保留，否则同页反复收藏出重复页
     if (resetPageNumbers)
@@ -235,8 +237,11 @@ void PageStore::rebuildPages(bool resetPageNumbers)
 
 void PageStore::onHomeReady()
 {
+    remarkxSetCtx("onHomeReady");
     rebuildPages(true);
     m_waitingOlder = false;
+    m_prefetchOlder = false;
+    m_lastPrefetchEmpty = false;
     m_loading = false;
     setStatus("");
     goPage(0);
@@ -244,7 +249,12 @@ void PageStore::onHomeReady()
 
 void PageStore::onOlderReady()
 {
+    remarkxSetCtx("onOlderReady");
+    const int pagesBefore = m_totalPages;
     rebuildPages(false);
+    m_prefetchOlder = false;
+    // 页码未增长 = 没有新内容（时间线已到头），后续翻页不再空抓
+    m_lastPrefetchEmpty = (m_totalPages == pagesBefore);
     m_waitingOlder = false;
     m_loading = false;
     setStatus("");
@@ -253,16 +263,25 @@ void PageStore::onOlderReady()
 
 void PageStore::onFetchError(const QString &msg)
 {
+    remarkxSetCtx("onFetchError");
     // 续抓失败也必须解锁翻页，否则 next/prev 永远被 m_waitingOlder 卡住
+    m_extendErrorWas = m_waitingOlder;
     m_waitingOlder = false;
     m_loading = false;
     setStatus("");
+    if (m_prefetchOlder) {
+        // 后台预抓失败：静默放弃（不打扰阅读），翻到旧书尾时前台续抓兜底
+        m_prefetchOlder = false;
+        qWarning() << "prefetch older failed, ignored:" << msg;
+        return;
+    }
     m_error = msg;
     emit errorChanged();
 }
 
 void PageStore::onMediaReady(const QString &tweetId)
 {
+    remarkxSetCtx("onMediaReady");
     if (m_mode != FeedMode || m_pages.isEmpty())
         return;
     syncFeed();   // 确保 m_feed 与 m_pages 索引一致
@@ -350,6 +369,7 @@ int PageStore::favCount() const
 
 void PageStore::enterFav(int index)
 {
+    remarkxSetCtx("enterFav");
     const QList<QString> nums = favNumbers();
     if (nums.isEmpty())
         return;
@@ -415,6 +435,7 @@ void PageStore::refresh()
 
 void PageStore::next()
 {
+    remarkxSetCtx("next");
     if (m_loading || m_waitingOlder) {
         qInfo() << "next ignored: busy";
         return;
@@ -431,10 +452,16 @@ void PageStore::next()
     }
     if (m_feedPage + 1 < m_totalPages) {
         goPage(m_feedPage + 1);
+        maybePrefetchOlder();
     } else {
         // 书尾：实时续抓更早内容（不做后台定时抓取）
-        if (m_client->fetching())
+        if (m_client->fetching()) {
+            // 后台预抓在途：转前台等待，避免按钮无响应
+            m_waitingOlder = true;
+            m_loading = true;
+            setStatus("正在加载更早内容…");
             return;
+        }
         qInfo() << "next at last page -> fetchOlder";
         m_waitingOlder = true;
         m_loading = true;
@@ -445,6 +472,7 @@ void PageStore::next()
 
 void PageStore::prev()
 {
+    remarkxSetCtx("prev");
     if (m_loading || m_waitingOlder) {
         qInfo() << "prev ignored: busy";
         return;
@@ -456,6 +484,7 @@ void PageStore::prev()
     }
     if (m_feedPage > 0) {
         goPage(m_feedPage - 1);
+        maybePrefetchOlder();
     } else {
         // 第 1 页继续上一页 → 进入收藏（带笔迹页）浏览
         if (favCount() > 0) {
@@ -480,6 +509,7 @@ void PageStore::suspendNow()
 {
     saveInkNow();
     persistState();
+    m_suspendWallMs = QDateTime::currentMSecsSinceEpoch();
     qInfo() << "suspending...";
     QProcess::startDetached("systemctl", {"suspend"});
 }
@@ -491,10 +521,21 @@ void PageStore::menuExit(int code)
 
 void PageStore::retry()
 {
+    remarkxSetCtx("retry");
     if (m_error.isEmpty())
         return;
+    const bool wasExtend = m_extendErrorWas;
     m_error.clear();
     emit errorChanged();
+    m_extendErrorWas = false;
+    if (wasExtend) {
+        // 续抓失败：重试续抓（保持当前页位置，不跳回首页）
+        m_waitingOlder = true;
+        m_loading = true;
+        setStatus("正在加载更早内容…");
+        m_client->fetchOlder();
+        return;
+    }
     m_loading = true;
     setStatus("正在从 X 抓取最新内容…");
     m_client->start();
@@ -502,6 +543,7 @@ void PageStore::retry()
 
 void PageStore::goPage(int n)
 {
+    remarkxSetCtx("goPage");
     saveInkNow();
     if (m_mode == FavMode)
         m_mode = FeedMode;
@@ -529,22 +571,39 @@ void PageStore::goPage(int n)
     }
 }
 
+// 靠近书尾（距末页不足 2 页）时后台预抓更早内容：
+// - 不必等翻到真正的末页才抓，翻页过程不被 m_waitingOlder/m_loading 阻塞；
+// - 预抓完成即追加页码，用户到旧末页时已有后续内容，避免大段空白。
+// 失败/到头时静默，回退到末页前台续抓的原有路径。
+void PageStore::maybePrefetchOlder()
+{
+    remarkxSetCtx("maybePrefetchOlder");
+    if (m_loading || m_waitingOlder || m_prefetchOlder)
+        return;
+    if (m_client->fetching())
+        return;
+    if (m_mode != FeedMode)
+        return;
+    if (m_feedPage + 2 < m_totalPages)
+        return;   // 距书尾 ≥2 页：不预抓
+    if (m_lastPrefetchEmpty)
+        return;   // 时间线已到头：避免每次翻页都空抓
+    m_prefetchOlder = true;
+    qInfo() << "prefetch older at page" << (m_feedPage + 1)
+            << "/" << m_totalPages;
+    m_client->fetchOlder();
+}
+
 void PageStore::renderCurrent(bool force)
 {
+    remarkxSetCtx("renderCurrent");
     if (m_pages.isEmpty() || m_feedPage >= m_pages.size()) {
         m_currentBase = QImage();
         return;
     }
     syncFeed();
-    QImage base;
-    auto it = m_pageCache.constFind(m_feedPage);
-    if (!force && it != m_pageCache.constEnd()) {
-        base = it.value();
-    } else {
-        base = m_renderer->renderPage(m_feed, m_pages, m_feedPage, false);
-        insertCache(m_feedPage, base);
-    }
-    m_currentBase = base;
+    // 不缓存页面位图：翻页实时重建，节省内存（e-ink 渲染 ~100ms 可接受）
+    m_currentBase = m_renderer->renderPage(m_feed, m_pages, m_feedPage, false);
     m_currentFile = QStringLiteral("image://pages/base?r=%1").arg(++m_baseRev);
     buildSlotList();
     requestSlotMedia();
@@ -553,22 +612,9 @@ void PageStore::renderCurrent(bool force)
     emit stateChanged();
 }
 
-void PageStore::insertCache(int n, const QImage &img)
-{
-    if (m_pageCache.contains(n)) {
-        m_pageCache[n] = img;
-        return;
-    }
-    if (m_pageCache.size() >= 8) {
-        const int oldest = m_cacheOrder.takeFirst();
-        m_pageCache.remove(oldest);
-    }
-    m_pageCache.insert(n, img);
-    m_cacheOrder.append(n);
-}
-
 void PageStore::buildSlotList()
 {
+    remarkxSetCtx("buildSlotList");
     QVariantList list;
     if (m_pages.isEmpty() || m_feedPage >= m_pages.size()) {
         m_imageSlots = list;
@@ -578,9 +624,13 @@ void PageStore::buildSlotList()
     const RenderPage &pg = m_pages.at(m_feedPage);
     for (int i = 0; i < pg.images.size(); ++i) {
         const ImageSlot &s = pg.images.at(i);
+        char ctx[64];
+        snprintf(ctx, sizeof(ctx), "buildSlotList:i%d/tw%d", i, s.tweetIndex);
+        remarkxSetCtx(ctx);
         if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
             continue;
-        const XTweet &t = m_feed.at(s.tweetIndex);
+        // 值拷贝而非引用：杜绝 t 指向被释放的 feed 缓冲区（use-after-free 防护）
+        const XTweet t = m_feed.at(s.tweetIndex);
         const QVector<XMedia> *ml = s.isQuoted ? &t.quoted.media : &t.media;
         const XMedia *m = (s.mediaIndex < ml->size()) ? &(*ml).at(s.mediaIndex)
                                                       : nullptr;
@@ -609,6 +659,7 @@ void PageStore::buildSlotList()
 
 void PageStore::requestSlotMedia()
 {
+    remarkxSetCtx("requestSlotMedia");
     if (m_pages.isEmpty() || m_feedPage >= m_pages.size())
         return;
     syncFeed();
@@ -616,13 +667,18 @@ void PageStore::requestSlotMedia()
     for (const ImageSlot &s : m_pages.at(m_feedPage).images) {
         if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
             continue;
-        const XTweet &t = m_feed.at(s.tweetIndex);
+        // 值拷贝而非引用：ensureMediaFor 在媒体已缓存时会在调用栈内同步触发
+        // mediaReady→onMediaReady→syncFeed，重新赋值 m_feed 会释放共享缓冲区，
+        // 引用随即悬垂（use-after-free，同 buildSlotList 的防护）。id 也先快照
+        // 成局部值，确保调用前后都不触碰可能被释放的 feed 内存。
+        const XTweet t = m_feed.at(s.tweetIndex);
         if (seen.contains(t.id))
             continue;
-        seen.insert(t.id);
-        m_client->ensureMediaFor(t.id);
+        const QString tid = t.id;
+        seen.insert(tid);
+        m_client->ensureMediaFor(tid);
         if (!t.avatar.isEmpty() && !t.avatar.startsWith("avatars/"))
-            m_avatarWanted.insert(t.id);
+            m_avatarWanted.insert(tid);
     }
 }
 
@@ -640,6 +696,7 @@ int PageStore::hitSlot(int x, int y)
 
 QString PageStore::hitFullText(int x, int y)
 {
+    remarkxSetCtx("hitFullText");
     if (m_mode != FeedMode || m_pages.isEmpty())
         return {};
     if (m_feedPage < 0 || m_feedPage >= m_pages.size())
@@ -656,6 +713,7 @@ QString PageStore::hitFullText(int x, int y)
 
 int PageStore::fullTextPages(const QString &tweetId)
 {
+    remarkxSetCtx("fullTextPages");
     syncFeed();
     for (const XTweet &t : m_feed) {
         if (t.id == tweetId)
@@ -666,6 +724,7 @@ int PageStore::fullTextPages(const QString &tweetId)
 
 QImage PageStore::textPageImage(const QString &tweetId, int page)
 {
+    remarkxSetCtx("textPageImage");
     syncFeed();
     for (const XTweet &t : m_feed) {
         if (t.id == tweetId) {
@@ -683,6 +742,7 @@ QImage PageStore::textPageImage(const QString &tweetId, int page)
 
 QStringList PageStore::slotFiles(int slotIndex)
 {
+    remarkxSetCtx("slotFiles");
     QStringList files;
     if (slotIndex < 0 || slotIndex >= m_imageSlots.size())
         return files;
@@ -725,6 +785,7 @@ void PageStore::loadLocal(const QString &number)
 
 void PageStore::saveInkNow()
 {
+    remarkxSetCtx("saveInkNow");
     if (!m_ink || !m_ink->hasInk())
         return;
     // 优先用当前页已分配编号；收藏页（loadLocal）直接沿用 m_currentNumber

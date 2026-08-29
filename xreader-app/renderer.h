@@ -29,14 +29,20 @@ struct ImageSlot {
 struct Op {
     enum Kind {
         Head, Line, Img, QHead, QLine, QImg, Stats,
-        FullText        // "显示全文" 按钮行
+        FullText,    // "显示全文" 按钮行
+        FloatCard    // 窄图卡片：头部+右上图+文字环绕（原子块，不可拆分）
     };
     int kind = Head;
     int y = 0;
     QString text;                 // Line/QLine/FullText 文本
     QString qname, qhandle;       // QHead
-    int slotIndex = -1;           // Img/QImg → RenderPage::slots 下标
+    int slotIndex = -1;           // Img/QImg/FloatCard → RenderPage::slots 下标
     QString statsLeft, statsRight; // Stats
+    // FloatCard 专用
+    QStringList floatLines;       // 图片旁侧（窄宽）文本行
+    QStringList belowLines;       // 图片下方（全宽）文本行
+    QString btnLabel;             // 卡片内"显示全文"按钮文案（空=无）
+    int imgW = 0, imgH = 0;       // FloatCard 图片显示尺寸
 };
 
 // 一个排版卡片（某推文在一页上的连续块；跨栏/跨页时拆成多个 chunk）
@@ -97,6 +103,8 @@ private:
         QString text;
         QString qname, qhandle;
         QString statsLeft, statsRight;
+        QStringList floatLines, belowLines;   // FloatCard 用
+        QString btnLabel;
         int tweetIndex = -1;
         bool isQuoted = false;
         int mediaIndex = 0;
@@ -105,6 +113,10 @@ private:
         int ind = 0;
         int dw = 0, dh = 0;
     };
+
+    // 窄图卡片布局：头部 + 右上图 + 左侧文字环绕 + 统计（原子块）。
+    // 不可行（图太宽/总高超过单列）返回 kind=-1，调用方回退普通布局。
+    Atom makeFloatCard(const XTweet &t, const Atom &img);
 
     QFont font(int pixel, bool bold = false) const;
     qreal textWidth(const QFont &f, const QString &text) const;

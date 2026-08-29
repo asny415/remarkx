@@ -22,7 +22,7 @@
 #define REGION_X_MAX 852
 #define REGION_Y_MIN 0
 #define REGION_Y_MAX 200
-#define MIN_HOLD_MS 3000       /* 长按阈值：须稳定按住 3s 才启动，防阅读/书写误触 */
+#define MIN_HOLD_MS 2000       /* 长按阈值：稳定按住 2s 启动（笔迹免疫 + 位移限幅防误触） */
 #define MAX_HOLD_MS 6000
 #define MAX_MOVE_PX 40         /* 长按期间允许的手指抖动 */
 #define LAUNCHER "/home/root/xreader/run-reader.sh"

@@ -125,13 +125,28 @@ test -s "$LOCAL_COOKIE" || { echo "Cookie 为空"; exit 1; }
 
 # ---------- 本地构建 ----------
 # 注意：xr 需在 Remarkable SDK 环境（environment-setup-cortexa7hf...）中构建
-echo "== 构建 xr =="
+echo "== 构建 xr（AddressSanitizer 版：隔离释放内存，稳定运行） =="
 if [ ! -d "${ROOT}/xreader-app/build" ]; then
-    (cd "${ROOT}/xreader-app" && cmake -B build) \
-        || { echo "构建配置失败——请先在 SDK 环境执行: cd xreader-app && cmake -B build"; exit 1; }
+    (cd "${ROOT}/xreader-app" && cmake -B build -DREMARKX_ASAN=ON) \
+        || { echo "构建配置失败——请先在 SDK 环境执行: cd xreader-app && cmake -B build -DREMARKX_ASAN=ON"; exit 1; }
+else
+    (cd "${ROOT}/xreader-app" && cmake -B build -DREMARKX_ASAN=ON) \
+        || { echo "重新配置失败"; exit 1; }
 fi
 cmake --build "${ROOT}/xreader-app/build" >/dev/null
 test -x "${ROOT}/xreader-app/build/xr" || { echo "构建 xr 失败（需在 SDK 环境中运行本脚本）"; exit 1; }
+
+# ASan 运行库 libasan.so.8（随 SDK 提供），部署到设备供 xr 链接
+LIBASAN="${TARGET_SYSROOT:-${RM_SDK:-/home/wwq/remarkable-sdk}/sysroots/cortexa7hf-neon-remarkable-linux-gnueabi}/usr/lib/libasan.so.8.0.0"
+if [ ! -f "$LIBASAN" ]; then
+    LIBASAN="${RM_SDK:-/home/wwq/remarkable-sdk}/sysroots/cortexa7hf-neon-remarkable-linux-gnueabi/usr/lib/libasan.so.8"
+fi
+if [ -f "$LIBASAN" ]; then
+    cp "$LIBASAN" "${ROOT}/deploy/build/libasan.so.8"
+    echo "libasan: $(basename "$LIBASAN")"
+else
+    echo "警告：找不到 libasan.so.8，设备端可能因缺少运行库无法启动"; exit 1
+fi
 
 # hello-hotkey 需交叉编译为 armv7l（用本机编译器会 203/EXEC 跑不起来）
 echo "== 构建 hello-hotkey (armv7l) =="
@@ -160,6 +175,7 @@ echo "== 比较本地与设备端文件 =="
 check_changed "${ROOT}/xreader-app/build/xr" "/home/root/xreader/xr"
 check_changed "${ROOT}/device/launcher/run-reader.sh" "/home/root/xreader/run-reader.sh"
 check_changed "${ROOT}/xreader-app/fonts/remarkx-cjk.ttf" "/home/root/xreader/fonts/remarkx-cjk.ttf"
+check_changed "${ROOT}/deploy/build/libasan.so.8" "/home/root/xreader/libasan.so.8"
 
 echo "== 写配置 =="
 # 代理无协议头时补 http://，避免设备端解析失败
@@ -185,7 +201,7 @@ check_changed "${ROOT}/device/launcher/hello-hotkey.service" "/home/root/hello-l
 if [ "$CHANGED" = "1" ]; then
     echo "== 停止正在运行的阅读器/守护 =="
     device 'systemctl stop hello-hotkey 2>/dev/null || true
-pkill -f "xreader/xr" 2>/dev/null || true
+killall -9 xr 2>/dev/null || true
 sleep 1
 systemctl start xochitl 2>/dev/null || true'
     echo "== 拷贝更新的文件 =="

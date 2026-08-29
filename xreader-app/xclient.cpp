@@ -1,14 +1,18 @@
 #include "xclient.h"
+#include "crashctx.h"
 
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QTextStream>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonValue>
 #include <QNetworkProxy>
+#include <QNetworkCookie>
+#include <QNetworkCookieJar>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QUrl>
@@ -66,6 +70,21 @@ static const char *const kFeatures =
 
 XClient::XClient(QObject *parent) : QObject(parent)
 {
+    // Qt 默认 QNetworkCookieJar 会把响应里的 set-cookie（如 lang=zh-CN）存入，
+    // 之后构造请求时用 jar 里的 Cookie 整体覆盖 apiRequest() 手动设置的
+    // auth_token/ct0/twid/guest_id 会话 Cookie，导致续抓请求丢失登录态被 X 拒
+    // （403）。改用不存储的 jar，保证手动设置的 Cookie 头每次都原样发送。
+    class NoStoreJar : public QNetworkCookieJar {
+    public:
+        using QNetworkCookieJar::QNetworkCookieJar;
+        QList<QNetworkCookie> cookiesForUrl(const QUrl &) const override { return {}; }
+        bool setCookiesFromUrl(const QList<QNetworkCookie> &, const QUrl &) override
+        {
+            return false;
+        }
+    };
+    m_nam.setCookieJar(new NoStoreJar(this));
+    m_mediaNam.setCookieJar(new NoStoreJar(this));
 }
 
 void XClient::configure(const QString &baseDir)
@@ -187,6 +206,7 @@ void XClient::start()
 
 void XClient::refresh()
 {
+    remarkxSetCtx("xclient:refresh");
     if (m_fetching)
         return;
     loadSession();
@@ -203,6 +223,7 @@ void XClient::refresh()
 
 void XClient::fetchHome()
 {
+    remarkxSetCtx("xclient:fetchHome");
     m_homePending = true;
     m_homeLeft = 2;
     m_fy.clear();
@@ -259,16 +280,61 @@ static QString replyErrorText(QNetworkReply *reply)
     }
 }
 
+// 请求/响应调试日志（定位 403 等：完整 URL + Cookie 状态 + 游标 + 响应体）
+static void logReq(const QString &baseDir, const QString &tag,
+                   const QString &which, QNetworkReply *reply,
+                   const QString &auth, const QString &ct0,
+                   const QString &cursor, const QByteArray &body)
+{
+    QFile f(baseDir + "/reqdebug.log");
+    if (!f.open(QIODevice::Append))
+        return;
+    const int status = reply->attribute(
+        QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    const QString ok = reply->error() == QNetworkReply::NoError
+                           ? "OK" : "FAIL";
+    QTextStream ts(&f);
+    ts << "\n[" << QDateTime::currentDateTime().toString("MM-dd HH:mm:ss")
+       << "] " << tag << ":" << which << " " << ok << " status=" << status
+       << "\n  url=" << reply->url().toString()
+       << "\n  request_headers:";
+    const QNetworkRequest req = reply->request();
+    const QList<QByteArray> rhd = req.rawHeaderList();
+    for (const QByteArray &h : rhd) {
+        // 打码敏感头（authorization/cookie 含会话凭据，reqdebug.log 会上传排查）
+        if (h.compare("authorization", Qt::CaseInsensitive) == 0
+                || h.compare("cookie", Qt::CaseInsensitive) == 0) {
+            ts << "\n    " << h << ": <redacted len="
+               << req.rawHeader(h).size() << ">";
+            continue;
+        }
+        ts << "\n    " << h << ": " << req.rawHeader(h);
+    }
+    ts << "\n  response_headers:";
+    const QList<QByteArray> phd = reply->rawHeaderList();
+    for (const QByteArray &h : phd)
+        ts << "\n    " << h << ": " << reply->rawHeader(h);
+    ts << "\n  cookie auth_token=" << (!auth.isEmpty() ? "Y" : "N")
+       << " ct0=" << (!ct0.isEmpty() ? "Y" : "N")
+       << " cursor=" << cursor.left(60)
+       << "\n  body=" << QString::fromUtf8(body).left(300) << "\n";
+    f.close();
+}
+
 void XClient::handleHomeReply(const QString &which, QNetworkReply *reply)
 {
+    remarkxSetCtx("xclient:handleHomeReply");
     reply->deleteLater();
     --m_homeLeft;
+    const QByteArray body = reply->readAll();
+    const QString cursorForLog = (which == "fy") ? m_cursor : m_cursorFollowing;
+    logReq(m_baseDir, "home", which, reply, m_authToken, m_ct0, cursorForLog,
+           body);
     if (reply->error() != QNetworkReply::NoError) {
         m_lastError = replyErrorText(reply);
         qWarning() << "XClient home error:" << which << m_lastError;
     } else {
-        const QJsonObject data = QJsonDocument::fromJson(reply->readAll())
-                                     .object();
+        const QJsonObject data = QJsonDocument::fromJson(body).object();
         QVector<XTweet> items;
         QString cursor;
         parseTimeline(data, &items, &cursor);
@@ -285,6 +351,7 @@ void XClient::handleHomeReply(const QString &which, QNetworkReply *reply)
 
 void XClient::maybeMergeHome()
 {
+    remarkxSetCtx("xclient:maybeMergeHome");
     if (!m_homePending || m_homeLeft > 0)
         return;
     m_homePending = false;
@@ -304,8 +371,16 @@ void XClient::maybeMergeHome()
 
 void XClient::fetchOlder()
 {
+    remarkxSetCtx("xclient:fetchOlder");
     if (m_fetching)
         return;
+    // 续抓失败冷却：短时间内不重复触发，避免疯狂重试被 X 风控持续 403
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (m_extendErrorAt && now - m_extendErrorAt < 10000) {
+        qInfo() << "XClient: extend cooling down, skip";
+        emit olderReady();   // 空批：读者停留在末页，不弹错误
+        return;
+    }
     loadSession();
     if (!m_sessionError.isEmpty()) {
         m_lastError = m_sessionError;
@@ -313,8 +388,11 @@ void XClient::fetchOlder()
         return;
     }
     if (m_cursor.isEmpty() && m_cursorFollowing.isEmpty()) {
-        // 无游标：当作抓首页处理
-        refresh();
+        // 无翻页游标（时间线已到尽头）：不刷新、不重建 feed——
+        // 重建会让在途媒体下载的任务索引失效（saveMedia 越界）且跳回第 0 页。
+        // 直接按"无更多内容"处理，读者停留在末页。
+        qInfo() << "XClient: no more older content (cursor empty)";
+        emit olderReady();
         return;
     }
     m_lastError.clear();
@@ -324,6 +402,8 @@ void XClient::fetchOlder()
     m_olderLeft = 0;
     m_oy.clear();
     m_ol.clear();
+    qInfo() << "XClient fetchOlder fy_cursor=" << m_cursor.left(50)
+            << "fl_cursor=" << m_cursorFollowing.left(50);
 
     if (!m_cursor.isEmpty()) {
         QJsonObject vars;
@@ -355,14 +435,29 @@ void XClient::fetchOlder()
 
 void XClient::handleOlderReply(const QString &which, QNetworkReply *reply)
 {
+    remarkxSetCtx("xclient:handleOlderReply");
     reply->deleteLater();
     --m_olderLeft;
+    const QByteArray body = reply->readAll();
+    const QString cursorUsed = (which == "fy") ? m_cursor : m_cursorFollowing;
+    logReq(m_baseDir, "older", which, reply, m_authToken, m_ct0, cursorUsed,
+           body);
     if (reply->error() != QNetworkReply::NoError) {
-        m_lastError = replyErrorText(reply);
+        const int status = reply->attribute(
+            QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (status == 403) {
+            // 续抓被 403 多为风控对首次翻页请求的拦截，非登录失效。
+            m_lastError = "请求被拒绝 (HTTP 403)：访问受限或会话状态异常，"
+                          "请稍后重试；若持续出现请重新导入 Cookie";
+        } else if (status == 401) {
+            m_lastError = "登录态失效 (HTTP 401)，请重新导入 Cookie";
+        } else {
+            m_lastError = replyErrorText(reply);
+        }
+        m_extendErrorAt = QDateTime::currentMSecsSinceEpoch();
         qWarning() << "XClient older error:" << m_lastError;
     } else {
-        const QJsonObject data = QJsonDocument::fromJson(reply->readAll())
-                                     .object();
+        const QJsonObject data = QJsonDocument::fromJson(body).object();
         QVector<XTweet> items;
         QString cursor;
         parseTimeline(data, &items, &cursor);
@@ -379,6 +474,7 @@ void XClient::handleOlderReply(const QString &which, QNetworkReply *reply)
 
 void XClient::maybeMergeOlder()
 {
+    remarkxSetCtx("xclient:maybeMergeOlder");
     if (!m_olderPending || m_olderLeft > 0)
         return;
     m_olderPending = false;
@@ -555,6 +651,7 @@ QVector<XMedia> XClient::mediaList(const QJsonObject &tweet)
 
 XTweet *XClient::normalize(const QJsonObject &result)
 {
+    remarkxSetCtx("xclient:normalize");
     const QJsonObject outer = unwrapResult(result);
     if (outer.isEmpty())
         return nullptr;
@@ -688,6 +785,7 @@ XTweet *XClient::normalize(const QJsonObject &result)
 void XClient::parseTimeline(const QJsonObject &data, QVector<XTweet> *items,
                             QString *cursor)
 {
+    remarkxSetCtx("xclient:parseTimeline");
     const QJsonArray instructions = data["data"].toObject()["home"]
                                         .toObject()["home_timeline_urt"]
                                         .toObject()["instructions"].toArray();
@@ -757,6 +855,7 @@ static QString mediaKey(const QString &tweetId, int mediaIndex, bool quoted)
 // 缓存命中：media_dir/base.jpg 或 .png 已存在 → 把路径写回推文并返回 true
 bool XClient::cacheHit(const QString &tweetId, const Job &job)
 {
+    remarkxSetCtx("xclient:cacheHit");
     for (int idx = 0; idx < m_tweets.size(); ++idx) {
         if (m_tweets[idx].id != tweetId)
             continue;
@@ -774,8 +873,12 @@ bool XClient::cacheHit(const QString &tweetId, const Job &job)
         }
         if (list->isEmpty())
             return false;
-        XMedia &m = (*list)[job.mediaIndex >= 0 ? job.mediaIndex
-                                                : job.quotedMediaIndex];
+        // 防越界：任务快照的索引可能因 feed 重建而失效
+        const int mi = job.mediaIndex >= 0 ? job.mediaIndex
+                                           : job.quotedMediaIndex;
+        if (mi < 0 || mi >= list->size())
+            return false;
+        XMedia &m = (*list)[mi];
         for (const char *ext : {".jpg", ".png"}) {
             const QString full = m_mediaDir + "/" + job.base + ext;
             if (QFile::exists(full) && QFileInfo(full).size() > 0) {
@@ -797,6 +900,7 @@ bool XClient::cacheHit(const QString &tweetId, const Job &job)
 void XClient::saveMedia(const QString &tweetId, const Job &job,
                         QNetworkReply *reply)
 {
+    remarkxSetCtx("xclient:saveMedia");
     const int status = reply->attribute(
         QNetworkRequest::HttpStatusCodeAttribute).toInt();
     if (reply->error() != QNetworkReply::NoError || status != 200) {
@@ -838,11 +942,11 @@ void XClient::saveMedia(const QString &tweetId, const Job &job,
             QVector<XMedia> *list = job.quotedMediaIndex >= 0
                                         ? &m_tweets[idx].quoted.media
                                         : &m_tweets[idx].media;
-            if (!list->isEmpty()) {
-                XMedia &m = (*list)[job.mediaIndex >= 0 ? job.mediaIndex
-                                                        : job.quotedMediaIndex];
-                m.path = base;
-            }
+            // 防越界：任务快照的索引可能因 feed 重建而失效
+            const int mi = job.mediaIndex >= 0 ? job.mediaIndex
+                                               : job.quotedMediaIndex;
+            if (mi >= 0 && mi < list->size())
+                (*list)[mi].path = base;
             // 纯转推：原帖媒体同时是引用块媒体，路径同步过去
             if (job.quotedMediaIndex < 0 && m_tweets[idx].isRetweet
                     && job.mediaIndex < m_tweets[idx].quoted.media.size()) {
@@ -864,8 +968,9 @@ void XClient::finishMedia(const QString &tweetId)
     emit mediaReady(tweetId);
 }
 
-void XClient::ensureMediaFor(const QString &tweetId)
+void XClient::ensureMediaFor(QString tweetId)
 {
+    remarkxSetCtx("xclient:ensureMediaFor");
     if (m_inflightMedia.contains(tweetId))
         return;
     m_inflightMedia.insert(tweetId);
@@ -915,10 +1020,16 @@ void XClient::ensureMediaFor(const QString &tweetId)
     }
 
     QDir().mkpath(m_mediaDir);
-    auto pending = std::make_shared<int>(jobs.size());
-    auto done = [this, tweetId, pending]() {
-        if (--(*pending) == 0)
+    // 成员计数器代替 shared_ptr：避免 lambda 捕获引用计数在异步回调里被破坏
+    m_mediaPending[tweetId] = jobs.size();
+    auto done = [this, tweetId]() {
+        auto it = m_mediaPending.find(tweetId);
+        if (it == m_mediaPending.end())
+            return;
+        if (--it.value() <= 0) {
+            m_mediaPending.erase(it);
             finishMedia(tweetId);
+        }
     };
 
     for (const Job &job : jobs) {

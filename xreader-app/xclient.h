@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHash>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QObject>
@@ -95,7 +96,9 @@ public slots:
     void start();          // 抓取首页（重建 feed）
     void refresh();        // 同 start()，语义为"刷新"
     void fetchOlder();     // 用 cursor 续抓更早内容（追加到尾部）
-    void ensureMediaFor(const QString &tweetId);   // 下载该推文媒体+头像
+    void ensureMediaFor(QString tweetId);   // 下载该推文媒体+头像（值传递：调用方
+                                            // 传入的 feed 缓冲区可能在本函数内被
+                                            // 同步触发的 mediaReady→syncFeed 释放）
 
 signals:
     void homeReady();                    // 首页/刷新完成，feed 已重建
@@ -167,6 +170,8 @@ private:
     QVector<XTweet> m_oy, m_ol;
 
     QString m_lastError;
+    qint64 m_extendErrorAt = 0;   // 续抓失败时间（冷却，防风控持续 403）
     QSet<QString> m_inflightMedia;
+    QHash<QString, int> m_mediaPending;   // tweetId -> 剩余下载任务数
     QSet<QString> m_failedMedia;   // "tweetId:q?idx" → 下载失败
 };

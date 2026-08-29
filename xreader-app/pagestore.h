@@ -65,6 +65,8 @@ public:
     QString error() const { return m_error; }
     QString bookLabel() const { return m_bookLabel; }
     QImage currentBaseImage() const { return m_currentBase; }
+    // 发起休眠的墙钟时间（唤醒后据此判断确实经历过休眠）
+    Q_INVOKABLE qint64 suspendWallMs() const { return m_suspendWallMs; }
 
 public slots:
     void start();
@@ -101,11 +103,11 @@ private:
     enum Mode { FeedMode, FavMode };
 
     void goPage(int n);
+    void maybePrefetchOlder();
     void loadLocal(const QString &number);
     void rebuildPages(bool resetPageNumbers);
     void syncFeed();
     void renderCurrent(bool force = false);
-    void insertCache(int n, const QImage &img);
     void buildSlotList();
     void requestSlotMedia();
     void onHomeReady();
@@ -131,8 +133,6 @@ private:
     QVector<XTweet> m_feed;
     QVector<RenderPage> m_pages;
     QImage m_currentBase;
-    QHash<int, QImage> m_pageCache;   // feedPage -> 基础图（LRU）
-    QVector<int> m_cacheOrder;
     QVariantList m_imageSlots;
     QSet<QString> m_avatarWanted;     // 正在等头像下载的推文
     QHash<int, QString> m_pageNumbers; // feedPage -> 已分配收藏页编号
@@ -161,11 +161,15 @@ private:
     QString m_error;
     QString m_bookLabel;
     bool m_waitingOlder = false;
+    bool m_prefetchOlder = false;      // 后台预抓更早内容（不阻塞翻页）
+    bool m_lastPrefetchEmpty = false;  // 上次预抓无新内容（时间线已到头）
+    bool m_extendErrorWas = false;   // 上次错误是否来自续抓（重试走续抓而非首页刷新）
     Mode m_mode = FeedMode;
     int m_favIndex = 0;
     int m_baseRev = 0;
     int m_pageKey = 0;
     QString m_lastDisplayKey;
+    qint64 m_suspendWallMs = 0;
     QTimer *m_avatarTimer = nullptr;
     bool m_avatarRefreshPending = false;
 };

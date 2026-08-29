@@ -22,3 +22,12 @@ qt_add_qml_module(xreader
     QML_FILES Main.qml Menu.qml)
 
 target_link_libraries(xreader PRIVATE Qt6::Quick Qt6::Network Qt6::Gui Qt6::GuiPrivate)
+# -rdynamic：让 dladdr/backtrace 在崩溃日志里解析主程序符号
+target_link_options(xreader PRIVATE -rdynamic)
+
+# AddressSanitizer 构建：隔离释放内存，掩盖 use-after-free 崩溃（默认开启）
+option(REMARKX_ASAN "Build with AddressSanitizer" ON)
+if(REMARKX_ASAN)
+    target_compile_options(xreader PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(xreader PRIVATE -fsanitize=address)
+endif()

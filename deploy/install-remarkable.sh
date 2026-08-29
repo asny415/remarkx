@@ -79,6 +79,8 @@ echo "== 停止正在运行的阅读器/守护 =="
 device 'systemctl stop hello-hotkey 2>/dev/null || true
 pkill -f "xreader/xr" 2>/dev/null || true
 sleep 1
+# 阅读器会停掉 xochitl，这里拉回原生界面，避免设备停在无 UI 状态
+systemctl start xochitl 2>/dev/null || true
 mkdir -p /home/root/xreader/book /home/root/hello-launch'
 
 echo "== 拷贝阅读器 =="

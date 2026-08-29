@@ -40,16 +40,48 @@ static int in_region(int raw_x, int raw_y) {
            sy >= REGION_Y_MIN && sy <= REGION_Y_MAX;
 }
 
-/* 阅读器(xr)是否在跑：在跑则绝不重复启动，避免误触杀掉当前阅读会话。
- * 用 pgrep -x（精确进程名）而非 -f，避免 -f 匹配到执行命令的 shell 自身。 */
+/* 按 comm 精确匹配 /proc/<pid>/comm 是否存在指定进程。
+ * 不用 pgrep：BusyBox 的 pgrep -x 不可靠（实测匹配不到），且 -f 会误匹配
+ * 执行命令的 shell 自身。 */
+static int proc_comm_exists(const char *name) {
+    DIR *dir = opendir("/proc");
+    if (!dir)
+        return 0;
+    struct dirent *ent;
+    int found = 0;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] < '0' || ent->d_name[0] > '9')
+            continue;                      /* 只处理数字目录（PID） */
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%s/comm", ent->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0)
+            continue;
+        char buf[32] = {0};
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = 0;
+            buf[strcspn(buf, "\n")] = 0;   /* 去 comm 末尾换行 */
+            if (strcmp(buf, name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+/* 阅读器(xr)是否在跑：在跑则绝不重复启动，避免误触杀掉当前阅读会话 */
 static int reader_running(void) {
-    return system("pgrep -x xr >/dev/null 2>&1") == 0;
+    return proc_comm_exists("xr");
 }
 
 /* xochitl 是否在跑：reMarkable 上 xochitl 是唯一 UI 前台，它不跑说明
  * 不处在原生界面（可能在阅读器/其他状态），此时不启动，防误触 */
 static int xochitl_running(void) {
-    return system("pgrep -x xochitl >/dev/null 2>&1") == 0;
+    return proc_comm_exists("xochitl");
 }
 
 static int find_touch_device(void) {

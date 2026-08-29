@@ -95,7 +95,9 @@ static int find_touch_device(void) {
             continue;
         char path[64];
         snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
-        int fd = open(path, O_RDONLY);
+        /* O_NONBLOCK：主循环用 poll+read 轮询，read 不能阻塞，
+         * 否则长按期间读空后卡在 read，永远回不到长按达标检查 */
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0)
             continue;
         char name[256] = {0};

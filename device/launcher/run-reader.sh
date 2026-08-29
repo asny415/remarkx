@@ -8,9 +8,6 @@ systemctl stop xochitl
 rm -f /tmp/epframebuffer.lock /tmp/epd.lock
 export QT_QUICK_BACKEND=epaper
 export QT_QPA_EVDEV_TOUCHSCREEN_PARAMETERS=inverty
-# AddressSanitizer：xr 链接 libasan.so.8，放在 /home/root/xreader
-export LD_LIBRARY_PATH=/home/root/xreader
-export ASAN_OPTIONS=detect_leaks=0:halt_on_error=1
 
 /home/root/xreader/xr -platform epaper
 systemctl start xochitl

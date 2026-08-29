@@ -125,27 +125,22 @@ test -s "$LOCAL_COOKIE" || { echo "Cookie 为空"; exit 1; }
 
 # ---------- 本地构建 ----------
 # 注意：xr 需在 Remarkable SDK 环境（environment-setup-cortexa7hf...）中构建
-echo "== 构建 xr（AddressSanitizer 版：隔离释放内存，稳定运行） =="
+# -DREMARKX_ASAN=OFF 必须显式指定：旧缓存可能残留 ON，若按 ON 构建又不再
+# 拷贝 libasan.so.8，设备端会因缺运行库一启动就崩
+echo "== 构建 xr（发布版，无 ASan；调试崩溃时可用 -DREMARKX_ASAN=ON 重编） =="
 if [ ! -d "${ROOT}/xreader-app/build" ]; then
-    (cd "${ROOT}/xreader-app" && cmake -B build -DREMARKX_ASAN=ON) \
-        || { echo "构建配置失败——请先在 SDK 环境执行: cd xreader-app && cmake -B build -DREMARKX_ASAN=ON"; exit 1; }
+    (cd "${ROOT}/xreader-app" && cmake -B build -DREMARKX_ASAN=OFF) \
+        || { echo "构建配置失败——请先在 SDK 环境执行: cd xreader-app && cmake -B build -DREMARKX_ASAN=OFF"; exit 1; }
 else
-    (cd "${ROOT}/xreader-app" && cmake -B build -DREMARKX_ASAN=ON) \
+    (cd "${ROOT}/xreader-app" && cmake -B build -DREMARKX_ASAN=OFF) \
         || { echo "重新配置失败"; exit 1; }
 fi
 cmake --build "${ROOT}/xreader-app/build" >/dev/null
 test -x "${ROOT}/xreader-app/build/xr" || { echo "构建 xr 失败（需在 SDK 环境中运行本脚本）"; exit 1; }
-
-# ASan 运行库 libasan.so.8（随 SDK 提供），部署到设备供 xr 链接
-LIBASAN="${TARGET_SYSROOT:-${RM_SDK:-/home/wwq/remarkable-sdk}/sysroots/cortexa7hf-neon-remarkable-linux-gnueabi}/usr/lib/libasan.so.8.0.0"
-if [ ! -f "$LIBASAN" ]; then
-    LIBASAN="${RM_SDK:-/home/wwq/remarkable-sdk}/sysroots/cortexa7hf-neon-remarkable-linux-gnueabi/usr/lib/libasan.so.8"
-fi
-if [ -f "$LIBASAN" ]; then
-    cp "$LIBASAN" "${ROOT}/deploy/build/libasan.so.8"
-    echo "libasan: $(basename "$LIBASAN")"
-else
-    echo "警告：找不到 libasan.so.8，设备端可能因缺少运行库无法启动"; exit 1
+# 发布版必须不含 ASan 运行库依赖，否则设备端缺少 libasan.so.8 会启动即崩
+READELF="${TARGET_SYSROOT:-${RM_SDK:-/home/wwq/remarkable-sdk}/sysroots/aarch64-codexsdk-linux/usr/bin/arm-remarkable-linux-gnueabi}/arm-remarkable-linux-gnueabi-readelf"
+if "$READELF" -d "${ROOT}/xreader-app/build/xr" 2>/dev/null | grep -q 'libasan'; then
+    echo "错误：xr 仍链接 libasan.so.8，请用 -DREMARKX_ASAN=OFF 重新配置构建"; exit 1;
 fi
 
 # hello-hotkey 需交叉编译为 armv7l（用本机编译器会 203/EXEC 跑不起来）
@@ -175,7 +170,6 @@ echo "== 比较本地与设备端文件 =="
 check_changed "${ROOT}/xreader-app/build/xr" "/home/root/xreader/xr"
 check_changed "${ROOT}/device/launcher/run-reader.sh" "/home/root/xreader/run-reader.sh"
 check_changed "${ROOT}/xreader-app/fonts/remarkx-cjk.ttf" "/home/root/xreader/fonts/remarkx-cjk.ttf"
-check_changed "${ROOT}/deploy/build/libasan.so.8" "/home/root/xreader/libasan.so.8"
 
 echo "== 写配置 =="
 # 代理无协议头时补 http://，避免设备端解析失败

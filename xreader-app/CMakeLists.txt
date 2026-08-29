@@ -25,8 +25,9 @@ target_link_libraries(xreader PRIVATE Qt6::Quick Qt6::Network Qt6::Gui Qt6::GuiP
 # -rdynamic：让 dladdr/backtrace 在崩溃日志里解析主程序符号
 target_link_options(xreader PRIVATE -rdynamic)
 
-# AddressSanitizer 构建：隔离释放内存，掩盖 use-after-free 崩溃（默认开启）
-option(REMARKX_ASAN "Build with AddressSanitizer" ON)
+# AddressSanitizer 构建（默认关：ASan 运行时开销大，调试崩溃时开
+# -DREMARKX_ASAN=ON；日常靠 main.cpp 崩溃处理器 + crash.log 定位）
+option(REMARKX_ASAN "Build with AddressSanitizer" OFF)
 if(REMARKX_ASAN)
     target_compile_options(xreader PRIVATE -fsanitize=address -fno-omit-frame-pointer)
     target_link_options(xreader PRIVATE -fsanitize=address)

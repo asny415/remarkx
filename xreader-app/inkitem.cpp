@@ -219,8 +219,10 @@ QRect InkItem::segmentRect(const QPointF &a, const QPointF &b) const
 
 // 绕过框架对 QQuickPaintedItem 区域的"默认灰度→慢波形"路径：笔迹段直接写进
 // 8-bit pen 缓冲（FB112），再走 pen 快速分支（DU + pixel_mode 7）瞬时显示。
-// FB112 需携带页面内容（pixel_mode 7 是替换显示，不合成）：先把主画布区域
-// 转灰度拷过去，再叠加 m_img 笔迹层。
+// 关键：pixel_mode 7 把 FB112 当"墨迹掩码"——非 0 的像素才用主画布(FB96)
+// 的值驱动显示，0 的像素被 gate 跳过。所以 FB112 必须填掩码（有墨=255，
+// 无墨=0），而不是页面拷贝；否则页面(255)被无谓重刷→闪烁，笔迹线(0)反而
+// 被 gate 掉→显示成 dash。
 // 失败（插件不可用/缓冲不对）返回 false，由调用方回退到框架 update()。
 bool InkItem::fastSubmit(const QRect &region)
 {
@@ -248,14 +250,19 @@ bool InkItem::fastSubmit(const QRect &region)
     if (buf->size() != m_img.size() || penBuf->size() != m_img.size())
         return false;
     {
-        // 主画布：页面 + 笔迹（m_img 是笔迹层）
+        // 主画布（pixel_mode 7 读取的显示内容）：页面 + 笔迹
         QPainter p(buf);
         p.drawImage(region.topLeft(), m_img, region);
         p.end();
-        // 8-bit pen 缓冲：把主画布区域转灰度拷过去，作为该区域显示内容
-        QPainter p2(penBuf);
-        p2.drawImage(region.topLeft(), *buf, region);
-        p2.end();
+        // 8-bit pen 掩码：有墨=255，无墨=0（只驱动有墨像素 → 线实、页面不闪）
+        for (int y = region.top(); y <= region.bottom(); ++y) {
+            const QRgb *src =
+                reinterpret_cast<const QRgb *>(m_img.constScanLine(y))
+                + region.left();
+            uchar *dst = penBuf->scanLine(y) + region.left();
+            for (int x = region.left(); x <= region.right(); ++x, ++src, ++dst)
+                *dst = qAlpha(*src) > 0 ? 255 : 0;
+        }
     }
     // contentType=0(Pen) + flags=2(FastDraw) → swapBuffers_impl 走
     // update mode 1(DU) + pixel_mode 7 的笔迹快速分支，瞬时显示
@@ -280,5 +287,5 @@ void InkItem::clearPenBuffer()
     auto *penBuf = reinterpret_cast<QImage *>(static_cast<char *>(fb) + 112);
     if (penBuf->isNull() || penBuf->size() != m_img.size())
         return;
-    penBuf->fill(Qt::white);
+    penBuf->fill(0);   // 掩码全 0 = 无墨，全部 gate，不残留旧笔迹
 }

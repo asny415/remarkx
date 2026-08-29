@@ -265,9 +265,9 @@ bool InkItem::fastSubmit(const QRect &region)
                 *dst = qAlpha(*src) > 0 ? 255 : 0;
         }
     }
-    // contentType=0(Pen) + flags=2(FastDraw) → swapBuffers_impl 走
-    // update mode 1(DU) + pixel_mode 7 的笔迹快速分支，瞬时显示
-    swap(fb, region, 0, 1, 2);
+    // 试：contentType=1(灰度) + flags=2(FastDraw) —— DU(1-bit) 对细线渲染呈
+    // dashed，灰度波形应渲染实线；若此参数快速且实线即根治，慢则回退 0
+    swap(fb, region, 1, 3, 2);
     return true;
 }
 

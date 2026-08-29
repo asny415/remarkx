@@ -125,6 +125,11 @@ void InkItem::onPenUp()
     m_stroke = false;
     // 收尾：把节流期间累积的笔迹段立即提交，不丢尾段
     flushInk();
+    // 灰度重绘整条笔画 → 快速波形显示的虚线变实线
+    if (!m_strokeRegion.isNull()) {
+        settleInk(m_strokeRegion);
+        m_strokeRegion = QRect();
+    }
 }
 
 void InkItem::onErDown(int x, int y, int pressure)
@@ -167,7 +172,7 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
         emit hasInkChanged();
     }
     // 首段立即通过 pen 快速路径显示
-    m_pending = segmentRect(m_last, m_last);
+    m_strokeRegion = m_pending = segmentRect(m_last, m_last);
     if (!fastSubmit(m_pending))
         update(m_pending);
 }
@@ -194,6 +199,9 @@ void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
     m_pending = m_pending.isNull()
                     ? segmentRect(m_last, cur)
                     : m_pending.united(segmentRect(m_last, cur));
+    m_strokeRegion = m_strokeRegion.isNull()
+                         ? segmentRect(m_last, cur)
+                         : m_strokeRegion.united(segmentRect(m_last, cur));
     m_last = cur;
     // 节流合并：定时器到点把小区域一次性提交（小区域快 + 覆盖近段防虚线）
     if (!m_flushTimer->isActive())
@@ -265,9 +273,9 @@ bool InkItem::fastSubmit(const QRect &region)
                 *dst = qAlpha(*src) > 0 ? 255 : 0;
         }
     }
-    // 试：contentType=1(灰度) + flags=2(FastDraw) —— DU(1-bit) 对细线渲染呈
-    // dashed，灰度波形应渲染实线；若此参数快速且实线即根治，慢则回退 0
-    swap(fb, region, 1, 3, 2);
+    // contentType=0(Pen) + flags=2(FastDraw) → 快速分支瞬时显示；
+    // 笔抬起时另做灰度 settle 把线渲染成实线
+    swap(fb, region, 0, 1, 2);
     return true;
 }
 
@@ -289,4 +297,29 @@ void InkItem::clearPenBuffer()
     if (penBuf->isNull() || penBuf->size() != m_img.size())
         return;
     penBuf->fill(0);   // 掩码全 0 = 无墨，全部 gate，不残留旧笔迹
+}
+
+// 笔抬起后对整条笔画做一次灰度重绘：快速波形(DU/1bit)会把细线显示成虚线，
+// 灰度波形(GL16)能保留细线灰度边缘渲染成实线。读取主画布(FB96=页面+笔迹)。
+void InkItem::settleInk(const QRect &region)
+{
+    if (region.isNull())
+        return;
+    void *lib = epaperLib();
+    if (!lib)
+        return;
+    using InstFn = void *(*)();
+    using SwapFn = void (*)(void *, QRect, int, int, int);
+    static auto inst = reinterpret_cast<InstFn>(
+        dlsym(lib, "_ZN13EPFramebuffer8instanceEv"));
+    static auto swap = reinterpret_cast<SwapFn>(
+        dlsym(lib, "_ZN13EPFramebuffer11swapBuffersE5QRect13EPContentType"
+                   "12EPScreenMode6QFlagsINS_10UpdateFlagEE"));
+    if (!inst || !swap)
+        return;
+    void *fb = inst();
+    if (!fb)
+        return;
+    // contentType=1(灰度) + GL16 + 同步，读主画布灰度渲染 → 实线
+    swap(fb, region, 1, 3, 0);
 }

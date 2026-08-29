@@ -5,14 +5,11 @@
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
-#include <QSet>
-#include <algorithm>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLibraryInfo>
-#include <QNetworkReply>
-#include <QNetworkRequest>
 #include <QProcess>
 #include <QQuickWindow>
 #include <QTimer>
@@ -24,35 +21,46 @@
 static const int SCREEN_W = 1404;
 static const int SCREEN_H = 1872;
 
-PageStore::PageStore(QObject *parent) : QObject(parent)
+QImage PageImageProvider::requestImage(const QString &id, QSize *size,
+                                       const QSize &requestedSize)
 {
-    m_pollTimer = new QTimer(this);
-    m_pollTimer->setInterval(1200);
-    connect(m_pollTimer, &QTimer::timeout, this, [this]() {
-        pollStatus(30);
-    });
+    Q_UNUSED(id);
+    Q_UNUSED(requestedSize);
+    const QImage img = m_store->currentBaseImage();
+    if (size)
+        *size = img.size();
+    return img;
 }
 
-void PageStore::configure(const QString &relayBase, const QString &baseDir)
+PageStore::PageStore(QObject *parent) : QObject(parent)
 {
-    m_relay = relayBase;
-    if (m_relay.endsWith('/'))
-        m_relay.chop(1);
+}
+
+void PageStore::configure(const QString &baseDir)
+{
+    m_baseDir = baseDir;
     m_bookDir = baseDir + "/book";
     m_stateFile = baseDir + "/state.json";
     m_bookJsonFile = baseDir + "/book.json";
     m_calibFile = baseDir + "/calib.json";
     QDir().mkpath(m_bookDir);
+
+    m_client = new XClient(this);
+    m_client->configure(baseDir);
+    m_renderer = new Renderer(this);
+    m_renderer->configure(baseDir);
+
+    connect(m_client, &XClient::homeReady, this, &PageStore::onHomeReady);
+    connect(m_client, &XClient::olderReady, this, &PageStore::onOlderReady);
+    connect(m_client, &XClient::errorOccurred, this,
+            &PageStore::onFetchError);
+    connect(m_client, &XClient::mediaReady, this, &PageStore::onMediaReady);
+
+    m_provider = new PageImageProvider(this);
 }
 
 void PageStore::setInk(InkItem *ink) { m_ink = ink; }
 void PageStore::setWindow(QQuickWindow *window) { m_window = window; }
-void PageStore::loadCalib(const QString &file) { Q_UNUSED(file); }
-
-void PageStore::setCalib(const QString &file)
-{
-    m_calibFile = file;
-}
 
 void PageStore::setStatus(const QString &s)
 {
@@ -60,6 +68,11 @@ void PageStore::setStatus(const QString &s)
         m_status = s;
         emit stateChanged();
     }
+}
+
+void PageStore::setCalib(const QString &file)
+{
+    m_calibFile = file;
 }
 
 // 页面展示完成后请求一次全屏强制刷新（等待下一帧真正画上墨水屏后再执行），
@@ -88,7 +101,6 @@ void PageStore::doFullRefresh()
 
 void PageStore::forceEpdFullRefresh()
 {
-    // Qt 以绝对路径加载场景图插件，先按插件目录定位已加载的 libqsgepaper.so
     void *so = dlopen("libqsgepaper.so", RTLD_NOW | RTLD_NOLOAD);
     if (!so) {
         const QStringList names = {"libqsgepaper.so", "libqsgepaper.so.6"};
@@ -125,7 +137,6 @@ void PageStore::forceEpdFullRefresh()
 
 void PageStore::start()
 {
-    qInfo() << "PageStore::start relay=" << m_relay;
     // 读取 state.json（日期 + 当日序号）
     QFile sf(m_stateFile);
     if (sf.open(QIODevice::ReadOnly)) {
@@ -142,12 +153,20 @@ void PageStore::start()
         bf.close();
     }
     cleanupOnStartup();
-    setStatus("正在连接中转站…");
-    fetchStatus();
+
+    if (!m_client->hasSession()) {
+        m_error = "未配置 X 登录态：请在 PC 运行安装脚本导入 Cookie 后再启动";
+        emit errorChanged();
+        setStatus("");
+        return;
+    }
+    m_loading = true;
+    setStatus("正在从 X 抓取最新内容…");
+    m_client->start();
 }
 
 // 只有带笔迹的页面（.draw.png 存在）会连同其页面 PNG 一起保留，
-// 其余缓存 PNG 全部删除，避免占用空间（需要的页面浏览时会按需重新下载）。
+// 其余缓存 PNG 全部删除（设备端渲染后，非收藏页不再落盘）。
 void PageStore::cleanupOnStartup()
 {
     QSet<QString> keep;
@@ -173,31 +192,77 @@ void PageStore::cleanupOnStartup()
         qInfo() << "cleanupOnStartup: removed" << removed << "cached pages";
 }
 
-void PageStore::fetchStatus()
+void PageStore::syncFeed()
 {
-    QNetworkRequest req(QUrl(m_relay + "/api/status"));
-    QNetworkReply *reply = m_nam.get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-        onStatus(reply);
-    });
+    m_feed = m_client->feed();
 }
 
-void PageStore::onStatus(QNetworkReply *reply)
+void PageStore::rebuildPages()
 {
-    reply->deleteLater();
-    qInfo() << "onStatus err=" << reply->error() << reply->errorString();
-    if (reply->error() != QNetworkReply::NoError) {
-        m_error = "无法连接中转站（" + m_relay + "）";
-        emit errorChanged();
-        setStatus("");
-        return;
-    }
-    const QJsonObject o = QJsonDocument::fromJson(reply->readAll()).object();
-    m_totalPages = o["pages"].toInt(1);
-    m_version = o["version"].toString();
+    syncFeed();
+    m_pages = m_renderer->paginate(m_feed);
+    m_totalPages = qMax(1, m_pages.size());
+    m_version = QStringLiteral("s%1").arg(++m_sessionSeq);
+    m_pageCache.clear();
+    m_cacheOrder.clear();
+    m_pageNumbers.clear();
     updateLabel();
-    emit stateChanged();
-    goPage(0, true);
+}
+
+void PageStore::onHomeReady()
+{
+    rebuildPages();
+    m_waitingOlder = false;
+    m_loading = false;
+    setStatus("");
+    goPage(0);
+}
+
+void PageStore::onOlderReady()
+{
+    rebuildPages();
+    m_loading = false;
+    setStatus("");
+    goPage(m_feedPage);
+}
+
+void PageStore::onFetchError(const QString &msg)
+{
+    m_loading = false;
+    setStatus("");
+    m_error = msg;
+    emit errorChanged();
+}
+
+void PageStore::onMediaReady(const QString &tweetId)
+{
+    // 只关心当前页的推文
+    bool onPage = false;
+    if (m_mode == FeedMode && !m_pages.isEmpty()
+            && m_feedPage < m_pages.size()) {
+        for (const ImageSlot &s : m_pages.at(m_feedPage).images) {
+            if (m_feed[s.tweetIndex].id == tweetId) {
+                onPage = true;
+                break;
+            }
+        }
+    }
+    if (!onPage)
+        return;
+    // 刷新槽位状态：QML overlay 换图 / 隐藏占位
+    buildSlotList();
+    emit imageSlotsChanged();
+    // 头像到位 → 重渲染基础页
+    if (m_avatarWanted.contains(tweetId)) {
+        m_avatarWanted.remove(tweetId);
+        syncFeed();
+        for (int i = 0; i < m_feed.size(); ++i) {
+            if (m_feed[i].id == tweetId && m_feed[i].avatar.startsWith("avatars/")) {
+                renderCurrent(true);
+                break;
+            }
+        }
+    }
 }
 
 void PageStore::updateLabel()
@@ -241,14 +306,15 @@ void PageStore::enterFav(int index)
     saveInkNow();
     m_mode = FavMode;
     m_favIndex = index;
-    m_downloading = -1;
     m_loading = false;
+    m_imageSlots.clear();
+    emit imageSlotsChanged();
     loadLocal(nums.at(index));
     updateLabel();
     emit stateChanged();
 }
 
-// 删除当前收藏页：移除笔迹图与页面缓存，从索引剔除，跳到下一张收藏
+// 删除当前收藏页：移除笔迹图与页面 PNG，从索引剔除，跳到下一张收藏
 void PageStore::deleteCurrentFav()
 {
     if (m_mode != FavMode)
@@ -276,21 +342,23 @@ void PageStore::deleteCurrentFav()
         enterFav(qMin(m_favIndex, favCount() - 1));
     else {
         m_mode = FeedMode;
-        goPage(0, false);
+        goPage(0);
     }
 }
 
 void PageStore::refresh()
 {
+    if (m_client->fetching())
+        return;
     saveInkNow();
-    m_version.clear();
-    // 重新拉取 status：更新 totalPages / version 后由 onStatus 进入第 0 页
-    fetchStatus();
+    m_loading = true;
+    setStatus("正在刷新…");
+    m_client->refresh();
 }
 
 void PageStore::next()
 {
-    if (m_loading || m_downloading >= 0) {
+    if (m_loading || m_waitingOlder) {
         qInfo() << "next ignored: busy";
         return;
     }
@@ -300,21 +368,27 @@ void PageStore::next()
         } else {
             qInfo() << "fav last -> feed page 0";
             m_mode = FeedMode;
-            goPage(0, false);
+            goPage(0);
         }
         return;
     }
     if (m_feedPage + 1 < m_totalPages) {
-        goPage(m_feedPage + 1, false);
+        goPage(m_feedPage + 1);
     } else {
-        qInfo() << "next at last page -> extendPoll";
-        extendPoll();
+        // 书尾：实时续抓更早内容（不做后台定时抓取）
+        if (m_client->fetching())
+            return;
+        qInfo() << "next at last page -> fetchOlder";
+        m_waitingOlder = true;
+        m_loading = true;
+        setStatus("正在加载更早内容…");
+        m_client->fetchOlder();
     }
 }
 
 void PageStore::prev()
 {
-    if (m_loading || m_downloading >= 0) {
+    if (m_loading || m_waitingOlder) {
         qInfo() << "prev ignored: busy";
         return;
     }
@@ -324,7 +398,7 @@ void PageStore::prev()
         return;
     }
     if (m_feedPage > 0) {
-        goPage(m_feedPage - 1, false);
+        goPage(m_feedPage - 1);
     } else {
         // 第 1 页继续上一页 → 进入收藏（带笔迹页）浏览
         if (favCount() > 0) {
@@ -358,102 +432,170 @@ void PageStore::menuExit(int code)
     QCoreApplication::exit(code);
 }
 
-void PageStore::extendPoll()
+void PageStore::retry()
 {
-    if (m_extendTarget >= 0)
+    if (m_error.isEmpty())
         return;
-    m_extendTarget = m_totalPages;
+    m_error.clear();
+    emit errorChanged();
     m_loading = true;
-    setStatus("已是最后一页，正在续抓更早内容…");
-    emit stateChanged();
-    // 请求当前最后一页（服务端会顺带触发续抓）
-    QNetworkRequest req(QUrl(m_relay + "/page?p=" + QString::number(m_feedPage)));
-    QNetworkReply *reply = m_nam.get(req);
-    connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
-    m_pollTimer->start();
+    setStatus("正在从 X 抓取最新内容…");
+    m_client->start();
 }
 
-void PageStore::pollStatus(int attempts)
-{
-    QNetworkRequest req(QUrl(m_relay + "/api/status"));
-    QNetworkReply *reply = m_nam.get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, attempts]() {
-        reply->deleteLater();
-        if (reply->error() == QNetworkReply::NoError) {
-            const QJsonObject o = QJsonDocument::fromJson(reply->readAll()).object();
-            const int pages = o["pages"].toInt(m_totalPages);
-            if (pages > m_totalPages && m_extendTarget >= 0) {
-                m_pollTimer->stop();
-                const int target = m_extendTarget;
-                m_extendTarget = -1;
-                m_totalPages = pages;
-                setStatus("");
-                goPage(target, false);
-                return;
-            }
-        }
-        if (attempts <= 0) {
-            m_pollTimer->stop();
-            m_extendTarget = -1;
-            m_loading = false;
-            setStatus("");
-            emit stateChanged();
-        }
-    });
-}
-
-void PageStore::goPage(int n, bool force)
+void PageStore::goPage(int n)
 {
     saveInkNow();
-    m_mode = FeedMode;
-    m_feedPage = n;
-    m_downloading = n;
-    m_loading = true;
+    if (m_mode == FavMode)
+        m_mode = FeedMode;
+    // 离开当前页：收藏编号交给 m_pageNumbers 记录，避免后续误用旧编号
+    m_currentNumber.clear();
+    m_feedPage = qBound(0, n, qMax(0, m_totalPages - 1));
+    m_loading = false;
     updateLabel();
-    setStatus(force ? "正在从 X 抓取最新内容…" : "正在加载…");
-    emit stateChanged();
-    qInfo() << "goPage" << n << "force" << force << "version" << m_version;
-
-    int idx = entryIndex(m_version, n);
-    if (idx >= 0 && !force) {
-        const QJsonObject e = m_entries.at(idx).toObject();
-        const QString number = e["number"].toString();
-        loadLocal(number);
-        return;
-    }
-    downloadPage(n, force);
+    setStatus("");
+    renderCurrent();
 }
 
-int PageStore::entryIndex(const QString &version, int feedPage) const
+void PageStore::renderCurrent(bool force)
 {
-    for (int i = 0; i < m_entries.size(); ++i) {
-        const QJsonObject e = m_entries.at(i).toObject();
-        if (e["version"].toString() == version
-                && e["feed_page"].toInt() == feedPage)
+    if (m_pages.isEmpty()) {
+        m_currentBase = QImage();
+        return;
+    }
+    syncFeed();
+    QImage base;
+    auto it = m_pageCache.constFind(m_feedPage);
+    if (!force && it != m_pageCache.constEnd()) {
+        base = it.value();
+    } else {
+        base = m_renderer->renderPage(m_feed, m_pages, m_feedPage, false);
+        insertCache(m_feedPage, base);
+    }
+    if (m_currentBase.size() != base.size()
+            || m_currentBase.cacheKey() != base.cacheKey())
+        m_currentBase = base;
+    m_currentFile = QStringLiteral("image://pages/base?r=%1").arg(++m_baseRev);
+    buildSlotList();
+    requestSlotMedia();
+    emit currentFileChanged();
+    emit imageSlotsChanged();
+    emit stateChanged();
+}
+
+void PageStore::insertCache(int n, const QImage &img)
+{
+    if (m_pageCache.contains(n)) {
+        m_pageCache[n] = img;
+        return;
+    }
+    if (m_pageCache.size() >= 8) {
+        const int oldest = m_cacheOrder.takeFirst();
+        m_pageCache.remove(oldest);
+    }
+    m_pageCache.insert(n, img);
+    m_cacheOrder.append(n);
+}
+
+void PageStore::buildSlotList()
+{
+    QVariantList list;
+    if (m_pages.isEmpty() || m_feedPage >= m_pages.size()) {
+        m_imageSlots = list;
+        return;
+    }
+    syncFeed();
+    const RenderPage &pg = m_pages.at(m_feedPage);
+    for (int i = 0; i < pg.images.size(); ++i) {
+        const ImageSlot &s = pg.images.at(i);
+        const XTweet &t = m_feed.at(s.tweetIndex);
+        const QVector<XMedia> *ml = s.isQuoted ? &t.quoted.media : &t.media;
+        const XMedia *m = (s.mediaIndex < ml->size()) ? &(*ml).at(s.mediaIndex)
+                                                      : nullptr;
+        const bool ready = m && !m->path.isEmpty();
+        const bool failed = m && !ready
+                            && m_client->mediaFailed(t.id, s.mediaIndex,
+                                                     s.isQuoted);
+        QVariantMap o;
+        o["x"] = s.x;
+        o["y"] = s.y;
+        o["w"] = s.w;
+        o["h"] = s.h;
+        o["index"] = i;
+        o["tweetId"] = t.id;
+        o["quoted"] = s.isQuoted;
+        o["ready"] = ready;
+        o["failed"] = failed;
+        o["video"] = s.video;
+        o["nMedia"] = s.nMedia;
+        o["path"] = ready ? QVariant(m_client->mediaPath(m->path))
+                          : QVariant();
+        list.append(o);
+    }
+    m_imageSlots = list;
+}
+
+void PageStore::requestSlotMedia()
+{
+    if (m_pages.isEmpty() || m_feedPage >= m_pages.size())
+        return;
+    syncFeed();
+    QSet<QString> seen;
+    for (const ImageSlot &s : m_pages.at(m_feedPage).images) {
+        const XTweet &t = m_feed.at(s.tweetIndex);
+        if (seen.contains(t.id))
+            continue;
+        seen.insert(t.id);
+        m_client->ensureMediaFor(t.id);
+        if (!t.avatar.isEmpty() && !t.avatar.startsWith("avatars/"))
+            m_avatarWanted.insert(t.id);
+    }
+}
+
+int PageStore::hitSlot(int x, int y)
+{
+    for (int i = 0; i < m_imageSlots.size(); ++i) {
+        const QVariantMap o = m_imageSlots.at(i).toMap();
+        const int sx = o["x"].toInt(), sy = o["y"].toInt();
+        const int sw = o["w"].toInt(), sh = o["h"].toInt();
+        if (x >= sx && x <= sx + sw && y >= sy && y <= sy + sh)
             return i;
     }
     return -1;
 }
 
+QStringList PageStore::slotFiles(int slotIndex)
+{
+    QStringList files;
+    if (slotIndex < 0 || slotIndex >= m_imageSlots.size())
+        return files;
+    const QVariantMap o = m_imageSlots.at(slotIndex).toMap();
+    const QString tweetId = o["tweetId"].toString();
+    const bool quoted = o["quoted"].toBool();
+    syncFeed();
+    for (const XTweet &t : m_feed) {
+        if (t.id != tweetId)
+            continue;
+        const QVector<XMedia> &ml = quoted ? t.quoted.media : t.media;
+        for (const XMedia &m : ml)
+            if (!m.path.isEmpty())
+                files << m_client->mediaPath(m.path);
+        break;
+    }
+    return files;
+}
+
 void PageStore::loadLocal(const QString &number)
 {
-    // 缓存被启动清理掉的页面：回退为按该条目记录的 feed 页重新下载
     const QString base = m_bookDir + "/" + number;
     if (!QFile::exists(base + ".png")) {
-        for (int i = 0; i < m_entries.size(); ++i) {
-            const QJsonObject e = m_entries.at(i).toObject();
-            if (e["number"].toString() == number) {
-                qInfo() << "loadLocal: cache missing for" << number
-                        << "-> re-download feed page" << e["feed_page"].toInt();
-                m_mode = FeedMode;
-                downloadPage(e["feed_page"].toInt(), false);
-                return;
-            }
-        }
+        qInfo() << "loadLocal: page missing" << number;
+        m_error = "收藏页缺失：" + number;
+        emit errorChanged();
+        return;
     }
     m_currentNumber = number;
     m_currentFile = "file://" + base + ".png";
-    m_downloading = -1;
     m_loading = false;
     setStatus("");
     if (m_ink) {
@@ -464,120 +606,56 @@ void PageStore::loadLocal(const QString &number)
     emit stateChanged();
 }
 
-void PageStore::downloadPage(int n, bool force)
-{
-    QUrl url(m_relay + "/page?p=" + QString::number(n));
-    if (force)
-        url.setQuery(url.query() + "&force=1");
-    QNetworkRequest req(url);
-    QNetworkReply *reply = m_nam.get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply, n]() {
-        onPageDownloaded(reply, n);
-    });
-}
-
-void PageStore::onPageDownloaded(QNetworkReply *reply, int n)
-{
-    reply->deleteLater();
-    qInfo() << "onPageDownloaded" << n << "err=" << reply->error();
-    if (reply->error() != QNetworkReply::NoError) {
-        m_loading = false;
-        m_downloading = -1;
-        m_error = "页面下载失败：" + reply->errorString();
-        emit errorChanged();
-        emit stateChanged();
-        return;
-    }
-    const QByteArray bytes = reply->readAll();
-
-    // 分配书页编号（YYYYMMDD + 当日序号）
-    const QString today = QDate::currentDate().toString("yyyyMMdd");
-    if (m_date != today) {
-        m_date = today;
-        m_seq = 0;
-    }
-    m_seq += 1;
-    const QString number = m_date + QString::number(m_seq).rightJustified(3, '0');
-    persistState();
-
-    const QString pagePath = m_bookDir + "/" + number + ".png";
-    QFile pf(pagePath);
-    if (pf.open(QIODevice::WriteOnly)) {
-        pf.write(bytes);
-        pf.close();
-    }
-
-    // 记录 book.json 条目
-    QJsonObject entry;
-    entry["number"] = number;
-    entry["date"] = QDate::currentDate().toString("yyyy-MM-dd");
-    entry["feed_page"] = n;
-    entry["version"] = m_version;
-    entry["posts"] = QJsonArray();
-    m_entries.append(entry);
-    persistBook();
-
-    m_currentNumber = number;
-    m_currentFile = "file://" + pagePath;
-    m_downloading = -1;
-    m_loading = false;
-    setStatus("");
-    if (m_ink)
-        m_ink->clear();
-    emit currentFileChanged();
-    emit stateChanged();
-
-    // 异步取该页帖 ID 补进索引
-    QNetworkRequest req(QUrl(m_relay + "/api/layout?p=" + QString::number(n)));
-    QNetworkReply *lr = m_nam.get(req);
-    connect(lr, &QNetworkReply::finished, this, [this, lr, number]() {
-        onLayoutDownloaded(lr, number);
-    });
-}
-
-void PageStore::onLayoutDownloaded(QNetworkReply *reply, const QString &number)
-{
-    reply->deleteLater();
-    if (reply->error() != QNetworkReply::NoError)
-        return;
-    const QJsonObject o = QJsonDocument::fromJson(reply->readAll()).object();
-    // layout 响应自带总页数：每次下载页面后校正标签，避免陈旧值卡住
-    const int pages = o["pages"].toInt(-1);
-    if (pages > 0 && pages != m_totalPages) {
-        qInfo() << "totalPages corrected:" << m_totalPages << "->" << pages;
-        m_totalPages = pages;
-        updateLabel();
-        emit stateChanged();
-    }
-    const QJsonArray cards = o["cards"].toArray();
-    QJsonArray ids;
-    for (const QJsonValue &c : cards)
-        ids.append(c.toObject()["id"].toString());
-    for (int i = 0; i < m_entries.size(); ++i) {
-        QJsonObject e = m_entries.at(i).toObject();
-        if (e["number"].toString() == number) {
-            e["posts"] = ids;
-            m_entries.replace(i, e);
-            break;
-        }
-    }
-    persistBook();
-}
-
 void PageStore::saveInkNow()
 {
-    if (!m_ink || !m_ink->hasInk() || m_currentNumber.isEmpty())
+    if (!m_ink || !m_ink->hasInk())
         return;
-    const QString base = m_bookDir + "/" + m_currentNumber;
+    // 优先用当前页已分配编号；收藏页（loadLocal）直接沿用 m_currentNumber
+    QString number = m_currentNumber;
+    if (number.isEmpty())
+        number = m_pageNumbers.value(m_feedPage);
+    const bool isNew = number.isEmpty();
+    if (isNew) {
+        if (m_mode != FeedMode)
+            return;
+        const QString today = QDate::currentDate().toString("yyyyMMdd");
+        if (m_date != today) {
+            m_date = today;
+            m_seq = 0;
+        }
+        m_seq += 1;
+        number = m_date + QString::number(m_seq).rightJustified(3, '0');
+        m_pageNumbers[m_feedPage] = number;
+        persistState();
+    }
+    m_currentNumber = number;
+    const QString base = m_bookDir + "/" + number;
+    if (m_mode == FeedMode) {
+        // 合成完整页（文本 + 已就绪图片）落盘，供收藏浏览
+        QImage full = m_renderer->renderPage(m_feed, m_pages, m_feedPage, true);
+        full.save(base + ".png");
+    }
     if (m_ink->saveDraw(base + ".draw.png")) {
-        // 更新 book.json 的 has_draw 标记
+        bool found = false;
         for (int i = 0; i < m_entries.size(); ++i) {
             QJsonObject e = m_entries.at(i).toObject();
-            if (e["number"].toString() == m_currentNumber) {
-                e["has_draw"] = true;
-                m_entries.replace(i, e);
+            if (e["number"].toString() == number) {
+                if (!e["has_draw"].toBool()) {
+                    e["has_draw"] = true;
+                    m_entries.replace(i, e);
+                }
+                found = true;
                 break;
             }
+        }
+        if (!found) {
+            QJsonObject e;
+            e["number"] = number;
+            e["date"] = QDate::currentDate().toString("yyyy-MM-dd");
+            e["feed_page"] = m_feedPage;
+            e["version"] = m_version;
+            e["has_draw"] = true;
+            m_entries.append(e);
         }
         persistBook();
     }

@@ -44,18 +44,9 @@ int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
     app.installEventFilter(new TouchSpy(&app));
-    qInfo() << "BUILD_INK=v7 powerkey-suspend";
+    qInfo() << "BUILD_INK=v9 standalone renderer";
 
     const QString baseDir = "/home/root/xreader";
-
-    QString relay = "http://192.168.3.235:8788";
-    QFile cf(baseDir + "/config");
-    if (cf.open(QIODevice::ReadOnly)) {
-        const QString line = QString::fromUtf8(cf.readAll()).trimmed();
-        cf.close();
-        if (!line.isEmpty())
-            relay = line;
-    }
 
     qmlRegisterType<InkItem>("xreader", 1, 0, "InkItem");
 
@@ -67,9 +58,10 @@ int main(int argc, char *argv[])
     powerKey.start();
 
     PageStore pageStore;
-    pageStore.configure(relay, baseDir);
+    pageStore.configure(baseDir);
 
     QQmlApplicationEngine engine;
+    engine.addImageProvider("pages", pageStore.provider());
     engine.rootContext()->setContextProperty("stylusObj", &stylus);
     engine.rootContext()->setContextProperty("powerKeyObj", &powerKey);
     engine.rootContext()->setContextProperty("pageStore", &pageStore);

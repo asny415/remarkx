@@ -1,26 +1,48 @@
 #!/bin/bash
-# install-remarkable.sh — 一键部署 remarkx 阅读器到 reMarkable 设备
+# install-remarkable.sh — 一键部署 remarkx 独立阅读器到 reMarkable 设备
+#
+# 设备端自抓取/自渲染（无 relay）：需配置代理 + X Cookie 才能直连 x.com。
 #
 # 用法：
-#   ./install-remarkable.sh <设备IP> [relay地址]
+#   ./install-remarkable.sh <设备IP> [--proxy http://PC:7890] \
+#       [--cookie-file /path/cookies.json | --browser brave,chromium]
 #
 #   设备IP      reMarkable 的局域网 IP（需已开启开发者模式/SSH）
-#   relay地址   中转站 URL，默认自动取本机局域网 IP 的 8788 端口
+#   --proxy     X 直连用的代理（须设备能访问，如家里 PC 的 Clash/V2Ray）
+#   --cookie-file  直接提供 X Cookie JSON（{auth_token,ct0,...}）
+#   --browser      从 PC 浏览器自动提取（逗号分隔多个，任一成功即可）
+#   都不给时：交互式询问代理，并尝试从浏览器提取 Cookie
 #
 # 认证：优先 SSH 密钥；否则若装了 sshpass 且设了 SSHPASS 环境变量用密码；
 #       都不满足则 ssh 交互式输入密码（reMarkable 默认 root）。
 #
 # 部署内容：
-#   /home/root/xreader/xr           阅读器（单文件，QML 已内嵌）
+#   /home/root/xreader/xr            阅读器（单文件，QML 已内嵌）
 #   /home/root/xreader/run-reader.sh hello-hotkey 触发的启动脚本
-#   /home/root/xreader/config       中转站地址
+#   /home/root/xreader/config.json   代理/Cookie/字体配置
+#   /home/root/xreader/cookies.json  X 登录态 Cookie
+#   /home/root/xreader/fonts/remarkx-cjk.ttf   渲染字体（换字体同名覆盖）
 #   /home/root/hello-launch/hello-hotkey       长按守护进程
 #   /home/root/hello-launch/hello-hotkey.service 并注册为开机自启
 
 set -euo pipefail
 
-IP="${1:?用法: $0 <设备IP> [relay地址]}"
+IP="${1:?用法: $0 <设备IP> [--proxy URL] [--cookie-file F | --browser B]}"
+shift
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+PROXY=""
+COOKIE_FILE=""
+BROWSERS=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --proxy) PROXY="${2:-}"; shift 2 ;;
+        --cookie-file) COOKIE_FILE="${2:-}"; shift 2 ;;
+        --browser) BROWSERS="${2:-}"; shift 2 ;;
+        *) echo "未知参数: $1"; exit 2 ;;
+    esac
+done
 
 # ---------- 认证方式 ----------
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
@@ -34,14 +56,59 @@ fi
 device() { "${SSH[@]}" "root@${IP}" "$@"; }
 push()   { "${SCP[@]}" "$@"; }
 
-# ---------- 中转站地址 ----------
-if [ -n "${2:-}" ]; then
-    RELAY="$2"
-else
-    LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    RELAY="http://${LAN_IP:-192.168.1.100}:8788"
+# 本地与设备端文件哈希一致则跳过拷贝；不一致才 scp，并标记 CHANGED
+CHANGED=0
+push_if_changed() {
+    local src="$1" dst="$2"
+    local local_md5 remote_md5
+    local_md5="$(md5sum "$src" | awk '{print $1}')"
+    remote_md5="$(device "md5sum \"$dst\" 2>/dev/null" || true)"
+    remote_md5="$(printf '%s' "$remote_md5" | awk '{print $1}' | tr -d '[:space:]')"
+    if [ -n "$remote_md5" ] && [ "$local_md5" = "$remote_md5" ]; then
+        echo "  跳过（未变化）: $dst"
+    else
+        echo "  拷贝: $dst"
+        push "$src" "root@${IP}:$dst"
+        CHANGED=1
+    fi
+}
+
+# ---------- 代理 ----------
+if [ -z "$PROXY" ]; then
+    read -rp "X 直连代理（设备需能访问，如 http://192.168.1.100:7890，直接回车跳过）: " PROXY
 fi
-printf '中转站地址: %s\n' "$RELAY"
+if [ -n "$PROXY" ]; then
+    printf '代理: %s\n' "$PROXY"
+else
+    echo "警告：未配置代理。若 x.com 不可直连，阅读器将无法抓取内容。"
+fi
+
+# ---------- Cookie ----------
+mkdir -p "${ROOT}/deploy/build"
+LOCAL_COOKIE="${ROOT}/deploy/build/cookies.json"
+# 优先用项目 venv 的 python（yt-dlp 较新，能解 v11 Cookie）；否则退回系统 python3
+if [ -x "${ROOT}/.venv/bin/python" ]; then
+    PY="${ROOT}/.venv/bin/python"
+else
+    PY="python3"
+fi
+if [ -n "$COOKIE_FILE" ]; then
+    cp "$COOKIE_FILE" "$LOCAL_COOKIE"
+    echo "使用 Cookie 文件: $COOKIE_FILE"
+elif [ -n "$BROWSERS" ]; then
+    echo "== 从浏览器 [$BROWSERS] 导入 X Cookie =="
+    if ! "$PY" "${ROOT}/deploy/import-cookies.py" "$BROWSERS" "$LOCAL_COOKIE"; then
+        echo "Cookie 导入失败"; exit 1
+    fi
+else
+    echo "== 尝试从浏览器导入 X Cookie（brave/chromium/firefox） =="
+    if ! "$PY" "${ROOT}/deploy/import-cookies.py" \
+            "brave,chromium,firefox" "$LOCAL_COOKIE"; then
+        echo "浏览器导入失败。可用 --browser 指定，或用 --cookie-file 提供。"
+        exit 1
+    fi
+fi
+test -s "$LOCAL_COOKIE" || { echo "Cookie 为空"; exit 1; }
 
 # ---------- 本地构建 ----------
 # 注意：xr 需在 Remarkable SDK 环境（environment-setup-cortexa7hf...）中构建
@@ -58,7 +125,6 @@ echo "== 构建 hello-hotkey (armv7l) =="
 RM_SDK="${RM_SDK:-/home/wwq/remarkable-sdk}"
 CROSS_GCC="$RM_SDK/sysroots/aarch64-codexsdk-linux/usr/bin/arm-remarkable-linux-gnueabi/arm-remarkable-linux-gnueabi-gcc"
 TARGET_SYSROOT="$RM_SDK/sysroots/cortexa7hf-neon-remarkable-linux-gnueabi"
-mkdir -p "${ROOT}/deploy/build"
 if [ -x "$CROSS_GCC" ]; then
     "$CROSS_GCC" -O2 -Wall -mfpu=neon -mfloat-abi=hard -mcpu=cortex-a7 \
         --sysroot="$TARGET_SYSROOT" \
@@ -74,25 +140,42 @@ echo "== 连接设备 ${IP} =="
 device 'echo connected; uname -m' || { echo "无法连接，请检查 IP / SSH"; exit 1; }
 
 # ---------- 部署 ----------
-# 先停守护进程、杀阅读器：Linux 不允许覆盖正在执行的二进制（ETXTBSY）
-echo "== 停止正在运行的阅读器/守护 =="
-device 'systemctl stop hello-hotkey 2>/dev/null || true
-pkill -f "xreader/xr" 2>/dev/null || true
-sleep 1
-# 阅读器会停掉 xochitl，这里拉回原生界面，避免设备停在无 UI 状态
-systemctl start xochitl 2>/dev/null || true
-mkdir -p /home/root/xreader/book /home/root/hello-launch'
+echo "== 准备设备目录 =="
+device 'mkdir -p /home/root/xreader/book /home/root/xreader/fonts /home/root/hello-launch'
 
-echo "== 拷贝阅读器 =="
-push "${ROOT}/xreader-app/build/xr" "root@${IP}:/home/root/xreader/xr"
-push "${ROOT}/device/launcher/run-reader.sh" "root@${IP}:/home/root/xreader/run-reader.sh"
-printf '%s' "$RELAY" > "${ROOT}/deploy/build/config"
-push "${ROOT}/deploy/build/config" "root@${IP}:/home/root/xreader/config"
+echo "== 比较并拷贝 =="
+push_if_changed "${ROOT}/xreader-app/build/xr" "/home/root/xreader/xr"
+push_if_changed "${ROOT}/device/launcher/run-reader.sh" "/home/root/xreader/run-reader.sh"
+push_if_changed "${ROOT}/xreader-app/fonts/remarkx-cjk.ttf" "/home/root/xreader/fonts/remarkx-cjk.ttf"
+
+echo "== 写配置 =="
+# 代理无协议头时补 http://，避免设备端解析失败
+if [ -n "$PROXY" ] && ! printf '%s' "$PROXY" | grep -q '://'; then
+    PROXY="http://${PROXY}"
+fi
+{
+    printf '{\n'
+    printf '  "proxy": "%s",\n' "$PROXY"
+    printf '  "cookies": "/home/root/xreader/cookies.json"\n'
+    printf '}\n'
+} > "${ROOT}/deploy/build/config.json"
+push_if_changed "${ROOT}/deploy/build/config.json" "/home/root/xreader/config.json"
+push_if_changed "$LOCAL_COOKIE" "/home/root/xreader/cookies.json"
 
 echo "== 拷贝长按守护 =="
-push "${ROOT}/deploy/build/hello-hotkey" "root@${IP}:/home/root/hello-launch/hello-hotkey"
-push "${ROOT}/device/launcher/hello-launch.sh" "root@${IP}:/home/root/hello-launch/hello-launch.sh"
-push "${ROOT}/device/launcher/hello-hotkey.service" "root@${IP}:/home/root/hello-launch/hello-hotkey.service"
+push_if_changed "${ROOT}/deploy/build/hello-hotkey" "/home/root/hello-launch/hello-hotkey"
+push_if_changed "${ROOT}/device/launcher/hello-launch.sh" "/home/root/hello-launch/hello-launch.sh"
+push_if_changed "${ROOT}/device/launcher/hello-hotkey.service" "/home/root/hello-launch/hello-hotkey.service"
+
+# 只有文件有变化时才停服务/杀阅读器（Linux 不允许覆盖正在执行的二进制 ETXTBSY）；
+# 全部未变化则不动运行中的阅读器
+if [ "$CHANGED" = "1" ]; then
+    echo "== 停止正在运行的阅读器/守护 =="
+    device 'systemctl stop hello-hotkey 2>/dev/null || true
+pkill -f "xreader/xr" 2>/dev/null || true
+sleep 1
+systemctl start xochitl 2>/dev/null || true'
+fi
 
 echo "== 安装服务并启用 =="
 device 'chmod +x /home/root/xreader/run-reader.sh /home/root/hello-launch/*.sh /home/root/hello-launch/hello-hotkey
@@ -103,10 +186,10 @@ systemctl start hello-hotkey'
 
 # ---------- 校验 ----------
 echo "== 校验 =="
-device 'ls -l /home/root/xreader/xr /home/root/hello-launch/hello-hotkey /home/root/xreader/config
+device 'ls -l /home/root/xreader/xr /home/root/xreader/fonts/remarkx-cjk.ttf /home/root/xreader/config.json /home/root/xreader/cookies.json /home/root/hello-launch/hello-hotkey
 systemctl is-active hello-hotkey
 pgrep -x xochitl >/dev/null && echo "xochitl 运行中（原声界面正常）"'
 
 echo
-echo "安装完成。长按顶部中央 3 秒即可进入阅读器。"
-echo "中转站: ${RELAY}（请确认该地址设备能访问、relay 在运行）"
+echo "安装完成。长按顶部中央 3 秒进入阅读器。"
+echo "代理: ${PROXY:-<未配置>}；Cookie 已部署到 /home/root/xreader/cookies.json"

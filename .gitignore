@@ -1,11 +1,12 @@
 # 数据与凭据（绝不入库）
-relay/data/
+**/cookies.json
 **/session.json
 *.db
 *.db-*
 
-# 本地运行配置（含代理等环境相关项；模板见 relay/config.example.json）
-relay/config.json
+# 设备端运行配置（含代理等环境相关项）
+xreader-app/config.json
+xreader-app/cookies.json
 
 # Python
 __pycache__/
@@ -32,9 +33,6 @@ nohup.out
 
 # 杂物
 *.apk
-
-# 设备字体（方正书宋，体积大且有版权，仅本地使用）
-relay/fonts/
 
 # 部署脚本的本地构建产物
 deploy/build/

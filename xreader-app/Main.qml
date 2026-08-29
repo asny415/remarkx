@@ -27,6 +27,53 @@ Window {
         }
     }
 
+    // 图片懒加载层：底层文字位图只画占位框，这里负责贴图/状态文案
+    Item {
+        id: photoLayer
+        anchors.fill: parent
+        Repeater {
+            model: pageStore.imageSlots
+            delegate: Item {
+                x: modelData.x
+                y: modelData.y
+                width: modelData.w
+                height: modelData.h
+                Rectangle {
+                    anchors.fill: parent
+                    color: "#ececec"
+                    border.color: "#d9d9d9"
+                    border.width: 2
+                }
+                Image {
+                    anchors.fill: parent
+                    source: modelData.ready ? ("file://" + modelData.path) : ""
+                    fillMode: Image.PreserveAspectFit
+                    cache: false
+                    visible: modelData.ready
+                }
+                Text {
+                    anchors.centerIn: parent
+                    text: modelData.ready ? "" : (modelData.failed ? "加载失败" : "图片加载中")
+                    font.pixelSize: 26
+                    color: "#8a8a8a"
+                    visible: !modelData.ready
+                }
+                Text {
+                    anchors.top: parent.top
+                    anchors.right: parent.right
+                    anchors.margins: 8
+                    text: modelData.nMedia > 1 ? ("共 " + modelData.nMedia + " 图") : ""
+                    font.pixelSize: 20
+                    font.bold: true
+                    color: "white"
+                    style: Text.Outline
+                    styleColor: "#333333"
+                    visible: modelData.nMedia > 1
+                }
+            }
+        }
+    }
+
     InkItem {
         id: ink
         anchors.fill: parent
@@ -80,6 +127,13 @@ Window {
             const dy = mouse.y - pressPt.y
             const adx = Math.abs(dx)
             const ady = Math.abs(dy)
+            // 手指短点：命中图片则打开全屏看图
+            if (adx < 90 && ady < 90) {
+                var idx = pageStore.hitSlot(mouse.x, mouse.y)
+                if (idx >= 0)
+                    fullscreen.open(idx)
+                return
+            }
             // 有效距离 + 主方向水平，移动一点点不算
             if (adx < 90 || adx <= ady)
                 return
@@ -438,6 +492,124 @@ Window {
             if (ady < 90 || ady <= adx)
                 return
             pageStore.refresh()
+        }
+    }
+
+    // 图片全屏查看：点按任意处/顶部下滑关闭，左右滑在槽位媒体间切换
+    Item {
+        id: fullscreen
+        visible: false
+        anchors.fill: parent
+        z: 200
+
+        property int slotIndex: -1
+        property var files: []
+        property int currentIdx: 0
+        property string currentPath: ""
+        property string label: ""
+
+        function updateCurrent() {
+            if (files.length === 0) {
+                currentPath = ""
+                label = "图片加载中…"
+            } else {
+                if (currentIdx >= files.length)
+                    currentIdx = 0
+                currentPath = "file://" + files[currentIdx]
+                label = "图片 " + (currentIdx + 1) + "/" + files.length
+            }
+        }
+        function open(idx) {
+            slotIndex = idx
+            files = pageStore.slotFiles(idx)
+            currentIdx = 0
+            updateCurrent()
+            visible = true
+            pageStore.requestFullRefresh()
+        }
+        function close() {
+            visible = false
+            pageStore.requestFullRefresh()
+        }
+        function nextImg() {
+            if (files.length > 1) {
+                currentIdx = (currentIdx + 1) % files.length
+                updateCurrent()
+                pageStore.requestFullRefresh()
+            }
+        }
+        function prevImg() {
+            if (files.length > 1) {
+                currentIdx = (currentIdx - 1 + files.length) % files.length
+                updateCurrent()
+                pageStore.requestFullRefresh()
+            }
+        }
+
+        // 媒体懒加载就绪时自动刷新全屏内容
+        Connections {
+            target: pageStore
+            function onImageSlotsChanged() {
+                if (fullscreen.visible) {
+                    fullscreen.files = pageStore.slotFiles(fullscreen.slotIndex)
+                    fullscreen.updateCurrent()
+                }
+            }
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            color: "white"
+        }
+        Image {
+            anchors.fill: parent
+            anchors.margins: 40
+            source: fullscreen.currentPath
+            fillMode: Image.PreserveAspectFit
+            cache: false
+        }
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 40
+            text: fullscreen.label
+            font.pixelSize: 30
+            color: "#888888"
+        }
+        Text {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.margins: 30
+            text: "点按关闭 · 左右滑切换"
+            font.pixelSize: 24
+            color: "#aaaaaa"
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            property point p0
+            property bool armed: false
+            onPressed: (m) => {
+                idleTimer.restart()
+                armed = true
+                p0 = Qt.point(m.x, m.y)
+            }
+            onReleased: (m) => {
+                if (!armed)
+                    return
+                armed = false
+                const dx = m.x - p0.x
+                const dy = m.y - p0.y
+                if (Math.abs(dx) < 60 && Math.abs(dy) < 60) {
+                    fullscreen.close()
+                    return
+                }
+                if (Math.abs(dx) > Math.abs(dy)) {
+                    dx < 0 ? fullscreen.nextImg() : fullscreen.prevImg()
+                } else if (dy > 90) {
+                    fullscreen.close()   // 顶部下滑关闭
+                }
+            }
         }
     }
 }

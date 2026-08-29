@@ -23,13 +23,13 @@ IP="${1:?用法: $0 <设备IP> [relay地址]}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ---------- 认证方式 ----------
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 if command -v sshpass >/dev/null 2>&1 && [ -n "${SSHPASS:-}" ]; then
-    SSH=(sshpass -e ssh "${SSH_OPTS}")
-    SCP=(sshpass -e scp "${SSH_OPTS}")
+    SSH=(sshpass -e ssh "${SSH_OPTS[@]}")
+    SCP=(sshpass -e scp "${SSH_OPTS[@]}")
 else
-    SSH=(ssh "${SSH_OPTS}")
-    SCP=(scp "${SSH_OPTS}")
+    SSH=(ssh "${SSH_OPTS[@]}")
+    SCP=(scp "${SSH_OPTS[@]}")
 fi
 device() { "${SSH[@]}" "root@${IP}" "$@"; }
 push()   { "${SCP[@]}" "$@"; }
@@ -53,18 +53,33 @@ fi
 cmake --build "${ROOT}/xreader-app/build" >/dev/null
 test -x "${ROOT}/xreader-app/build/xr" || { echo "构建 xr 失败（需在 SDK 环境中运行本脚本）"; exit 1; }
 
-echo "== 构建 hello-hotkey =="
+# hello-hotkey 需交叉编译为 armv7l（用本机编译器会 203/EXEC 跑不起来）
+echo "== 构建 hello-hotkey (armv7l) =="
+RM_SDK="${RM_SDK:-/home/wwq/remarkable-sdk}"
+CROSS_GCC="$RM_SDK/sysroots/aarch64-codexsdk-linux/usr/bin/arm-remarkable-linux-gnueabi/arm-remarkable-linux-gnueabi-gcc"
+TARGET_SYSROOT="$RM_SDK/sysroots/cortexa7hf-neon-remarkable-linux-gnueabi"
 mkdir -p "${ROOT}/deploy/build"
-cc -O2 -Wall -o "${ROOT}/deploy/build/hello-hotkey" \
-    "${ROOT}/device/launcher/hello-hotkey.c"
+if [ -x "$CROSS_GCC" ]; then
+    "$CROSS_GCC" -O2 -Wall -mfpu=neon -mfloat-abi=hard -mcpu=cortex-a7 \
+        --sysroot="$TARGET_SYSROOT" \
+        -o "${ROOT}/deploy/build/hello-hotkey" \
+        "${ROOT}/device/launcher/hello-hotkey.c"
+else
+    echo "找不到交叉编译器 $CROSS_GCC（可用 RM_SDK 指定 SDK 路径）"
+    exit 1
+fi
 
 # ---------- 连通性检查 ----------
 echo "== 连接设备 ${IP} =="
 device 'echo connected; uname -m' || { echo "无法连接，请检查 IP / SSH"; exit 1; }
 
 # ---------- 部署 ----------
-echo "== 创建目录 =="
-device 'mkdir -p /home/root/xreader/book /home/root/hello-launch'
+# 先停守护进程、杀阅读器：Linux 不允许覆盖正在执行的二进制（ETXTBSY）
+echo "== 停止正在运行的阅读器/守护 =="
+device 'systemctl stop hello-hotkey 2>/dev/null || true
+pkill -f "xreader/xr" 2>/dev/null || true
+sleep 1
+mkdir -p /home/root/xreader/book /home/root/hello-launch'
 
 echo "== 拷贝阅读器 =="
 push "${ROOT}/xreader-app/build/xr" "root@${IP}:/home/root/xreader/xr"
@@ -82,7 +97,7 @@ device 'chmod +x /home/root/xreader/run-reader.sh /home/root/hello-launch/*.sh /
 ln -sf /home/root/hello-launch/hello-hotkey.service /etc/systemd/system/hello-hotkey.service
 systemctl daemon-reload
 systemctl enable hello-hotkey >/dev/null 2>&1
-systemctl restart hello-hotkey'
+systemctl start hello-hotkey'
 
 # ---------- 校验 ----------
 echo "== 校验 =="

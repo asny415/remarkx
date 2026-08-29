@@ -4,7 +4,6 @@
 #include <QLibraryInfo>
 #include <QPainter>
 #include <QPen>
-#include <QTimer>
 
 #include <dlfcn.h>
 
@@ -45,12 +44,6 @@ InkItem::InkItem(QQuickItem *parent) : QQuickPaintedItem(parent)
     setAcceptedMouseButtons(Qt::NoButton);
     m_img = QImage(SW, SH, QImage::Format_ARGB32_Premultiplied);
     m_img.fill(Qt::transparent);
-    // 逐段提交会被 swtcon 掉帧导致虚线；大区域提交又慢(~300ms)。
-    // 用 ~20ms 节流把近段笔迹合并成"小区域"提交：小区域处理快、
-    // 覆盖近段保证实线、不掉帧。之前节流不跟手是因为用了 ±24 大矩形。
-    m_flushTimer = new QTimer(this);
-    m_flushTimer->setInterval(20);
-    connect(m_flushTimer, &QTimer::timeout, this, &InkItem::flushInk);
 }
 
 void InkItem::setStylus(QObject *stylus)
@@ -123,8 +116,6 @@ void InkItem::onPenMove(int x, int y, int pressure)
 void InkItem::onPenUp()
 {
     m_stroke = false;
-    // 收尾：把节流期间累积的笔迹段立即提交，不丢尾段
-    flushInk();
 }
 
 void InkItem::onErDown(int x, int y, int pressure)
@@ -153,8 +144,9 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
                       Qt::RoundCap, Qt::RoundJoin));
     } else {
         p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        // 抗锯齿：让细斜线连续（无 AA 会在覆盖不足处出现断点→DU 显示成 dash）
+        p.setRenderHint(QPainter::Antialiasing, true);
         m_width = 1.2 + qreal(pressure) / 4095.0 * 3.5;
-        // 纯黑：让 libqsgepaper 的灰度扫描把笔迹区域判为"非灰度"，走快速波形
         p.setPen(QPen(QColor(0, 0, 0), m_width, Qt::SolidLine,
                       Qt::RoundCap, Qt::RoundJoin));
     }
@@ -165,10 +157,10 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
         m_hasInk = true;
         emit hasInkChanged();
     }
-    // 首段立即通过 pen 快速路径显示
-    m_pending = segmentRect(m_last, m_last);
-    if (!fastSubmit(m_pending))
-        update(m_pending);
+    // 首段立即通过 pen 快速路径显示（紧致区域，仅笔迹范围）
+    QRect r = segmentRect(m_last, m_last);
+    if (!fastSubmit(r))
+        update(r);
 }
 
 void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
@@ -183,37 +175,25 @@ void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
                       Qt::RoundCap, Qt::RoundJoin));
     } else {
         p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        p.setRenderHint(QPainter::Antialiasing, true);
         m_width = 1.2 + qreal(pressure) / 4095.0 * 3.5;
-        // 纯黑：让 libqsgepaper 的灰度扫描把笔迹区域判为"非灰度"，走快速波形
         p.setPen(QPen(QColor(0, 0, 0), m_width, Qt::SolidLine,
                       Qt::RoundCap, Qt::RoundJoin));
     }
     p.drawLine(m_last, cur);
     p.end();
-    m_pending = m_pending.isNull()
-                    ? segmentRect(m_last, cur)
-                    : m_pending.united(segmentRect(m_last, cur));
+    QRect r = segmentRect(m_last, cur);
     m_last = cur;
-    // 节流合并：定时器到点把小区域一次性提交（小区域快 + 覆盖近段防虚线）
-    if (!m_flushTimer->isActive())
-        m_flushTimer->start();
+    // 逐段直接提交：每次只刷笔迹段的紧致区域，矩形小、不抖周围页面
+    if (!fastSubmit(r))
+        update(r);
 }
 
-void InkItem::flushInk()
-{
-    if (m_pending.isNull())
-        return;
-    if (!fastSubmit(m_pending))
-        update(m_pending);
-    m_pending = QRect();
-    m_flushTimer->stop();
-}
-
-// 笔迹段的紧致脏区：线段包围盒 + 笔宽半径（含圆帽与抗锯齿余量）。
-// 官方笔迹只刷新笔尖经过的细条区域，整块大矩形会闪得很厉害。
+// 笔迹段的紧致脏区：线段包围盒 + 笔宽半径。收紧到最小，DU 只碰笔迹像素，
+// 避免把矩形里的页面灰度一起抖成"均匀 dash / 闪烁"。
 QRect InkItem::segmentRect(const QPointF &a, const QPointF &b) const
 {
-    const int r = qMax(4, int(m_width / 2) + 2);
+    const int r = qMax(2, int(m_width / 2) + 1);
     return QRect(a.toPoint(), b.toPoint()).normalized().adjusted(-r, -r, r, r);
 }
 

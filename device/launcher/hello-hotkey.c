@@ -189,6 +189,12 @@ int main(void) {
                 printf("hello-hotkey: long-press at (%d,%d), launching\n",
                        cur_x, cur_y);
                 launch();
+                /* 启动（阻塞到阅读器退出）后复位触摸状态，避免残留
+                 * 状态触发同一次长按再次启动；下一次按压会重新建立状态 */
+                tracking = -1;
+                down_x = down_y = cur_x = cur_y = -1;
+                down_time = 0;
+                launched = 0;
             }
         }
     }

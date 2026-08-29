@@ -35,3 +35,6 @@ nohup.out
 
 # 设备字体（方正书宋，体积大且有版权，仅本地使用）
 relay/fonts/
+
+# 部署脚本的本地构建产物
+deploy/build/

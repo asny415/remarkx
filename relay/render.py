@@ -710,27 +710,42 @@ class Renderer:
                   self._ellipsize(draw, meta_line, f_meta, name_w),
                   font=f_meta, fill=FG_FAINT)
 
+    def _draw_img_placeholder(self, draw, ix, py, dw_, dh):
+        """媒体尚未下载/加载失败时画占位框，避免整块留白。"""
+        draw.rectangle([ix - 3, py - 3, ix + dw_ + 3, py + dh + 3],
+                       outline=CARD_BORDER, width=2)
+        draw.rectangle([ix, py, ix + dw_, py + dh], fill="#ececec")
+        label = "图片加载中"
+        f = self.font(26)
+        tw = int(self._text_width(draw, label, f))
+        draw.text((ix + (dw_ - tw) / 2, py + (dh - 30) / 2),
+                  label, font=f, fill=FG_FAINT)
+
     def _draw_img(self, page, draw, info, px):
         dw_, dh = info["dw"], info["dh"]
         py = info["y"]
         tw = info.get("tw") or TEXT_W
         ind = info.get("ind") or 0
+        ix = px + ind + (tw - dw_) // 2
         # 懒加载：path 由 ensure_media 在渲染前写入媒体 dict，绘制时读实时值
         m = info.get("m")
         path = (m.get("path") if isinstance(m, dict) else "") \
             or info.get("path", "")
-        if not path:
-            return  # 媒体尚未下载，留白（正常流程渲染前已下载，不应走到）
         key = (path, dw_, dh)
         photo = self._resize_cache.get(key)
         if photo is None:
+            if not path:
+                # 媒体尚未下载 → 占位
+                self._draw_img_placeholder(draw, ix, py, dw_, dh)
+                return
             img = self._load_photo({"path": path})
             if img is None:
+                # 文件缺失/损坏 → 占位
+                self._draw_img_placeholder(draw, ix, py, dw_, dh)
                 return
             rz, dw_, dh = self._fit(img, tw, IMG_MAX_H)
             photo = rz
             self._resize_cache[key] = photo
-        ix = px + ind + (tw - dw_) // 2
         draw.rectangle([ix - 3, py - 3, ix + dw_ + 3, py + dh + 3],
                        outline=CARD_BORDER, width=2)
         page.paste(photo, (ix, py))

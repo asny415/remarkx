@@ -22,7 +22,7 @@
 #define REGION_X_MAX 852
 #define REGION_Y_MIN 0
 #define REGION_Y_MAX 200
-#define MIN_HOLD_MS 700        /* 长按阈值：防止阅读时误触 */
+#define MIN_HOLD_MS 3000       /* 长按阈值：须稳定按住 3s 才启动，防阅读/书写误触 */
 #define MAX_HOLD_MS 6000
 #define MAX_MOVE_PX 40         /* 长按期间允许的手指抖动 */
 #define LAUNCHER "/home/root/xreader/run-reader.sh"
@@ -38,6 +38,18 @@ static int in_region(int raw_x, int raw_y) {
     int sy = 1871 - raw_y;
     return sx >= REGION_X_MIN && sx <= REGION_X_MAX &&
            sy >= REGION_Y_MIN && sy <= REGION_Y_MAX;
+}
+
+/* 阅读器(xr)是否在跑：在跑则绝不重复启动，避免误触杀掉当前阅读会话。
+ * 用 pgrep -x（精确进程名）而非 -f，避免 -f 匹配到执行命令的 shell 自身。 */
+static int reader_running(void) {
+    return system("pgrep -x xr >/dev/null 2>&1") == 0;
+}
+
+/* xochitl 是否在跑：reMarkable 上 xochitl 是唯一 UI 前台，它不跑说明
+ * 不处在原生界面（可能在阅读器/其他状态），此时不启动，防误触 */
+static int xochitl_running(void) {
+    return system("pgrep -x xochitl >/dev/null 2>&1") == 0;
 }
 
 static int find_touch_device(void) {
@@ -86,7 +98,7 @@ int main(void) {
         return 1;
     }
     printf("hello-hotkey: long-press top-center [%d..%d]x[%d..%d] "
-           "(>= %dms, move<= %dpx)\n",
+           "(>= %dms, move<= %dpx, only when reader idle & xochitl up)\n",
            REGION_X_MIN, REGION_X_MAX, REGION_Y_MIN, REGION_Y_MAX,
            MIN_HOLD_MS, MAX_MOVE_PX);
 
@@ -115,6 +127,12 @@ int main(void) {
                         in_region(down_x, down_y) &&
                         abs(cur_x - down_x) <= MAX_MOVE_PX &&
                         abs(cur_y - down_y) <= MAX_MOVE_PX) {
+                        /* 前台守卫：阅读器在跑或不在 xochitl 前台则不启动 */
+                        if (reader_running() || !xochitl_running()) {
+                            printf("hello-hotkey: skip (reader=%d xochitl=%d)\n",
+                                   reader_running(), xochitl_running());
+                            continue;
+                        }
                         printf("hello-hotkey: long-press at (%d,%d), launching\n",
                                cur_x, cur_y);
                         launch();

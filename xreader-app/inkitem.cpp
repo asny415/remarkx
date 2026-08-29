@@ -49,7 +49,7 @@ InkItem::InkItem(QQuickItem *parent) : QQuickPaintedItem(parent)
     // 用 ~20ms 节流把近段笔迹合并成"小区域"提交：小区域处理快、
     // 覆盖近段保证实线、不掉帧。之前节流不跟手是因为用了 ±24 大矩形。
     m_flushTimer = new QTimer(this);
-    m_flushTimer->setInterval(40);
+    m_flushTimer->setInterval(2);
     connect(m_flushTimer, &QTimer::timeout, this, &InkItem::flushInk);
 }
 

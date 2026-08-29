@@ -56,6 +56,17 @@ void PageStore::configure(const QString &baseDir)
             &PageStore::onFetchError);
     connect(m_client, &XClient::mediaReady, this, &PageStore::onMediaReady);
 
+    // 头像下载到位后的基础页重渲染去抖：一页多次头像到达合并成一次重绘
+    m_avatarTimer = new QTimer(this);
+    m_avatarTimer->setSingleShot(true);
+    m_avatarTimer->setInterval(300);
+    connect(m_avatarTimer, &QTimer::timeout, this, [this]() {
+        if (m_avatarRefreshPending) {
+            m_avatarRefreshPending = false;
+            renderCurrent(true);
+        }
+    });
+
     m_provider = new PageImageProvider(this);
 }
 
@@ -197,7 +208,7 @@ void PageStore::syncFeed()
     m_feed = m_client->feed();
 }
 
-void PageStore::rebuildPages()
+void PageStore::rebuildPages(bool resetPageNumbers)
 {
     syncFeed();
     m_pages = m_renderer->paginate(m_feed);
@@ -205,13 +216,16 @@ void PageStore::rebuildPages()
     m_version = QStringLiteral("s%1").arg(++m_sessionSeq);
     m_pageCache.clear();
     m_cacheOrder.clear();
-    m_pageNumbers.clear();
+    // 只有整批刷新（homeReady）才清收藏编号映射；续抓（extend）只是尾部追加，
+    // 已展示页面不变，编号必须保留，否则同页反复收藏出重复页
+    if (resetPageNumbers)
+        m_pageNumbers.clear();
     updateLabel();
 }
 
 void PageStore::onHomeReady()
 {
-    rebuildPages();
+    rebuildPages(true);
     m_waitingOlder = false;
     m_loading = false;
     setStatus("");
@@ -220,7 +234,8 @@ void PageStore::onHomeReady()
 
 void PageStore::onOlderReady()
 {
-    rebuildPages();
+    rebuildPages(false);
+    m_waitingOlder = false;
     m_loading = false;
     setStatus("");
     goPage(m_feedPage);
@@ -228,6 +243,8 @@ void PageStore::onOlderReady()
 
 void PageStore::onFetchError(const QString &msg)
 {
+    // 续抓失败也必须解锁翻页，否则 next/prev 永远被 m_waitingOlder 卡住
+    m_waitingOlder = false;
     m_loading = false;
     setStatus("");
     m_error = msg;
@@ -236,31 +253,55 @@ void PageStore::onFetchError(const QString &msg)
 
 void PageStore::onMediaReady(const QString &tweetId)
 {
-    // 只关心当前页的推文
-    bool onPage = false;
-    if (m_mode == FeedMode && !m_pages.isEmpty()
-            && m_feedPage < m_pages.size()) {
-        for (const ImageSlot &s : m_pages.at(m_feedPage).images) {
-            if (m_feed[s.tweetIndex].id == tweetId) {
-                onPage = true;
+    if (m_mode != FeedMode || m_pages.isEmpty())
+        return;
+    syncFeed();   // 确保 m_feed 与 m_pages 索引一致
+    const int cur = m_feedPage;
+    bool onCurrent = false;
+    if (cur >= 0 && cur < m_pages.size()) {
+        for (const ImageSlot &s : m_pages.at(cur).images) {
+            if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
+                continue;
+            if (m_feed.at(s.tweetIndex).id == tweetId) {
+                onCurrent = true;
                 break;
             }
         }
     }
-    if (!onPage)
-        return;
-    // 刷新槽位状态：QML overlay 换图 / 隐藏占位
-    buildSlotList();
-    emit imageSlotsChanged();
-    // 头像到位 → 重渲染基础页
-    if (m_avatarWanted.contains(tweetId)) {
-        m_avatarWanted.remove(tweetId);
-        syncFeed();
-        for (int i = 0; i < m_feed.size(); ++i) {
-            if (m_feed[i].id == tweetId && m_feed[i].avatar.startsWith("avatars/")) {
-                renderCurrent(true);
+    if (onCurrent) {
+        // 刷新槽位状态：QML overlay 换图 / 隐藏占位
+        buildSlotList();
+        emit imageSlotsChanged();
+        // 头像到位 → 去抖后重渲染基础页
+        if (m_avatarWanted.contains(tweetId)) {
+            m_avatarWanted.remove(tweetId);
+            for (const XTweet &t : m_feed) {
+                if (t.id == tweetId && t.avatar.startsWith("avatars/")) {
+                    m_avatarRefreshPending = true;
+                    m_avatarTimer->start();
+                    break;
+                }
+            }
+        }
+    }
+    // 所有带收藏编号且含此推文的页 → 用最新图片重存合成页（补上先前缺失的图）
+    for (auto it = m_pageNumbers.cbegin(); it != m_pageNumbers.cend(); ++it) {
+        const int pg = it.key();
+        if (pg < 0 || pg >= m_pages.size())
+            continue;
+        bool has = false;
+        for (const ImageSlot &s : m_pages.at(pg).images) {
+            if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
+                continue;
+            if (m_feed.at(s.tweetIndex).id == tweetId) {
+                has = true;
                 break;
             }
+        }
+        if (has) {
+            const QString num = it.value();
+            QImage full = m_renderer->renderPage(m_feed, m_pages, pg, true);
+            full.save(m_bookDir + "/" + num + ".png", "PNG", 30);
         }
     }
 }
@@ -312,6 +353,12 @@ void PageStore::enterFav(int index)
     loadLocal(nums.at(index));
     updateLabel();
     emit stateChanged();
+    // 页切换计数
+    const QString key = QStringLiteral("v") + nums.at(index);
+    if (m_lastDisplayKey != key) {
+        m_lastDisplayKey = key;
+        ++m_pageKey;
+    }
 }
 
 // 删除当前收藏页：移除笔迹图与页面 PNG，从索引剔除，跳到下一张收藏
@@ -455,11 +502,26 @@ void PageStore::goPage(int n)
     updateLabel();
     setStatus("");
     renderCurrent();
+    // 页切换计数（供 QML 每 N 页强制刷新）
+    const QString key = QStringLiteral("f%1").arg(m_feedPage);
+    if (m_lastDisplayKey != key) {
+        m_lastDisplayKey = key;
+        ++m_pageKey;
+        // 换页：恢复本页已存笔迹，否则清空（避免上一页笔迹叠到新页）
+        if (m_ink) {
+            const QString num = m_pageNumbers.value(m_feedPage);
+            if (!num.isEmpty()
+                    && QFile::exists(m_bookDir + "/" + num + ".draw.png"))
+                m_ink->loadDraw(m_bookDir + "/" + num + ".draw.png");
+            else
+                m_ink->clear();
+        }
+    }
 }
 
 void PageStore::renderCurrent(bool force)
 {
-    if (m_pages.isEmpty()) {
+    if (m_pages.isEmpty() || m_feedPage >= m_pages.size()) {
         m_currentBase = QImage();
         return;
     }
@@ -472,9 +534,7 @@ void PageStore::renderCurrent(bool force)
         base = m_renderer->renderPage(m_feed, m_pages, m_feedPage, false);
         insertCache(m_feedPage, base);
     }
-    if (m_currentBase.size() != base.size()
-            || m_currentBase.cacheKey() != base.cacheKey())
-        m_currentBase = base;
+    m_currentBase = base;
     m_currentFile = QStringLiteral("image://pages/base?r=%1").arg(++m_baseRev);
     buildSlotList();
     requestSlotMedia();
@@ -508,6 +568,8 @@ void PageStore::buildSlotList()
     const RenderPage &pg = m_pages.at(m_feedPage);
     for (int i = 0; i < pg.images.size(); ++i) {
         const ImageSlot &s = pg.images.at(i);
+        if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
+            continue;
         const XTweet &t = m_feed.at(s.tweetIndex);
         const QVector<XMedia> *ml = s.isQuoted ? &t.quoted.media : &t.media;
         const XMedia *m = (s.mediaIndex < ml->size()) ? &(*ml).at(s.mediaIndex)
@@ -542,6 +604,8 @@ void PageStore::requestSlotMedia()
     syncFeed();
     QSet<QString> seen;
     for (const ImageSlot &s : m_pages.at(m_feedPage).images) {
+        if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
+            continue;
         const XTweet &t = m_feed.at(s.tweetIndex);
         if (seen.contains(t.id))
             continue;
@@ -633,7 +697,7 @@ void PageStore::saveInkNow()
     if (m_mode == FeedMode) {
         // 合成完整页（文本 + 已就绪图片）落盘，供收藏浏览
         QImage full = m_renderer->renderPage(m_feed, m_pages, m_feedPage, true);
-        full.save(base + ".png");
+        full.save(base + ".png", "PNG", 30);
     }
     if (m_ink->saveDraw(base + ".draw.png")) {
         bool found = false;

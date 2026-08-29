@@ -41,6 +41,7 @@ class PageStore : public QObject {
     Q_PROPERTY(QVariantList imageSlots READ imageSlots NOTIFY imageSlotsChanged)
     Q_PROPERTY(int feedPage READ feedPage NOTIFY stateChanged)
     Q_PROPERTY(int totalPages READ totalPages NOTIFY stateChanged)
+    Q_PROPERTY(int pageKey READ pageKey NOTIFY stateChanged)
     Q_PROPERTY(bool loading READ loading NOTIFY stateChanged)
     Q_PROPERTY(bool favMode READ favMode NOTIFY stateChanged)
     Q_PROPERTY(QString status READ status NOTIFY stateChanged)
@@ -58,6 +59,7 @@ public:
     QVariantList imageSlots() const { return m_imageSlots; }
     int feedPage() const { return m_feedPage; }
     int totalPages() const { return m_totalPages; }
+    int pageKey() const { return m_pageKey; }
     bool loading() const { return m_loading; }
     bool favMode() const { return m_mode == FavMode; }
     QString status() const { return m_status; }
@@ -95,7 +97,7 @@ private:
 
     void goPage(int n);
     void loadLocal(const QString &number);
-    void rebuildPages();
+    void rebuildPages(bool resetPageNumbers);
     void syncFeed();
     void renderCurrent(bool force = false);
     void insertCache(int n, const QImage &img);
@@ -157,4 +159,8 @@ private:
     Mode m_mode = FeedMode;
     int m_favIndex = 0;
     int m_baseRev = 0;
+    int m_pageKey = 0;
+    QString m_lastDisplayKey;
+    QTimer *m_avatarTimer = nullptr;
+    bool m_avatarRefreshPending = false;
 };

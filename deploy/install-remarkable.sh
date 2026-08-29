@@ -56,9 +56,11 @@ fi
 device() { "${SSH[@]}" "root@${IP}" "$@"; }
 push()   { "${SCP[@]}" "$@"; }
 
-# 本地与设备端文件哈希一致则跳过拷贝；不一致才 scp，并标记 CHANGED
+# 阶段一：比较本地与设备端哈希，记录需要拷贝的文件（不立即拷贝，
+# 必须先确定 CHANGED 再停服务，否则正在运行的二进制被覆盖会 ETXTBSY）
+TO_COPY=()
 CHANGED=0
-push_if_changed() {
+check_changed() {
     local src="$1" dst="$2"
     local local_md5 remote_md5
     local_md5="$(md5sum "$src" | awk '{print $1}')"
@@ -67,10 +69,21 @@ push_if_changed() {
     if [ -n "$remote_md5" ] && [ "$local_md5" = "$remote_md5" ]; then
         echo "  跳过（未变化）: $dst"
     else
-        echo "  拷贝: $dst"
-        push "$src" "root@${IP}:$dst"
+        echo "  需更新: $dst"
+        TO_COPY+=("$src|$dst")
         CHANGED=1
     fi
+}
+
+# 阶段二：把记录到的文件逐个 scp 到设备（此时服务已停）
+copy_all() {
+    local entry src dst
+    for entry in "${TO_COPY[@]}"; do
+        src="${entry%%|*}"
+        dst="${entry#*|}"
+        echo "  拷贝: $dst"
+        push "$src" "root@${IP}:$dst"
+    done
 }
 
 # ---------- 代理 ----------
@@ -143,10 +156,10 @@ device 'echo connected; uname -m' || { echo "无法连接，请检查 IP / SSH";
 echo "== 准备设备目录 =="
 device 'mkdir -p /home/root/xreader/book /home/root/xreader/fonts /home/root/hello-launch'
 
-echo "== 比较并拷贝 =="
-push_if_changed "${ROOT}/xreader-app/build/xr" "/home/root/xreader/xr"
-push_if_changed "${ROOT}/device/launcher/run-reader.sh" "/home/root/xreader/run-reader.sh"
-push_if_changed "${ROOT}/xreader-app/fonts/remarkx-cjk.ttf" "/home/root/xreader/fonts/remarkx-cjk.ttf"
+echo "== 比较本地与设备端文件 =="
+check_changed "${ROOT}/xreader-app/build/xr" "/home/root/xreader/xr"
+check_changed "${ROOT}/device/launcher/run-reader.sh" "/home/root/xreader/run-reader.sh"
+check_changed "${ROOT}/xreader-app/fonts/remarkx-cjk.ttf" "/home/root/xreader/fonts/remarkx-cjk.ttf"
 
 echo "== 写配置 =="
 # 代理无协议头时补 http://，避免设备端解析失败
@@ -159,13 +172,13 @@ fi
     printf '  "cookies": "/home/root/xreader/cookies.json"\n'
     printf '}\n'
 } > "${ROOT}/deploy/build/config.json"
-push_if_changed "${ROOT}/deploy/build/config.json" "/home/root/xreader/config.json"
-push_if_changed "$LOCAL_COOKIE" "/home/root/xreader/cookies.json"
+check_changed "${ROOT}/deploy/build/config.json" "/home/root/xreader/config.json"
+check_changed "$LOCAL_COOKIE" "/home/root/xreader/cookies.json"
 
-echo "== 拷贝长按守护 =="
-push_if_changed "${ROOT}/deploy/build/hello-hotkey" "/home/root/hello-launch/hello-hotkey"
-push_if_changed "${ROOT}/device/launcher/hello-launch.sh" "/home/root/hello-launch/hello-launch.sh"
-push_if_changed "${ROOT}/device/launcher/hello-hotkey.service" "/home/root/hello-launch/hello-hotkey.service"
+echo "== 比较长按守护 =="
+check_changed "${ROOT}/deploy/build/hello-hotkey" "/home/root/hello-launch/hello-hotkey"
+check_changed "${ROOT}/device/launcher/hello-launch.sh" "/home/root/hello-launch/hello-launch.sh"
+check_changed "${ROOT}/device/launcher/hello-hotkey.service" "/home/root/hello-launch/hello-hotkey.service"
 
 # 只有文件有变化时才停服务/杀阅读器（Linux 不允许覆盖正在执行的二进制 ETXTBSY）；
 # 全部未变化则不动运行中的阅读器
@@ -175,6 +188,8 @@ if [ "$CHANGED" = "1" ]; then
 pkill -f "xreader/xr" 2>/dev/null || true
 sleep 1
 systemctl start xochitl 2>/dev/null || true'
+    echo "== 拷贝更新的文件 =="
+    copy_all
 fi
 
 echo "== 安装服务并启用 =="

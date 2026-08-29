@@ -567,9 +567,9 @@ QImage Renderer::avatar(const XTweet &t) const
     QImage src(full);
     if (src.isNull())
         return {};
-    QImage img = src.convertToFormat(QImage::Format_RGB32)
-                     .scaled(AVATAR_D, AVATAR_D, Qt::IgnoreAspectRatio,
-                             Qt::SmoothTransformation);
+    QImage img = src.scaled(AVATAR_D, AVATAR_D, Qt::IgnoreAspectRatio,
+                            Qt::FastTransformation)
+                     .convertToFormat(QImage::Format_RGB32);
     QImage mask(AVATAR_D, AVATAR_D, QImage::Format_ARGB32_Premultiplied);
     mask.fill(Qt::transparent);
     {
@@ -705,9 +705,9 @@ void Renderer::drawPhoto(QPainter &p, const XTweet &t, const ImageSlot &s,
             drawPlaceholder(p, ix, py, dw, dh);
             return;
         }
-        photo = src.convertToFormat(QImage::Format_RGB32)
-                    .scaled(dw, dh, Qt::IgnoreAspectRatio,
-                            Qt::SmoothTransformation);
+        photo = src.scaled(dw, dh, Qt::IgnoreAspectRatio,
+                           Qt::FastTransformation)
+                     .convertToFormat(QImage::Format_RGB32);
         m_photoCache.insert(key, photo);
     }
     p.drawImage(ix, py, photo);

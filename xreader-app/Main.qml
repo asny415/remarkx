@@ -17,12 +17,16 @@ Window {
         source: pageStore.currentFile
         cache: false
         fillMode: Image.PreserveAspectFit
-        // 每 3 页全屏强制刷新一次，清除墨水屏残影（每次都刷太慢）
+        // 每 5 个不同页面全屏强制刷新一次，清除墨水屏残影（每次都刷太慢）
+        property int lastCountedKey: -1
         onStatusChanged: {
             if (status !== Image.Ready)
                 return
+            if (pageStore.pageKey === pageImage.lastCountedKey)
+                return
+            pageImage.lastCountedKey = pageStore.pageKey
             root.refreshCount += 1
-            if (root.refreshCount % 3 === 0)
+            if (root.refreshCount % 5 === 0)
                 pageStore.requestFullRefresh()
         }
     }

@@ -94,7 +94,8 @@ bool InkItem::saveDraw(const QString &path) const
 {
     if (!m_hasInk)
         return false;
-    return m_img.save(path, "PNG");
+    // PNG 低压缩快编码：收藏页不多，体积换取翻页流畅
+    return m_img.save(path, "PNG", 30);
 }
 
 bool InkItem::loadDraw(const QString &path)

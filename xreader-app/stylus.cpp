@@ -20,11 +20,12 @@ static const qreal TAP_MAX_TRAVEL = 24.0;
 
 Stylus::Stylus(QObject *parent) : QObject(parent)
 {
-    // 合成点击的鼠标事件在事件循环里稍后处理；期间保持 penActive，
-    // 避免被手势逻辑误判成手指滑动
+    // 笔按下/抬起后的一段时间内保持 penActive：
+    // 手写时手掌可能碰到屏幕，这段时间内忽略手指手势；笔抬起后再延时
+    // 1s 清除，避免刚停笔时手掌误触翻页。合成点击的鼠标事件也在此窗口内。
     m_tapTimer = new QTimer(this);
     m_tapTimer->setSingleShot(true);
-    m_tapTimer->setInterval(300);
+    m_tapTimer->setInterval(1000);
     connect(m_tapTimer, &QTimer::timeout, this,
             [this]() { setPenActive(false); });
 }
@@ -147,6 +148,7 @@ void Stylus::onData()
             } else if (ev.code == BTN_TOUCH) {
                 if (ev.value) {
                     m_touching = true;
+                    m_tapTimer->stop();
                     setPenActive(true);
                 } else if (m_touching) {
                     m_touching = false;
@@ -158,13 +160,13 @@ void Stylus::onData()
                     if (!m_eraser && m_tapEnabled && m_calibrated
                         && dur < TAP_MAX_MS && m_travel < TAP_MAX_TRAVEL) {
                         synthesizeTap(int(m_pressPt.x()), int(m_pressPt.y()));
-                        // 合成的鼠标事件稍后处理：期间保持 penActive，
-                        // 笔抬起后再延时清除，防止手势误判
+                        // 1s 窗口内忽略手指手势，覆盖合成鼠标事件的处理
                         m_tapTimer->start();
                         emit penUp();
                         return;
                     }
-                    setPenActive(false);
+                    // 笔抬起后仍保留 penActive（1s 窗口），忽略手掌误触
+                    m_tapTimer->start();
                     if (m_eraser)
                         emit eraserUp();
                     else

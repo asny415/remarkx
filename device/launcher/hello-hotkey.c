@@ -137,51 +137,56 @@ int main(void) {
     int tracking = -1;
     int down_x = -1, down_y = -1, cur_x = -1, cur_y = -1;
     long long down_time = 0;
+    int launched = 0;
     struct input_event ev;
 
     for (;;) {
-        ssize_t n = read(fd, &ev, sizeof(ev));
-        if (n != sizeof(ev))
-            continue;
-
-        if (ev.type == EV_ABS) {
-            if (ev.code == ABS_MT_TRACKING_ID) {
-                if (ev.value >= 0 && tracking < 0) {
-                    tracking = ev.value;
-                    down_x = down_y = cur_x = cur_y = -1;
-                    down_time = now_ms();
-                } else if (ev.value < 0 && tracking >= 0) {
-                    tracking = -1;
-                    if (down_x >= 0 && down_y >= 0 && cur_x >= 0 &&
-                        cur_y >= 0 &&
-                        now_ms() - down_time >= MIN_HOLD_MS &&
-                        now_ms() - down_time <= MAX_HOLD_MS &&
-                        in_region(down_x, down_y) &&
-                        abs(cur_x - down_x) <= MAX_MOVE_PX &&
-                        abs(cur_y - down_y) <= MAX_MOVE_PX) {
-                        /* 前台守卫：阅读器在跑或不在 xochitl 前台则不启动 */
-                        if (reader_running() || !xochitl_running()) {
-                            printf("hello-hotkey: skip (reader=%d xochitl=%d)\n",
-                                   reader_running(), xochitl_running());
-                            continue;
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int rc = poll(&pfd, 1, 100);   /* 100ms 轮询，兼顾长按计时 */
+        if (rc > 0 && (pfd.revents & POLLIN)) {
+            while (read(fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+                if (ev.type == EV_ABS) {
+                    if (ev.code == ABS_MT_TRACKING_ID) {
+                        if (ev.value >= 0 && tracking < 0) {
+                            tracking = ev.value;
+                            down_x = down_y = cur_x = cur_y = -1;
+                            down_time = now_ms();
+                            launched = 0;
+                        } else if (ev.value < 0 && tracking >= 0) {
+                            tracking = -1;
                         }
-                        printf("hello-hotkey: long-press at (%d,%d), launching\n",
-                               cur_x, cur_y);
-                        launch();
+                    } else if (ev.code == ABS_MT_POSITION_X) {
+                        if (tracking >= 0) {
+                            cur_x = ev.value;
+                            if (down_x < 0)
+                                down_x = ev.value;
+                        }
+                    } else if (ev.code == ABS_MT_POSITION_Y) {
+                        if (tracking >= 0) {
+                            cur_y = ev.value;
+                            if (down_y < 0)
+                                down_y = ev.value;
+                        }
                     }
                 }
-            } else if (ev.code == ABS_MT_POSITION_X) {
-                if (tracking >= 0) {
-                    cur_x = ev.value;
-                    if (down_x < 0)
-                        down_x = ev.value;
-                }
-            } else if (ev.code == ABS_MT_POSITION_Y) {
-                if (tracking >= 0) {
-                    cur_y = ev.value;
-                    if (down_y < 0)
-                        down_y = ev.value;
-                }
+            }
+        }
+        /* 长按达标即启动，无需等 UP 信号 */
+        if (tracking >= 0 && !launched && down_x >= 0 && down_y >= 0 &&
+            cur_x >= 0 && cur_y >= 0 &&
+            now_ms() - down_time >= MIN_HOLD_MS &&
+            now_ms() - down_time <= MAX_HOLD_MS &&
+            in_region(down_x, down_y) &&
+            abs(cur_x - down_x) <= MAX_MOVE_PX &&
+            abs(cur_y - down_y) <= MAX_MOVE_PX) {
+            launched = 1;   /* 本次按住只启动一次 */
+            if (reader_running() || !xochitl_running()) {
+                printf("hello-hotkey: skip (reader=%d xochitl=%d)\n",
+                       reader_running(), xochitl_running());
+            } else {
+                printf("hello-hotkey: long-press at (%d,%d), launching\n",
+                       cur_x, cur_y);
+                launch();
             }
         }
     }

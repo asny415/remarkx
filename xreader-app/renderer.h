@@ -27,10 +27,13 @@ struct ImageSlot {
 
 // 单条绘制指令（顺序执行，自上而下消耗竖直空间）
 struct Op {
-    enum Kind { Head, Line, Img, QHead, QLine, QImg, Stats };
+    enum Kind {
+        Head, Line, Img, QHead, QLine, QImg, Stats,
+        FullText        // "显示全文" 按钮行
+    };
     int kind = Head;
     int y = 0;
-    QString text;                 // Line/QLine 文本
+    QString text;                 // Line/QLine/FullText 文本
     QString qname, qhandle;       // QHead
     int slotIndex = -1;           // Img/QImg → RenderPage::slots 下标
     QString statsLeft, statsRight; // Stats
@@ -45,9 +48,16 @@ struct RenderChunk {
     QVector<Op> ops;
 };
 
+// "显示全文" 按钮热区（全屏看全文用）
+struct TextButton {
+    QRect rect;
+    int tweetIndex = -1;
+};
+
 struct RenderPage {
     QVector<RenderChunk> chunks;
     QVector<ImageSlot> images;
+    QVector<TextButton> buttons;
 };
 
 // 整页渲染器：把推文流排版成 1404x1872 整页位图（原 relay/render.py 的移植）。
@@ -68,6 +78,14 @@ public:
     QImage renderPage(const QVector<XTweet> &feed,
                       const QVector<RenderPage> &pages, int pageIndex,
                       bool withPhotos);
+
+    // 全文全屏阅读：把某条推文的完整内容（含原文/引用块）单栏排版成若干整页
+    // 位图，返回第 pageIndex 页；totalPages 输出总页数。
+    QImage renderTextPage(const XTweet &t, int pageIndex, int *totalPages);
+    int textPageCount(const XTweet &t);
+
+    // 语言代码 -> 中文名（"译自英语"）
+    static QString langName(const QString &code);
 
     // 文本清洗（隐藏链接、剥离 emoji）
     static QString cleanText(const QString &text);
@@ -93,7 +111,7 @@ private:
     QString ellipsize(const QFont &f, const QString &text,
                       qreal maxWidth) const;
     QStringList wrapText(const QFont &f, const QString &text, qreal maxWidth,
-                         int maxLines) const;
+                         int maxLines, bool *truncated = nullptr) const;
     QVector<Atom> buildAtoms(const QVector<XTweet> &feed, int ti);
     Atom imgAtom(const QVector<XTweet> &feed, int ti, bool isQuoted, int ind);
     QString statsText(const XTweet &t) const;

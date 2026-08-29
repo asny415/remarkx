@@ -30,8 +30,12 @@ struct XMedia {
 struct XQuoted {
     QString authorName;
     QString authorHandle;
-    QString text;
+    QString text;          // 默认显示文本（译文优先，否则 full_text 预览）
+    QString originalText;  // 完整原文（note_tweet 全文或 full_text）
     QString createdAt;
+    bool translated = false;   // 该文本显示的是译文
+    bool isExpandable = false; // note_tweet.is_expandable：帖子还有更多内容
+    QString sourceLang;        // 译自哪种语言
     QVector<XMedia> media;
     int reposts = 0;
     int likes = 0;
@@ -45,8 +49,8 @@ struct XTweet {
     QString createdAt;
     QString authorName;
     QString authorHandle;
-    QString text;         // 译文优先，无译文为原文
-    QString originalText;
+    QString text;         // 默认显示文本（译文优先，否则 full_text 预览）
+    QString originalText; // 完整原文（note_tweet 全文，或 full_text）
     QString comment;      // 引用推文时：引用者的评论
     QString rtHandle;     // 纯转推时：转发者
     QString url;
@@ -55,6 +59,8 @@ struct XTweet {
     QString sourceLang;
     QString destLang;
     bool isRetweet = false;
+    bool translated = false;   // 当前显示的是译文（grok 翻译存在）
+    bool isExpandable = false; // note_tweet.is_expandable：帖子还有更多内容
     QVector<XMedia> media;
     XQuoted quoted;
     int reposts = 0;
@@ -118,6 +124,7 @@ private:
     static QString noteText(const QJsonObject &tweet);
     static QString rawText(const QJsonObject &r);
     static QString textOf(const QJsonObject &r);
+    static bool hasTranslation(const QJsonObject &r);
     static QVector<XTweet> mergeInterleave(const QVector<XTweet> &fy,
                                            const QVector<XTweet> &fl);
 

@@ -131,11 +131,18 @@ Window {
             const dy = mouse.y - pressPt.y
             const adx = Math.abs(dx)
             const ady = Math.abs(dy)
-            // 手指短点：命中图片则打开全屏看图
+            // 手指短点：命中图片则打开全屏看图；命中"显示全文"则全屏看全文
             if (adx < 90 && ady < 90) {
                 var idx = pageStore.hitSlot(mouse.x, mouse.y)
-                if (idx >= 0)
+                if (idx >= 0) {
                     fullscreen.open(idx)
+                    return
+                }
+                var tid = pageStore.hitFullText(mouse.x, mouse.y)
+                if (tid.length > 0) {
+                    textFs.open(tid)
+                    return
+                }
                 return
             }
             // 有效距离 + 主方向水平，移动一点点不算
@@ -612,6 +619,102 @@ Window {
                     dx < 0 ? fullscreen.nextImg() : fullscreen.prevImg()
                 } else if (dy > 90) {
                     fullscreen.close()   // 顶部下滑关闭
+                }
+            }
+        }
+    }
+
+    // 全文全屏阅读：点卡片上"显示全文"按钮打开；左右滑在长文页间切换
+    Item {
+        id: textFs
+        visible: false
+        anchors.fill: parent
+        z: 200
+
+        property string tweetId: ""
+        property int page: 0
+        property int pages: 1
+        property string sourceUrl: ""
+
+        function open(tid) {
+            tweetId = tid
+            page = 0
+            pages = Math.max(1, pageStore.fullTextPages(tid))
+            sourceUrl = "image://pages/text/" + tweetId + "/" + page
+            visible = true
+            pageStore.requestFullRefresh()
+        }
+        function close() {
+            visible = false
+            tweetId = ""
+            pageStore.requestFullRefresh()
+        }
+        function nextPage() {
+            if (page + 1 < pages) {
+                page += 1
+                sourceUrl = "image://pages/text/" + tweetId + "/" + page
+                pageStore.requestFullRefresh()
+            }
+        }
+        function prevPage() {
+            if (page > 0) {
+                page -= 1
+                sourceUrl = "image://pages/text/" + tweetId + "/" + page
+                pageStore.requestFullRefresh()
+            }
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            color: "white"
+        }
+        Image {
+            anchors.fill: parent
+            source: textFs.sourceUrl
+            cache: false
+            fillMode: Image.PreserveAspectFit
+        }
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 20
+            text: textFs.pages > 1 ? ("第 " + (textFs.page + 1) + " 页 · 共 "
+                                      + textFs.pages + " 页") : ""
+            font.pixelSize: 26
+            color: "#888888"
+        }
+        Text {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.margins: 30
+            text: "点按关闭 · 左右滑翻页"
+            font.pixelSize: 24
+            color: "#aaaaaa"
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            property point p0
+            property bool armed: false
+            onPressed: (m) => {
+                idleTimer.restart()
+                armed = true
+                p0 = Qt.point(m.x, m.y)
+            }
+            onReleased: (m) => {
+                if (!armed)
+                    return
+                armed = false
+                const dx = m.x - p0.x
+                const dy = m.y - p0.y
+                if (Math.abs(dx) < 60 && Math.abs(dy) < 60) {
+                    textFs.close()
+                    return
+                }
+                if (Math.abs(dx) > Math.abs(dy)) {
+                    dx < 0 ? textFs.nextPage() : textFs.prevPage()
+                } else if (dy > 90) {
+                    textFs.close()   // 顶部下滑关闭
                 }
             }
         }

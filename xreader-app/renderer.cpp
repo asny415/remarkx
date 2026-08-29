@@ -40,6 +40,27 @@ static const int STATS_H = 30;
 static const int AVATAR_D = 56;
 static const int AVATAR_GAP = 14;
 
+// 卡片文本最大行数：超出截断并显示"显示全文"按钮（长文/长译文都适用）
+static const int BODY_MAX_LINES = 6;
+static const int QUOTED_MAX_LINES = 4;
+
+QString Renderer::langName(const QString &code)
+{
+    static const QHash<QString, QString> m = {
+        {"en", "英语"}, {"ja", "日语"}, {"ko", "韩语"},
+        {"fr", "法语"}, {"de", "德语"}, {"es", "西班牙语"},
+        {"ru", "俄语"}, {"it", "意大利语"}, {"pt", "葡萄牙语"},
+        {"nl", "荷兰语"}, {"tr", "土耳其语"}, {"th", "泰语"},
+        {"vi", "越南语"}, {"id", "印尼语"}, {"ar", "阿拉伯语"},
+        {"hi", "印地语"}, {"pl", "波兰语"}, {"uk", "乌克兰语"},
+        {"sv", "瑞典语"}, {"el", "希腊语"}, {"he", "希伯来语"},
+        {"zh", "中文"}, {"zh-CN", "中文"}, {"zh-cn", "中文"},
+        {"zh-TW", "繁体中文"}, {"zh-tw", "繁体中文"},
+    };
+    const QString k = code.trimmed();
+    return m.value(k, k.isEmpty() ? QString() : k);
+}
+
 static const QColor BG("#ffffff");
 static const QColor FG("#1a1a1a");
 static const QColor FG_DIM("#5a5a5a");
@@ -125,9 +146,12 @@ QString Renderer::cleanText(const QString &text)
 }
 
 QStringList Renderer::wrapText(const QFont &f, const QString &text,
-                               qreal maxWidth, int maxLines) const
+                               qreal maxWidth, int maxLines,
+                               bool *truncated) const
 {
     QStringList lines;
+    if (truncated)
+        *truncated = false;
     static const QRegularExpression unitRe(QStringLiteral(
         "[A-Za-z0-9]+(?:['\\x{2019}\\-][A-Za-z0-9]+)*|\\s+|\\S"));
     static const QString closing(
@@ -189,6 +213,8 @@ QStringList Renderer::wrapText(const QFont &f, const QString &text,
     if (lines.size() > maxLines) {
         lines = lines.mid(0, maxLines);
         lines[maxLines - 1] = rstrip(lines[maxLines - 1]) + QStringLiteral(" …");
+        if (truncated)
+            *truncated = true;
     }
     return lines;
 }
@@ -278,11 +304,23 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     const bool hasQuoted = !t.quoted.authorName.isEmpty()
                            || !t.quoted.text.trimmed().isEmpty()
                            || !t.quoted.media.isEmpty();
+    // 卡片显示 API 默认文本（译文或 full_text 预览），但统一限制行数
+    // （"不需要总是显示全文"，长文/长译文都截断）。
+    // "显示全文"触发：卡片被行数截断，或（非译文时）显示的是长推文预览
+    // （legacy.full_text）而完整文本在 note_tweet.text。
+    bool needFullText = false;
+
     if (hasQuoted) {
         if (!t.isRetweet) {
             const QString text = cleanText(t.text);
             if (!text.isEmpty()) {
-                const QStringList lns = wrapText(font(30), text, TEXT_W, 100000);
+                // 译文没有"预览"字段（translation 永远是完整译文），只能截断；
+                // 非译文直接用 full_text（API 自带的长文预览），不再自行截断
+                const int maxLines = t.translated ? BODY_MAX_LINES : 100000;
+                bool truncated = false;
+                const QStringList lns = wrapText(font(30), text, TEXT_W,
+                                                 maxLines, &truncated);
+                needFullText = needFullText || truncated;
                 for (const QString &ln : lns) {
                     Atom a;
                     a.kind = Op::Line;
@@ -304,8 +342,11 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
         atoms.append(qh);
         const QString qtext = cleanText(t.quoted.text);
         if (!qtext.isEmpty()) {
-            const QStringList lns =
-                wrapText(font(26), qtext, TEXT_W - QIND, 100000);
+            const int qmax = t.quoted.translated ? QUOTED_MAX_LINES : 100000;
+            bool truncated = false;
+            const QStringList lns = wrapText(font(26), qtext, TEXT_W - QIND,
+                                             qmax, &truncated);
+            needFullText = needFullText || truncated;
             for (const QString &ln : lns) {
                 Atom a;
                 a.kind = Op::QLine;
@@ -320,7 +361,11 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     } else {
         const QString text = cleanText(t.text);
         if (!text.isEmpty()) {
-            const QStringList lns = wrapText(font(30), text, TEXT_W, 100000);
+            const int maxLines = t.translated ? BODY_MAX_LINES : 100000;
+            bool truncated = false;
+            const QStringList lns = wrapText(font(30), text, TEXT_W,
+                                             maxLines, &truncated);
+            needFullText = needFullText || truncated;
             for (const QString &ln : lns) {
                 Atom a;
                 a.kind = Op::Line;
@@ -332,6 +377,21 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
         Atom a = imgAtom(feed, ti, false, 0);
         if (a.kind == Op::Img)
             atoms.append(a);
+    }
+
+    // API 标记的长文（note_tweet.is_expandable）：完整文本仍在 note_tweet 里
+    if (t.isExpandable)
+        needFullText = true;
+    if (hasQuoted && t.quoted.isExpandable)
+        needFullText = true;
+
+    // 有完整文本可看 → 追加"显示全文"按钮（放在统计行之前）
+    if (needFullText) {
+        Atom a;
+        a.kind = Op::FullText;
+        a.h = TEXT_LH;
+        a.text = QStringLiteral("显示全文");
+        atoms.append(a);
     }
 
     const QString st = statsText(t);
@@ -427,7 +487,8 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 return false;
             if (chunkIdx < 0) {
                 const bool cont = chunkWasSplit
-                                  && (a.kind == Op::Line || a.kind == Op::QLine);
+                                  && (a.kind == Op::Line || a.kind == Op::QLine
+                                      || a.kind == Op::FullText);
                 openChunk(cont, ti);
             }
             RenderChunk &ch = pages[p].chunks[chunkIdx];
@@ -441,6 +502,19 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             case Op::QLine:
                 op.y = grow(a.h);
                 op.text = a.text;
+                break;
+            case Op::FullText:
+                op.y = grow(a.h);
+                op.text = a.text;
+                // 记录"显示全文"按钮热区（用于点按打开全文全屏）
+                {
+                    TextButton btn;
+                    btn.rect = QRect(colX(col) + PAD, op.y,
+                                     int(textWidth(font(26, true), a.text)),
+                                     a.h);
+                    btn.tweetIndex = ti;
+                    pages[p].buttons.append(btn);
+                }
                 break;
             case Op::QHead:
                 op.y = grow(a.h);
@@ -653,6 +727,12 @@ void Renderer::drawHead(QPainter &p, const XTweet &t, int px, int py)
         metas << QStringLiteral("▶ 视频");
     if (imgs)
         metas << QString::number(imgs) + QStringLiteral(" 图");
+    // 翻译提示：显示的是译文时标注"译自 XX"
+    if (t.translated && !t.sourceLang.isEmpty()) {
+        const QString zh = langName(t.sourceLang);
+        if (!zh.isEmpty())
+            metas << QStringLiteral("译自 %1").arg(zh);
+    }
     p.setFont(fm);
     p.setPen(FG_FAINT);
     p.drawText(QRectF(tx, py2, nameW, META_H), Qt::AlignLeft | Qt::AlignTop,
@@ -822,6 +902,166 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
         case Op::Stats:
             drawStats(p, op, chunk);
             break;
+        case Op::FullText: {
+            const QFont fb = font(26, true);
+            p.setFont(fb);
+            p.setPen(QColor("#1a6b9c"));
+            p.drawText(QRectF(px, op.y, TEXT_W, TEXT_LH),
+                       Qt::AlignLeft | Qt::AlignTop, op.text);
+            // 下划线链接样式，提示可点
+            const int tw = int(textWidth(fb, op.text));
+            p.drawLine(px, op.y + TEXT_LH - 8, px + tw, op.y + TEXT_LH - 8);
+            break;
+        }
         }
     }
+}
+
+// ---- 全文全屏阅读（单栏，跨页排版） ----
+
+static bool tweetHasQuoted(const XTweet &t)
+{
+    return !t.quoted.authorName.isEmpty()
+           || !t.quoted.text.trimmed().isEmpty()
+           || !t.quoted.media.isEmpty();
+}
+
+QImage Renderer::renderTextPage(const XTweet &t, int pageIndex, int *totalPages)
+{
+    struct Ln {
+        int page = 0;
+        int y = 0;
+        QString text;
+        int pixel = 30;
+        bool bold = false;
+        QColor color;
+        bool divider = false;   // 画分隔横线
+        bool bar = false;       // 引用块左竖线
+    };
+    QVector<Ln> lns;
+    const int x = MARGIN;
+    const int w = W - 2 * MARGIN;
+    int page = 0, y = TOP_Y;
+    auto take = [&](int lh) {
+        if (y + lh > BOTTOM_Y) {
+            ++page;
+            y = TOP_Y;
+        }
+        const int r = y;
+        y += lh;
+        return r;
+    };
+    auto pushWrapped = [&](const QString &s, int pixel, bool bold,
+                           const QColor &c, int lh, bool bar = false) {
+        const QStringList ls = wrapText(font(pixel, bold), s, w, 100000);
+        for (const QString &ln : ls)
+            lns.append({page, take(lh), ln, pixel, bold, c, false, bar});
+    };
+
+    const bool translated = t.translated && !t.sourceLang.isEmpty();
+
+    // 头部
+    {
+        const QString name = t.authorName.isEmpty() ? QStringLiteral("?")
+                                                    : t.authorName;
+        lns.append({page, take(TEXT_LH), name + QStringLiteral("  @")
+                                           + t.authorHandle, 30, true, FG,
+                    false, false});
+        if (t.isRetweet) {
+            lns.append({page, take(30), QStringLiteral("转发了"), 22, false,
+                        FG_DIM, false, false});
+        }
+        QStringList ms;
+        const QString at = absTime(t.createdAt);
+        if (!at.isEmpty())
+            ms << at;
+        if (translated) {
+            const QString zh = langName(t.sourceLang);
+            if (!zh.isEmpty())
+                ms << QStringLiteral("译自 %1").arg(zh);
+        }
+        if (!ms.isEmpty())
+            lns.append({page, take(30), ms.join(QStringLiteral(" · ")), 22,
+                        false, FG_FAINT, false, false});
+        lns.append({page, take(24), QString(), 22, false, CARD_BORDER, true,
+                    false});
+    }
+
+    if (!t.isRetweet) {
+        // 完整文本：译文已覆盖全文则显示译文，否则显示原文全文
+        // （长推文的 note_tweet.text / 普通推文的 full_text）
+        const QString full = t.translated ? cleanText(t.text)
+                                          : cleanText(t.originalText);
+        if (!full.isEmpty())
+            pushWrapped(full, 30, false, FG, TEXT_LH);
+    }
+
+    // 引用块
+    if (tweetHasQuoted(t)) {
+        lns.append({page, take(24), QString(), 22, false, CARD_BORDER, true,
+                    false});
+        const QString qn = t.quoted.authorName.isEmpty()
+                               ? QStringLiteral("?") : t.quoted.authorName;
+        lns.append({page, take(30), qn + QStringLiteral("  @")
+                                       + t.quoted.authorHandle, 26, true, FG,
+                    false, true});
+        if (t.quoted.translated && !t.quoted.sourceLang.isEmpty()) {
+            const QString zh = langName(t.quoted.sourceLang);
+            if (!zh.isEmpty())
+                lns.append({page, take(26),
+                            QStringLiteral("译自 %1").arg(zh), 22, false,
+                            FG_FAINT, false, true});
+        }
+        const QString qfull = t.quoted.translated
+                                  ? cleanText(t.quoted.text)
+                                  : cleanText(t.quoted.originalText);
+        pushWrapped(qfull, 26, false, FG_DIM, TEXT_LH_Q, true);
+    }
+
+    const int total = page + 1;
+    if (totalPages)
+        *totalPages = total;
+    if (pageIndex < 0 || pageIndex >= total)
+        return QImage();
+
+    QImage img(W, H, QImage::Format_RGB32);
+    img.fill(BG);
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setRenderHint(QPainter::TextAntialiasing, true);
+    for (const Ln &l : lns) {
+        if (l.page != pageIndex)
+            continue;
+        if (l.divider) {
+            p.setPen(QPen(CARD_BORDER, 2));
+            p.drawLine(x, l.y, x + w, l.y);
+            continue;
+        }
+        int tx = x;
+        if (l.bar) {
+            p.setPen(QPen(FG_FAINT, 2));
+            p.drawLine(x, l.y - 2, x, l.y + TEXT_LH_Q + 2);
+            tx = x + 20;
+        }
+        p.setFont(font(l.pixel, l.bold));
+        p.setPen(l.color);
+        p.drawText(QRectF(tx, l.y, w - (tx - x), 4000),
+                   Qt::AlignLeft | Qt::AlignTop, l.text);
+    }
+    if (total > 1) {
+        p.setFont(font(22));
+        p.setPen(FG_FAINT);
+        p.drawText(QRectF(x, BOTTOM_Y - 8, w, 30),
+                   Qt::AlignHCenter | Qt::AlignTop,
+                   QStringLiteral("第 %1/%2 页").arg(pageIndex + 1).arg(total));
+    }
+    p.end();
+    return img;
+}
+
+int Renderer::textPageCount(const XTweet &t)
+{
+    int total = 0;
+    renderTextPage(t, 0, &total);
+    return total;
 }

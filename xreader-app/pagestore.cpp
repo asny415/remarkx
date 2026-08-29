@@ -24,8 +24,18 @@ static const int SCREEN_H = 1872;
 QImage PageImageProvider::requestImage(const QString &id, QSize *size,
                                        const QSize &requestedSize)
 {
-    Q_UNUSED(id);
     Q_UNUSED(requestedSize);
+    // image://pages/text/<tweetId>/<page>
+    if (id.startsWith(QLatin1String("text/"))) {
+        const QStringList parts = id.split(QLatin1Char('/'));
+        if (parts.size() >= 3) {
+            const QImage img = m_store->textPageImage(parts.at(1),
+                                                      parts.at(2).toInt());
+            if (size)
+                *size = img.size();
+            return img;
+        }
+    }
     const QImage img = m_store->currentBaseImage();
     if (size)
         *size = img.size();
@@ -626,6 +636,49 @@ int PageStore::hitSlot(int x, int y)
             return i;
     }
     return -1;
+}
+
+QString PageStore::hitFullText(int x, int y)
+{
+    if (m_mode != FeedMode || m_pages.isEmpty())
+        return {};
+    if (m_feedPage < 0 || m_feedPage >= m_pages.size())
+        return {};
+    for (const TextButton &b : m_pages.at(m_feedPage).buttons) {
+        if (x >= b.rect.x() && x <= b.rect.x() + b.rect.width()
+                && y >= b.rect.y() && y <= b.rect.y() + b.rect.height()) {
+            if (b.tweetIndex >= 0 && b.tweetIndex < m_feed.size())
+                return m_feed.at(b.tweetIndex).id;
+        }
+    }
+    return {};
+}
+
+int PageStore::fullTextPages(const QString &tweetId)
+{
+    syncFeed();
+    for (const XTweet &t : m_feed) {
+        if (t.id == tweetId)
+            return m_renderer->textPageCount(t);
+    }
+    return 1;
+}
+
+QImage PageStore::textPageImage(const QString &tweetId, int page)
+{
+    syncFeed();
+    for (const XTweet &t : m_feed) {
+        if (t.id == tweetId) {
+            int total = 1;
+            QImage img = m_renderer->renderTextPage(t, page, &total);
+            if (!img.isNull())
+                return img;
+            break;
+        }
+    }
+    QImage blank(1404, 1872, QImage::Format_RGB32);
+    blank.fill(Qt::white);
+    return blank;
 }
 
 QStringList PageStore::slotFiles(int slotIndex)

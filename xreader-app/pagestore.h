@@ -32,7 +32,6 @@ public:
 private:
     PageStore *m_store;
 };
-
 // 页面状态机：抓取（XClient）→ 排版渲染（Renderer）→ 基础页 + 图片槽位。
 // 保留 book/ 收藏（带笔迹页）、断点续读、休眠/退出逻辑。
 class PageStore : public QObject {
@@ -83,8 +82,14 @@ public slots:
     Q_INVOKABLE void requestFullRefresh();
     // 手指点按命中图片槽位 → 返回槽位索引（-1 = 未命中）
     Q_INVOKABLE int hitSlot(int x, int y);
+    // 手指点按命中"显示全文"按钮 → 返回推文 id（"" = 未命中）
+    Q_INVOKABLE QString hitFullText(int x, int y);
+    // 全文全屏：总页数
+    Q_INVOKABLE int fullTextPages(const QString &tweetId);
     // 槽位对应媒体的全部本地文件（全屏分页浏览；未下载完的条目为空）
     Q_INVOKABLE QStringList slotFiles(int slotIndex);
+    // 供 image://pages/text/... provider 渲染全文页（公开给 Provider 调用）
+    QImage textPageImage(const QString &tweetId, int page);
 
 signals:
     void currentFileChanged();

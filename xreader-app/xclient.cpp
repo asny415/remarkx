@@ -463,13 +463,30 @@ QString XClient::noteText(const QJsonObject &tweet)
         .toObject()["result"].toObject()["text"].toString();
 }
 
-// 译文优先：X 网页端 Grok 自动翻译内嵌在各级响应里
+bool XClient::hasTranslation(const QJsonObject &r)
+{
+    const QJsonObject g =
+        r["grok_translated_post_with_availability"].toObject();
+    return !g["data"].toObject()["translation"].toString().trimmed().isEmpty();
+}
+
+// note_tweet.is_expandable：API 明确标记帖子还有更多内容（长文）
+static bool noteExpandable(const QJsonObject &r)
+{
+    return r["note_tweet"].toObject()["is_expandable"].toBool();
+}
+
+// 默认显示文本：X 网页端 Grok 译文优先，否则用 legacy.full_text。
+// 注意：长推文(note_tweet)的 full_text 就是卡片上显示的预览，
+// 完整原文在 note_tweet.text（见 rawText），不要在这里回退到 note_tweet 全文。
 QString XClient::textOf(const QJsonObject &r)
 {
     const QJsonObject g =
         r["grok_translated_post_with_availability"].toObject();
     const QString t = g["data"].toObject()["translation"].toString().trimmed();
-    return t.isEmpty() ? rawText(r) : t;
+    if (!t.isEmpty())
+        return t;
+    return r["legacy"].toObject()["full_text"].toString().trimmed();
 }
 
 void XClient::authorInfo(const QJsonObject &r, QString *name,
@@ -569,11 +586,13 @@ XTweet *XClient::normalize(const QJsonObject &result)
     QVector<XMedia> media, qMedia;
     XStats stats, qStats;
     QString qCreated;
+    bool mainTranslated = false;
 
     if (hasRt) {
         comment.clear();
         mainText = textOf(orig);
         mainRaw = rawText(orig);
+        mainTranslated = hasTranslation(orig);
         media = mediaList(orig);
         stats = statsOf(orig);
         qMedia = media;
@@ -583,6 +602,7 @@ XTweet *XClient::normalize(const QJsonObject &result)
         comment = textOf(outer);
         mainText = comment;
         mainRaw = rawText(outer);
+        mainTranslated = hasTranslation(outer);
         media = mediaList(outer);
         stats = statsOf(outer);
         qMedia = mediaList(quotedSrc);
@@ -592,6 +612,7 @@ XTweet *XClient::normalize(const QJsonObject &result)
         comment.clear();
         mainText = textOf(outer);
         mainRaw = rawText(outer);
+        mainTranslated = hasTranslation(outer);
         media = mediaList(outer);
         stats = statsOf(outer);
     }
@@ -620,6 +641,9 @@ XTweet *XClient::normalize(const QJsonObject &result)
     t->originalText = mainRaw;
     t->comment = comment;
     t->isRetweet = hasRt;
+    t->translated = mainTranslated;
+    t->isExpandable = hasRt ? noteExpandable(orig)
+                            : noteExpandable(outer);
     t->rtHandle = hasRt ? handle : QString();
     t->media = media;
     t->reposts = stats.reposts;
@@ -645,6 +669,12 @@ XTweet *XClient::normalize(const QJsonObject &result)
         t->quoted.authorName = qn;
         t->quoted.authorHandle = qh;
         t->quoted.text = textOf(quotedSrc);
+        t->quoted.originalText = rawText(quotedSrc);
+        t->quoted.translated = hasTranslation(quotedSrc);
+        t->quoted.isExpandable = noteExpandable(quotedSrc);
+        t->quoted.sourceLang =
+            quotedSrc["grok_translated_post_with_availability"]
+                .toObject()["data"].toObject()["source_language"].toString();
         t->quoted.createdAt = qCreated;
         t->quoted.media = qMedia;
         t->quoted.reposts = qStats.reposts;

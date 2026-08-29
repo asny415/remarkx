@@ -509,7 +509,6 @@ void PageStore::suspendNow()
 {
     saveInkNow();
     persistState();
-    m_suspendWallMs = QDateTime::currentMSecsSinceEpoch();
     qInfo() << "suspending...";
     QProcess::startDetached("systemctl", {"suspend"});
 }

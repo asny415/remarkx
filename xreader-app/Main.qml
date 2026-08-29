@@ -434,23 +434,17 @@ Window {
         interval: 1600          // 等提示刷上墨水屏
         onTriggered: {
             pageStore.suspendNow()
+            wakeClear.interval = 6000
             wakeClear.restart()
         }
     }
 
-    // 唤醒检测：休眠期间 QTimer 暂停（单调时钟），恢复后 0.5s 内触发。
-    // 用墙钟判断确实经历过休眠（距 suspend 超过 2s）→ 立即清除提示层，
-    // 不再等固定 6s（否则唤醒后要等好几秒才响应）。
     Timer {
         id: wakeClear
-        interval: 500
+        interval: 6000
         onTriggered: {
-            var wasSuspended = (Date.now() - pageStore.suspendWallMs()) > 2000
             sleepOverlay.visible = false
-            if (wasSuspended) {
-                pageStore.requestFullRefresh()   // 清"正在休眠"残影
-                idleTimer.restart()
-            }
+            idleTimer.restart()
         }
     }
 

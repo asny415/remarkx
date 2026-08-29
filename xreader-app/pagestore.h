@@ -65,8 +65,6 @@ public:
     QString error() const { return m_error; }
     QString bookLabel() const { return m_bookLabel; }
     QImage currentBaseImage() const { return m_currentBase; }
-    // 发起休眠的墙钟时间（唤醒后据此判断确实经历过休眠）
-    Q_INVOKABLE qint64 suspendWallMs() const { return m_suspendWallMs; }
 
 public slots:
     void start();
@@ -169,7 +167,6 @@ private:
     int m_baseRev = 0;
     int m_pageKey = 0;
     QString m_lastDisplayKey;
-    qint64 m_suspendWallMs = 0;
     QTimer *m_avatarTimer = nullptr;
     bool m_avatarRefreshPending = false;
 };

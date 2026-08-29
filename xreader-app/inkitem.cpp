@@ -123,8 +123,9 @@ void InkItem::onPenMove(int x, int y, int pressure)
 void InkItem::onPenUp()
 {
     m_stroke = false;
-    // 收尾：把节流期间累积的笔迹段立即提交，不丢尾段
+    // 收尾：把整条笔画立即提交，不丢尾段；并复位区域供下一笔
     flushInk();
+    m_strokeRegion = QRect();
 }
 
 void InkItem::onErDown(int x, int y, int pressure)
@@ -166,10 +167,10 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
         m_hasInk = true;
         emit hasInkChanged();
     }
-    // 首段立即通过 pen 快速路径显示
-    m_pending = segmentRect(m_last, m_last);
-    if (!fastSubmit(m_pending))
-        update(m_pending);
+    // 首段立即通过 pen 快速路径显示（整条笔画区域）
+    m_strokeRegion = segmentRect(m_last, m_last);
+    if (!fastSubmit(m_strokeRegion))
+        update(m_strokeRegion);
 }
 
 void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
@@ -191,22 +192,22 @@ void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
     }
     p.drawLine(m_last, cur);
     p.end();
-    m_pending = m_pending.isNull()
-                    ? segmentRect(m_last, cur)
-                    : m_pending.united(segmentRect(m_last, cur));
+    m_strokeRegion = m_strokeRegion.isNull()
+                         ? segmentRect(m_last, cur)
+                         : m_strokeRegion.united(segmentRect(m_last, cur));
     m_last = cur;
-    // 节流合并：定时器到点把小区域一次性提交（小区域快 + 覆盖近段防虚线）
+    // 节流合并：定时器到点提交整条笔画累积区域；墨迹掩码下页面被 gate，
+    // 区域再大也只驱动笔迹像素，不闪；整条线每次都被驱动 → 无 dash 缺口
     if (!m_flushTimer->isActive())
         m_flushTimer->start();
 }
 
 void InkItem::flushInk()
 {
-    if (m_pending.isNull())
+    if (m_strokeRegion.isNull())
         return;
-    if (!fastSubmit(m_pending))
-        update(m_pending);
-    m_pending = QRect();
+    if (!fastSubmit(m_strokeRegion))
+        update(m_strokeRegion);
     m_flushTimer->stop();
 }
 

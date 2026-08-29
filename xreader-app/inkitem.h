@@ -42,7 +42,7 @@ private:
     QRect segmentRect(const QPointF &a, const QPointF &b) const;
     // 直接写 8-bit pen 缓冲 + DU 快速波形下发，绕过框架慢路径；失败返回 false
     bool fastSubmit(const QRect &region);
-    // 节流定时器到点：把近段时间累积的笔迹段合并成一次小区域提交
+    // 节流定时器到点：把整条笔画累积区域一次性提交（墨迹掩码下大区域也只驱动笔迹像素）
     void flushInk();
     // 翻页/清空时同步清掉 8-bit pen 叠加层，防止旧笔迹叠到新页上
     void clearPenBuffer();
@@ -54,5 +54,7 @@ private:
     qreal m_width = 4.0;
     bool m_hasInk = false;
     QTimer *m_flushTimer = nullptr;
-    QRect m_pending;
+    // 整条笔画（本次按下以来）已累积的区域：每次 flush 都提交它，
+    // 即使 swtcon 丢弃个别 flush，下一次仍会把整条线驱动出来，不产生 dash 缺口
+    QRect m_strokeRegion;
 };

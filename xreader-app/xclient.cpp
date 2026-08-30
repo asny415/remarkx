@@ -221,6 +221,26 @@ void XClient::refresh()
     fetchHome();
 }
 
+void XClient::reportSeen(const QString &tweetId)
+{
+    if (tweetId.isEmpty())
+        return;
+    // 网页端同款：不查重、按展示顺序追加（抓包确认 seenTweetIds 里会有重复 id）
+    m_seenTweetIds.append(tweetId);
+    // 限长防请求过大（整场阅读会话足够用）
+    const int kMaxSeen = 1000;
+    if (m_seenTweetIds.size() > kMaxSeen)
+        m_seenTweetIds = m_seenTweetIds.mid(m_seenTweetIds.size() - kMaxSeen);
+}
+
+QJsonArray XClient::seenArray() const
+{
+    QJsonArray a;
+    for (const QString &id : m_seenTweetIds)
+        a.append(id);
+    return a;
+}
+
 void XClient::fetchHome()
 {
     remarkxSetCtx("xclient:fetchHome");
@@ -234,6 +254,9 @@ void XClient::fetchHome()
     vars["includePromotedContent"] = true;
     vars["requestContext"] = "launch";
     vars["withCommunity"] = true;
+    // 模拟阅读进度：把本次会话已展示过的推文 id 一并上送（同网页端刷新行为）
+    if (!m_seenTweetIds.isEmpty())
+        vars["seenTweetIds"] = seenArray();
 
     QNetworkReply *fy = m_nam.get(apiRequest(kOpForYou, vars));
     connect(fy, &QNetworkReply::finished, this,
@@ -412,6 +435,8 @@ void XClient::fetchOlder()
         vars["requestContext"] = "launch";
         vars["withCommunity"] = true;
         vars["cursor"] = m_cursor;
+        if (!m_seenTweetIds.isEmpty())
+            vars["seenTweetIds"] = seenArray();
         ++m_olderLeft;
         QNetworkReply *fy = m_nam.get(apiRequest(kOpForYou, vars));
         connect(fy, &QNetworkReply::finished, this,
@@ -424,6 +449,8 @@ void XClient::fetchOlder()
         vars["requestContext"] = "launch";
         vars["withCommunity"] = true;
         vars["cursor"] = m_cursorFollowing;
+        if (!m_seenTweetIds.isEmpty())
+            vars["seenTweetIds"] = seenArray();
         ++m_olderLeft;
         QNetworkReply *fl = m_nam.get(apiRequest(kOpFollowing, vars));
         connect(fl, &QNetworkReply::finished, this,

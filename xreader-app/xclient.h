@@ -1,10 +1,12 @@
 #pragma once
 
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QObject>
 #include <QSet>
+#include <QStringList>
 #include <QVector>
 
 class QNetworkReply;
@@ -99,6 +101,10 @@ public slots:
     void start();          // 抓取首页（重建 feed）
     void refresh();        // 同 start()，语义为"刷新"
     void fetchOlder();     // 用 cursor 续抓更早内容（追加到尾部）
+    // 汇报"已读"进度：网页端在翻页/刷新时会把已渲染过的推文 id 以
+    // seenTweetIds 附在 HomeTimeline 请求上（模拟阅读过程，下次刷新
+    // 更可能拿到新内容）。PageStore 每展示一页调用一次本函数。
+    void reportSeen(const QString &tweetId);
     void ensureMediaFor(QString tweetId);   // 下载该推文媒体+头像（值传递：调用方
                                             // 传入的 feed 缓冲区可能在本函数内被
                                             // 同步触发的 mediaReady→syncFeed 释放）
@@ -156,6 +162,11 @@ private:
 
     QString m_authToken, m_ct0, m_twid, m_guestId;
     QString m_sessionError;
+
+    // 已读推文 id 列表（网页端 seenTweetIds 同款：不查重、按展示顺序追加，
+    // 限制长度防请求过大），随 HomeTimeline 请求上送模拟阅读进度
+    QStringList m_seenTweetIds;
+    QJsonArray seenArray() const;
 
     QVector<XTweet> m_tweets;
     quint64 m_feedRev = 0;

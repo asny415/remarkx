@@ -468,6 +468,19 @@ void PageStore::goPage(int n)
     updateLabel();
     setStatus("");
     renderCurrent();
+    // 模拟阅读进度：本页展示过的推文全部上报给 X（网页端翻页时同样会把
+    // 可见推文 id 以 seenTweetIds 附在 HomeTimeline 请求上，供下次刷新去重）
+    if (m_feedPage >= 0 && m_feedPage < m_pages.size()) {
+        QSet<int> pageTweets;
+        for (const RenderChunk &c : m_pages.at(m_feedPage).chunks) {
+            if (c.tweetIndex < 0 || c.tweetIndex >= m_feed.size())
+                continue;
+            if (pageTweets.contains(c.tweetIndex))
+                continue;
+            pageTweets.insert(c.tweetIndex);
+            m_client->reportSeen(m_feed.at(c.tweetIndex).id);
+        }
+    }
     // 页切换计数（供 QML 每 N 页强制刷新）
     const QString key = QStringLiteral("f%1").arg(m_feedPage);
     if (m_lastDisplayKey != key) {

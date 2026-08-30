@@ -1213,7 +1213,22 @@ QImage Renderer::avatar(const XTweet &t) const
 {
     if (t.avatar.isEmpty())
         return {};
-    const QString full = m_mediaDir + "/" + t.avatar;
+    // 头像长期缓存：下载后按 handle 存在 avatars/<handle>.jpg(.png)。
+    // 同一用户的头像只写回在触发下载的那条推文上，其余推文的 t.avatar 仍是 URL；
+    // 这里在 t.avatar 还是 URL 时也按 handle 探测本地缓存文件，保证头像缓存过一次
+    // 之后，任何页面上的同一用户都能直接从本地读取（不依赖逐条推文解析）。
+    QString full = m_mediaDir + "/" + t.avatar;
+    if (t.avatar.startsWith(QLatin1String("http://"))
+        || t.avatar.startsWith(QLatin1String("https://"))) {
+        const QString local = m_mediaDir + "/avatars/"
+                              + (t.authorHandle.isEmpty()
+                                     ? QStringLiteral("unknown")
+                                     : t.authorHandle);
+        if (QFile::exists(local + QStringLiteral(".jpg")))
+            full = local + QStringLiteral(".jpg");
+        else if (QFile::exists(local + QStringLiteral(".png")))
+            full = local + QStringLiteral(".png");
+    }
     auto it = m_avatarCache.constFind(full);
     if (it != m_avatarCache.constEnd()) {
         // 命中即移到末尾（LRU）

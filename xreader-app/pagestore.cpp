@@ -579,13 +579,16 @@ void PageStore::requestSlotMedia()
         return;
     syncFeed();
     QSet<QString> seen;
-    for (const ImageSlot &s : m_pages.at(m_feedPage).images) {
-        if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
+    // 遍历当前页所有帖子块（含纯文本帖）请求媒体+头像：只遍历图片槽位会漏掉
+    // 纯文本帖，导致同一用户的头像在该帖上永远不解析/不下载（即使本地已缓存）。
+    for (const RenderChunk &c : m_pages.at(m_feedPage).chunks) {
+        const int ti = c.tweetIndex;
+        if (ti < 0 || ti >= m_feed.size())
             continue;
         // 只快照用到的 id/avatar 两个字符串（而非整条推文）：ensureMediaFor
         // 在媒体已缓存时会在调用栈内同步触发 mediaReady→onMediaReady→syncFeed，
         // 重新赋值 m_feed 会释放共享缓冲区，其后不得再触碰 feed 内存。
-        const XTweet &t = m_feed.at(s.tweetIndex);
+        const XTweet &t = m_feed.at(ti);
         if (seen.contains(t.id))
             continue;
         const QString tid = t.id;

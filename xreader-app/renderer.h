@@ -128,8 +128,11 @@ private:
     qreal textWidth(const QFont &f, const QString &text) const;
     QString ellipsize(const QFont &f, const QString &text,
                       qreal maxWidth) const;
+    // endOffsets（可选）：与返回值逐行对应，记录每行在原 text 中的结束
+    // 字节偏移（用于图文环绕时从原文续排下方文字）。
     QStringList wrapText(const QFont &f, const QString &text, qreal maxWidth,
-                         int maxLines, bool *truncated = nullptr) const;
+                         int maxLines, bool *truncated = nullptr,
+                         QList<int> *endOffsets = nullptr) const;
     QVector<Atom> buildAtoms(const QVector<XTweet> &feed, int ti);
     Atom imgAtom(const QVector<XTweet> &feed, int ti, bool isQuoted, int ind);
     QString statsText(const XTweet &t) const;

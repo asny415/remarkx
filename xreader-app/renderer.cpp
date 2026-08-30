@@ -164,9 +164,11 @@ QString Renderer::cleanText(const QString &text)
 
 QStringList Renderer::wrapText(const QFont &f, const QString &text,
                                qreal maxWidth, int maxLines,
-                               bool *truncated) const
+                               bool *truncated, QList<int> *endOffsets) const
 {
     QStringList lines;
+    if (endOffsets)
+        endOffsets->clear();
     if (truncated)
         *truncated = false;
     static const QRegularExpression unitRe(QStringLiteral(
@@ -179,59 +181,84 @@ QStringList Renderer::wrapText(const QFont &f, const QString &text,
         s.replace(trailingWs, QString());
         return s;
     };
-    auto emitLine = [&](QString line) {
+    // endOff 是该行在原文 text 中的结束偏移：行尾被悬挂丢弃的空格/标点之外，
+    // 下一个字真正开始的位置，续排时 text.mid(endOff) 即为剩余原文。
+    auto emitLine = [&](QString line, int endOff) {
         line = rstrip(line);
-        if (!line.isEmpty())
+        if (!line.isEmpty()) {
             lines.append(line);
-        else if (lines.isEmpty() || !lines.last().isEmpty())
+            if (endOffsets)
+                endOffsets->append(endOff);
+        } else if (lines.isEmpty() || !lines.last().isEmpty()) {
             lines.append(QString());
+            if (endOffsets)
+                endOffsets->append(endOff);
+        }
     };
 
-    for (const QString &raw : text.split(QLatin1Char('\n'))) {
+    int paraStart = 0;
+    const QStringList paras = text.split(QLatin1Char('\n'));
+    for (const QString &raw : paras) {
+        const int paraEnd = paraStart + raw.length();
         if (raw.trimmed().isEmpty()) {
-            emitLine(QString());
+            emitLine(QString(), paraEnd);
+            paraStart = paraEnd + 1;
+            if (lines.size() >= maxLines + 1)
+                break;
             continue;
         }
         QString line;
+        int lineEnd = paraStart;
         auto it = unitRe.globalMatch(raw);
         while (it.hasNext()) {
-            const QString u = it.next().captured(0);
+            const QRegularExpressionMatch m = it.next();
+            const QString u = m.captured(0);
+            const int uStart = paraStart + m.capturedStart(0);
+            const int uEnd = uStart + u.length();
             if (textWidth(f, line + u) <= maxWidth) {
                 line += u;
+                lineEnd = uEnd;
                 continue;
             }
             if (u.at(0).isSpace())
-                continue;  // 行尾空白悬挂丢弃
+                continue;  // 行尾空白悬挂丢弃（lineEnd 保持本行内容末尾）
             if (closing.contains(u) && !line.isEmpty()) {
                 line += u;  // 闭合标点挂到行尾
+                lineEnd = uEnd;
                 continue;
             }
             if (!line.trimmed().isEmpty()) {
-                emitLine(line);
+                emitLine(line, lineEnd);
                 line.clear();
                 if (textWidth(f, u) <= maxWidth) {
                     line = u;
+                    lineEnd = uEnd;
                     continue;
                 }
             }
             // 超长原子（长英文单词）逐字符硬拆
-            for (const QChar &ch : u) {
+            for (int ci = 0; ci < u.length(); ++ci) {
+                const QChar ch = u.at(ci);
                 if (!line.isEmpty() && textWidth(f, line + ch) > maxWidth) {
-                    emitLine(line);
+                    emitLine(line, lineEnd);
                     line.clear();
                 }
                 line += ch;
+                lineEnd = uStart + ci + 1;
             }
         }
-        emitLine(line);
+        emitLine(line, lineEnd);
         if (lines.size() >= maxLines + 1)
             break;
+        paraStart = paraEnd + 1;
     }
     if (lines.size() > maxLines) {
         lines = lines.mid(0, maxLines);
         lines[maxLines - 1] = rstrip(lines[maxLines - 1]) + QStringLiteral(" …");
         if (truncated)
             *truncated = true;
+        if (endOffsets && endOffsets->size() > lines.size())
+            endOffsets->resize(lines.size());
     }
     return lines;
 }
@@ -319,13 +346,19 @@ Renderer::Atom Renderer::makeFloatCard(const XTweet &t, const Atom &img)
     if (floatTextW < 200)
         return bad;   // 图相对太宽，环绕意义不大
 
-    // 先按"图旁窄宽"包裹全部文本，取前 K 行放在图片旁；剩余文本重新全宽包裹
+    // 前 K 行按"图旁窄宽"包裹放在图片旁；剩余文字从原文续排，按整卡全宽
+    // 包裹（不能把窄行用换行符拼起来再重排——那会按段保留窄行，图下留白）。
     const int K = (dh + TEXT_LH - 1) / TEXT_LH;   // ceil(dh / TEXT_LH)
-    const QStringList allNarrow = wrapText(font(30), text, floatTextW, 100000);
+    QList<int> offs;
+    const QStringList allNarrow =
+        wrapText(font(30), text, floatTextW, 100000, nullptr, &offs);
     const QStringList beside = allNarrow.mid(0, K);
     QStringList below;
     if (allNarrow.size() > K) {
-        const QString rest = allNarrow.mid(K).join(QLatin1Char('\n'));
+        QString rest = text.mid(offs.value(K - 1));
+        // 去掉上一行行尾悬挂的空格（保留段落换行）
+        static const QRegularExpression hangWs(QStringLiteral("^[ \\t]+"));
+        rest.replace(hangWs, QString());
         below = wrapText(font(30), rest, TEXT_W, 100000);
     }
 
@@ -382,14 +415,18 @@ Renderer::Atom Renderer::makeQFloatCard(const XTweet &t, const Atom &img)
     if (floatTextW < 200)
         return bad;
 
-    // 引用文字：先按"图旁窄宽"包裹全部文本，取前 K 行放在图片旁；
-    // 剩余文本重新全宽包裹，落到图片下方（消除图片下面的空白）。
+    // 引用文字：前 K 行按"图旁窄宽"包裹放在图片旁；剩余文字从原文续排，
+    // 按引用块全宽包裹落到图片下方（消除图片下面的空白）。
     const int K = (dh + TEXT_LH_Q - 1) / TEXT_LH_Q;
-    const QStringList allNarrow = wrapText(font(26), qtext, floatTextW, 100000);
+    QList<int> offs;
+    const QStringList allNarrow =
+        wrapText(font(26), qtext, floatTextW, 100000, nullptr, &offs);
     const QStringList beside = allNarrow.mid(0, K);
     QStringList below;
     if (allNarrow.size() > K) {
-        const QString rest = allNarrow.mid(K).join(QLatin1Char('\n'));
+        QString rest = qtext.mid(offs.value(K - 1));
+        static const QRegularExpression hangWs(QStringLiteral("^[ \\t]+"));
+        rest.replace(hangWs, QString());
         below = wrapText(font(26), rest, qtw, 100000);
     }
 

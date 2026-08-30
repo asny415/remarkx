@@ -116,7 +116,7 @@ private:
     QString upsertFav(const XTweet &t, const QString &pageNum, bool *fresh);
     QString allocNumber();
     void updateFavImage(const QString &number, const QString &tweetId);
-    void onFavSent(const QString &number);
+    void onFavSent(const QString &number, const QString &tweetId);
     void setStatus(const QString &s);
     void updateLabel();
     void doFullRefresh();
@@ -154,6 +154,9 @@ private:
     bool m_refreshArmed = false;
 
     QJsonArray m_favs;         // 收藏索引：{number,tweet_id,url,feed_page,created}
+    // 已成功推送 Telegram 的推文 mid（持久化在 favs.json "sent"）：
+    // 同一个帖子无论何时再出现（翻页/刷新/重排）都不再收藏、不再推送
+    QSet<QString> m_sentMids;
     QString m_date;
     int m_seq = 0;
     int m_feedPage = 0;

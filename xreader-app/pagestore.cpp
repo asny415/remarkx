@@ -175,12 +175,27 @@ void PageStore::start()
         m_seq = o["seq"].toInt();
         sf.close();
     }
-    // 读取 favs.json 收藏索引（帖图 + 原始链接）
+    // 读取 favs.json 收藏索引（帖图 + 原始链接）+ 已推送的 mid 集合
     QFile bf(m_favsJsonFile);
     if (bf.open(QIODevice::ReadOnly)) {
         const QJsonObject o = QJsonDocument::fromJson(bf.readAll()).object();
         m_favs = o["favs"].toArray();
+        const QJsonArray sent = o["sent"].toArray();
+        for (const QJsonValue &v : sent)
+            if (!v.toString().isEmpty())
+                m_sentMids.insert(v.toString());
         bf.close();
+    }
+    // 启动去重：同一帖子只保留一条收藏（老版本按页收藏可能留下重复项），
+    // 已推送过的条目清掉（帖图早被删除，属于残留），避免再补发/重复发
+    QSet<QString> seenFav;
+    for (int i = m_favs.size() - 1; i >= 0; --i) {
+        const QString id = m_favs.at(i).toObject()["tweet_id"].toString();
+        if (id.isEmpty() || seenFav.contains(id)
+                || m_sentMids.contains(id))
+            m_favs.removeAt(i);
+        else
+            seenFav.insert(id);
     }
     cleanupOnStartup();
     // 重启后补发上次没发完的 Telegram 收藏通知（不受 X 登录态影响）
@@ -723,11 +738,14 @@ void PageStore::saveInkNow()
         if (done.contains(t.id))
             continue;
         done.insert(t.id);
+        // 已成功推送过的帖子：不再收藏、不再发送（防翻页/刷新后重复）
+        if (m_sentMids.contains(t.id))
+            continue;
         bool fresh = false;
         const QString number = upsertFav(t, pageNum, &fresh);
         updateFavImage(number, t.id);
         if (fresh)
-            m_telegram->enqueue(number, t.url);
+            m_telegram->enqueue(number, t.id, t.url);
     }
 }
 
@@ -760,13 +778,18 @@ void PageStore::persistFavs()
     if (f.open(QIODevice::WriteOnly)) {
         QJsonObject o;
         o["favs"] = m_favs;
+        QJsonArray sent;
+        for (const QString &id : m_sentMids)
+            sent.append(id);
+        o["sent"] = sent;
         f.write(QJsonDocument(o).toJson(QJsonDocument::Indented));
         f.close();
     }
 }
 
-// 收藏索引写回：同页同帖（feed_page + tweet_id）只保留一条收藏（更新链接，
-// 保留编号/创建时间）；不同帖子、或同一帖子在不同页，各自分配独立编号。
+// 收藏索引写回：同一帖子（tweet_id）无论出现在哪一页，只保留一条收藏。
+// 翻页/刷新/重排导致同一帖子在不同页反复出现时，都归并到首次收藏，
+// 不再分配新编号、不再触发 Telegram 推送。
 // 返回该收藏的编号；新收藏时 *fresh=true（触发 Telegram 推送）。
 QString PageStore::upsertFav(const XTweet &t, const QString &pageNum,
                              bool *fresh)
@@ -775,8 +798,7 @@ QString PageStore::upsertFav(const XTweet &t, const QString &pageNum,
         *fresh = false;
     for (int i = 0; i < m_favs.size(); ++i) {
         QJsonObject e = m_favs.at(i).toObject();
-        if (e["feed_page"].toInt(-1) == m_feedPage
-                && e["tweet_id"].toString() == t.id) {
+        if (e["tweet_id"].toString() == t.id) {
             e["url"] = t.url;
             m_favs.replace(i, e);
             persistFavs();
@@ -834,12 +856,16 @@ void PageStore::updateFavImage(const QString &number, const QString &tweetId)
         post.save(m_bookDir + "/" + number + ".png", "PNG", 30);
 }
 
-// Telegram 推送成功：删除本地帖图（占空间大头）并移出索引。
+// Telegram 推送成功：记录该帖子 mid（此后不再收藏/发送），
+// 删除本地帖图（占空间大头）并移出索引。
 // 笔迹层 .draw.png 保留——翻页回来还要恢复笔迹，且体积很小。
-void PageStore::onFavSent(const QString &number)
+void PageStore::onFavSent(const QString &number, const QString &tweetId)
 {
     qInfo() << "fav sent, drop local image" << number;
-    QFile::remove(m_bookDir + "/" + number + ".png");
+    // 无论索引里是否还找得到该编号（老版本可能有残留/已去重），
+    // 都记下 mid，保证同一个帖子此后绝不再收藏、再发送
+    if (!tweetId.isEmpty())
+        m_sentMids.insert(tweetId);
     for (int i = m_favs.size() - 1; i >= 0; --i) {
         const QJsonObject e = m_favs.at(i).toObject();
         if (e["number"].toString() == number) {
@@ -847,6 +873,7 @@ void PageStore::onFavSent(const QString &number)
             break;
         }
     }
+    QFile::remove(m_bookDir + "/" + number + ".png");
     persistFavs();
 }
 

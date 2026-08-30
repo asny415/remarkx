@@ -28,20 +28,22 @@ public:
 
     bool enabled() const { return !m_bot.isEmpty() && !m_chat.isEmpty(); }
 
-    // 入队一条收藏通知（按 number 去重），随后后台尝试发送。
+    // 入队一条收藏通知（按 number / tweetId 去重），随后后台尝试发送。
     // caption 为原始帖子完整链接；图片取 book/<number>.png。
-    void enqueue(const QString &number, const QString &url);
+    void enqueue(const QString &number, const QString &tweetId,
+                 const QString &url);
 
     // 应用启动后调用：重置退避、立即补发所有未完成的消息。
     void flush();
 
 signals:
-    // 某条收藏已成功推送（接收方据此删除本地图片）
-    void sent(const QString &number);
+    // 某条收藏已成功推送（接收方据此记录 mid、删除本地图片）
+    void sent(const QString &number, const QString &tweetId);
 
 private:
     struct Pending {
         QString number;
+        QString tweetId;   // 帖子 mid：跨编号去重，同一帖子只发一次
         QString url;
         int attempts = 0;
         qint64 nextTryMs = 0;   // 0 = 立即可发

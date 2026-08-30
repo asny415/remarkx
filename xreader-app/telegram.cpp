@@ -103,6 +103,7 @@ void Telegram::saveQueue()
     for (const Pending &it : m_pending) {
         QJsonObject o;
         o["number"] = it.number;
+        o["tweet_id"] = it.tweetId;
         o["url"] = it.url;
         o["attempts"] = it.attempts;
         o["next_try"] = it.nextTryMs;
@@ -114,6 +115,17 @@ void Telegram::saveQueue()
     f.close();
 }
 
+// 从帖子的完整链接里取 mid（https://x.com/<handle>/status/<mid>）；
+// 老版本队列只存了 url，用它做跨编号去重的兜底。
+static QString midFromUrl(const QString &url)
+{
+    const QString trimmed = url.trimmed();
+    const int slash = trimmed.lastIndexOf(QLatin1Char('/'));
+    if (slash < 0)
+        return {};
+    return trimmed.mid(slash + 1);
+}
+
 void Telegram::loadQueue()
 {
     m_pending.clear();
@@ -123,30 +135,41 @@ void Telegram::loadQueue()
     const QJsonArray arr = QJsonDocument::fromJson(f.readAll())
                                .object()["queue"].toArray();
     f.close();
+    QSet<QString> seenMids;   // 同一帖子只留队列里第一条，避免重复补发
     for (const QJsonValue &v : arr) {
         const QJsonObject o = v.toObject();
         Pending p;
         p.number = o["number"].toString();
+        p.tweetId = o["tweet_id"].toString();
         p.url = o["url"].toString();
         if (p.url.isEmpty())
             p.url = o["tweet_id"].toString();   // 兼容旧队列
+        if (p.tweetId.isEmpty())
+            p.tweetId = midFromUrl(p.url);
         p.attempts = o["attempts"].toInt();
         p.nextTryMs = qint64(o["next_try"].toDouble());
         if (p.number.isEmpty() || p.url.isEmpty())
             continue;
+        if (seenMids.contains(p.tweetId))
+            continue;   // 同帖重复项丢弃（取第一条）
+        seenMids.insert(p.tweetId);
         m_pending.append(p);
     }
 }
 
-void Telegram::enqueue(const QString &number, const QString &url)
+void Telegram::enqueue(const QString &number, const QString &tweetId,
+                       const QString &url)
 {
     if (!enabled())
         return;
+    // 同帖（mid）无论编号如何都只发一次：翻页/刷新/重排产生的
+    // 新编号（新帖图）也不再入队，避免重复消息
     for (const Pending &it : m_pending)
-        if (it.number == number)
-            return;   // 已在队列，不重复
+        if (it.number == number || it.tweetId == tweetId)
+            return;
     Pending p;
     p.number = number;
+    p.tweetId = tweetId;
     p.url = url;
     m_pending.append(p);
     saveQueue();
@@ -260,12 +283,15 @@ void Telegram::onReplyFinished(QNetworkReply *reply, const QString &number)
     logTelegram(m_baseDir, number, ok, status, attempts, body);
     if (ok) {
         qInfo() << "Telegram sendPhoto ok" << number;
+        QString sentId;
         for (int i = m_pending.size() - 1; i >= 0; --i) {
-            if (m_pending.at(i).number == number)
+            if (m_pending.at(i).number == number) {
+                sentId = m_pending.at(i).tweetId;
                 m_pending.removeAt(i);
+            }
         }
         saveQueue();
-        emit sent(number);   // 已投递：让 PageStore 删掉本地图片腾空间
+        emit sent(number, sentId);   // 已投递：让 PageStore 记 mid + 删本地图腾空间
     } else {
         qWarning() << "Telegram sendPhoto failed" << number
                    << reply->errorString() << "HTTP" << status;

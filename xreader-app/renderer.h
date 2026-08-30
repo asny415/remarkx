@@ -88,6 +88,14 @@ public:
                       const QVector<RenderPage> &pages, int pageIndex,
                       bool withPhotos);
 
+    // 渲染某条推文的独立收藏图：把该帖在整本 feed 排版中的各个拆分块
+    // （跨页/跨栏）按阅读顺序自上而下拼成一张图，宽度裁剪到帖子实际
+    // 占位（去掉无内容的半版空白）；inkPage 页上的笔迹 inkPage 会按
+    // 块矩形原位叠加（其他页的拆分块无笔迹）。无块时返回空图。
+    QImage renderFavorite(const QVector<XTweet> &feed,
+                          const QVector<RenderPage> &pages, int tweetIndex,
+                          int inkPageIndex, const QImage &inkPage);
+
     // 全文全屏阅读：把某条推文的完整内容（含原文/引用块）单栏排版成若干整页
     // 位图，返回第 pageIndex 页；totalPages 输出总页数。
     QImage renderTextPage(const XTweet &t, int pageIndex, int *totalPages);

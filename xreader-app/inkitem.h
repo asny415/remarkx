@@ -16,6 +16,12 @@ public:
     bool hasInk() const { return m_hasInk; }
     void paint(QPainter *painter) override;
 
+    const QImage &inkImage() const { return m_img; }
+    // 笔迹起始位置（最靠上、最靠左的墨迹像素，用于判断归属哪个帖子）
+    QPoint inkStart() const;
+    // 是否真的有墨迹像素（擦除痕迹不算）
+    bool hasInkPixels() const;
+
     Q_INVOKABLE void clear();
     Q_INVOKABLE bool saveDraw(const QString &path) const;
     Q_INVOKABLE bool loadDraw(const QString &path);

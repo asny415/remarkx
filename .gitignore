@@ -7,6 +7,9 @@
 # 设备端运行配置（含代理等环境相关项）
 xreader-app/config.json
 xreader-app/cookies.json
+xreader-app/pending.json
+xreader-app/favs.json
+xreader-app/state.json
 
 # Python
 __pycache__/

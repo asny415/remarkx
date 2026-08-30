@@ -1056,6 +1056,73 @@ QImage Renderer::renderPage(const QVector<XTweet> &feed,
     return img;
 }
 
+QImage Renderer::renderFavorite(const QVector<XTweet> &feed,
+                                const QVector<RenderPage> &pages,
+                                int tweetIndex, int inkPageIndex,
+                                const QImage &inkPage)
+{
+    remarkxSetCtx("render:renderFavorite");
+    struct Loc {
+        int page;
+        QRect rect;
+    };
+    QVector<Loc> locs;
+    for (int pi = 0; pi < pages.size(); ++pi) {
+        for (const RenderChunk &c : pages.at(pi).chunks) {
+            if (c.tweetIndex != tweetIndex || c.rect.isEmpty())
+                continue;
+            locs.append({pi, c.rect});
+        }
+    }
+    if (locs.isEmpty())
+        return {};
+
+    const int gap = 24;
+    int totalH = gap;
+    // 帖子各块的水平占位：裁掉无内容的半版空白，只保留帖子实际宽度
+    int minX = W, maxX = 0;
+    for (const Loc &l : locs) {
+        totalH += l.rect.height() + gap;
+        minX = qMin(minX, l.rect.x());
+        maxX = qMax(maxX, l.rect.x() + l.rect.width());
+    }
+    const int edge = 12;   // 左右留一点边，避免卡片边框贴着图片边缘
+    minX = qMax(0, minX - edge);
+    maxX = qMin(W, maxX + edge);
+    const int outW = qMax(1, maxX - minX);
+
+    QImage out(outW, totalH, QImage::Format_RGB32);
+    out.fill(BG);
+    QPainter p(&out);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setRenderHint(QPainter::TextAntialiasing, true);
+
+    // 同一页多个块只渲染一次（收藏图跨页时会重排渲染多页）
+    QHash<int, QImage> pageCache;
+    int y = gap;
+    for (int i = 0; i < locs.size(); ++i) {
+        const Loc &l = locs.at(i);
+        auto it = pageCache.constFind(l.page);
+        if (it == pageCache.constEnd())
+            it = pageCache.insert(l.page,
+                                  renderPage(feed, pages, l.page, true));
+        const QImage &pg = it.value();
+        // 块与笔迹整体平移到裁剪后的左边界（相对帖子的位置不变）
+        p.drawImage(QPoint(l.rect.x() - minX, y), pg, l.rect);
+        if (l.page == inkPageIndex && !inkPage.isNull())
+            p.drawImage(QPoint(l.rect.x() - minX, y), inkPage, l.rect);
+        if (i + 1 < locs.size()) {
+            // 拆分块之间画分隔线
+            p.setPen(QPen(CARD_BORDER, 2));
+            p.drawLine(0, y + l.rect.height() + gap / 2, outW,
+                       y + l.rect.height() + gap / 2);
+        }
+        y += l.rect.height() + gap;
+    }
+    p.end();
+    return out;
+}
+
 void Renderer::drawCardBorder(QPainter &p, int x, int y0, int y1, int w,
                               bool top, bool bottom) const
 {

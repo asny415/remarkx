@@ -19,6 +19,7 @@
 
 #include "crashctx.h"
 #include "inkitem.h"
+#include "telegram.h"
 
 static const int SCREEN_W = 1404;
 static const int SCREEN_H = 1872;
@@ -53,7 +54,7 @@ void PageStore::configure(const QString &baseDir)
     m_baseDir = baseDir;
     m_bookDir = baseDir + "/book";
     m_stateFile = baseDir + "/state.json";
-    m_bookJsonFile = baseDir + "/book.json";
+    m_favsJsonFile = baseDir + "/favs.json";
     m_calibFile = baseDir + "/calib.json";
     QDir().mkpath(m_bookDir);
 
@@ -61,6 +62,10 @@ void PageStore::configure(const QString &baseDir)
     m_client->configure(baseDir);
     m_renderer = new Renderer(this);
     m_renderer->configure(baseDir);
+    m_telegram = new Telegram(this);
+    m_telegram->configure(baseDir);
+    // 推送成功后删除本地帖图（笔迹层保留，供翻页恢复）
+    connect(m_telegram, &Telegram::sent, this, &PageStore::onFavSent);
 
     connect(m_client, &XClient::homeReady, this, &PageStore::onHomeReady);
     connect(m_client, &XClient::olderReady, this, &PageStore::onOlderReady);
@@ -169,14 +174,16 @@ void PageStore::start()
         m_seq = o["seq"].toInt();
         sf.close();
     }
-    // 读取 book.json 索引
-    QFile bf(m_bookJsonFile);
+    // 读取 favs.json 收藏索引（帖图 + 原始链接）
+    QFile bf(m_favsJsonFile);
     if (bf.open(QIODevice::ReadOnly)) {
         const QJsonObject o = QJsonDocument::fromJson(bf.readAll()).object();
-        m_entries = o["entries"].toArray();
+        m_favs = o["favs"].toArray();
         bf.close();
     }
     cleanupOnStartup();
+    // 重启后补发上次没发完的 Telegram 收藏通知（不受 X 登录态影响）
+    m_telegram->flush();
 
     if (!m_client->hasSession()) {
         m_error = "未配置 X 登录态：请在 PC 运行安装脚本导入 Cookie 后再启动";
@@ -189,15 +196,13 @@ void PageStore::start()
     m_client->start();
 }
 
-// 只有带笔迹的页面（.draw.png 存在）会连同其页面 PNG 一起保留，
-// 其余缓存 PNG 全部删除（设备端渲染后，非收藏页不再落盘）。
+// 启动清理：收藏帖图（.png）与笔迹层（.draw.png）保留，其余 PNG
+// （旧版整页收藏/历史缓存）删除。
 void PageStore::cleanupOnStartup()
 {
     QSet<QString> keep;
-    for (int i = 0; i < m_entries.size(); ++i) {
-        const QJsonObject e = m_entries.at(i).toObject();
-        if (!e["has_draw"].toBool())
-            continue;
+    for (int i = 0; i < m_favs.size(); ++i) {
+        const QJsonObject e = m_favs.at(i).toObject();
         const QString num = e["number"].toString();
         keep.insert(num + ".png");
         keep.insert(num + ".draw.png");
@@ -207,13 +212,15 @@ void PageStore::cleanupOnStartup()
         dir.entryInfoList(QStringList{"*.png"}, QDir::Files);
     int removed = 0;
     for (const QFileInfo &fi : files) {
-        if (!keep.contains(fi.fileName())) {
-            QFile::remove(fi.absoluteFilePath());
-            ++removed;
-        }
+        // 笔迹层一律保留（翻页恢复用）；收藏帖图按索引保留
+        if (fi.fileName().endsWith(QLatin1String(".draw.png"))
+                || keep.contains(fi.fileName()))
+            continue;
+        QFile::remove(fi.absoluteFilePath());
+        ++removed;
     }
     if (removed)
-        qInfo() << "cleanupOnStartup: removed" << removed << "cached pages";
+        qInfo() << "cleanupOnStartup: removed" << removed << "obsolete pngs";
 }
 
 void PageStore::syncFeed()
@@ -233,12 +240,11 @@ void PageStore::rebuildPages(bool resetPageNumbers)
     syncFeed();
     m_pages = m_renderer->paginate(m_feed);
     m_totalPages = qMax(1, m_pages.size());
-    m_version = QStringLiteral("s%1").arg(++m_sessionSeq);
     // feed/排版已变：已渲染位图全部作废（页码可能映射到不同内容）
     m_pageCache.clear();
     m_pageCacheOrder.clear();
-    // 只有整批刷新（homeReady）才清收藏编号映射；续抓（extend）只是尾部追加，
-    // 已展示页面不变，编号必须保留，否则同页反复收藏出重复页
+    // 只有整批刷新（homeReady）才清笔迹编号映射；续抓（extend）只是尾部追加，
+    // 已展示页面不变，编号必须保留，否则同页反复写字出重复收藏
     if (resetPageNumbers)
         m_pageNumbers.clear();
     updateLabel();
@@ -291,7 +297,7 @@ void PageStore::onFetchError(const QString &msg)
 void PageStore::onMediaReady(const QString &tweetId)
 {
     remarkxSetCtx("onMediaReady");
-    if (m_mode != FeedMode || m_pages.isEmpty())
+    if (m_pages.isEmpty())
         return;
     syncFeed();   // 确保 m_feed 与 m_pages 索引一致
     const int cur = m_feedPage;
@@ -322,124 +328,20 @@ void PageStore::onMediaReady(const QString &tweetId)
             }
         }
     }
-    // 所有带收藏编号且含此推文的页 → 用最新图片重存合成页（补上先前缺失的图）
-    for (auto it = m_pageNumbers.cbegin(); it != m_pageNumbers.cend(); ++it) {
-        const int pg = it.key();
-        if (pg < 0 || pg >= m_pages.size())
+    // 媒体就绪：重存含此推文的收藏帖图（补上先前缺失的图）
+    for (int i = 0; i < m_favs.size(); ++i) {
+        const QJsonObject e = m_favs.at(i).toObject();
+        if (e["tweet_id"].toString() != tweetId)
             continue;
-        bool has = false;
-        for (const ImageSlot &s : m_pages.at(pg).images) {
-            if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
-                continue;
-            if (m_feed.at(s.tweetIndex).id == tweetId) {
-                has = true;
-                break;
-            }
-        }
-        if (has) {
-            const QString num = it.value();
-            QImage full = m_renderer->renderPage(m_feed, m_pages, pg, true);
-            full.save(m_bookDir + "/" + num + ".png", "PNG", 30);
-        }
+        updateFavImage(e["number"].toString(), tweetId);
     }
 }
 
 void PageStore::updateLabel()
 {
-    if (m_mode == FavMode) {
-        const int n = favCount();
-        m_bookLabel = QString("收藏 %1/%2")
-                          .arg(qBound(1, m_favIndex + 1, qMax(n, 1)))
-                          .arg(n);
-        return;
-    }
     m_bookLabel = QString("第 %1 页 · 共 %2 页")
                       .arg(m_feedPage + 1)
                       .arg(m_totalPages);
-}
-
-// 收藏页 = 所有带笔迹(has_draw)的书页，按编号（时间）升序。
-// 结果缓存：收藏夹翻页时 favNumbers/favCount 会被反复调用，每次全量
-// 重建+排序在收藏较多时明显拖慢翻页。
-void PageStore::refreshFavNums() const
-{
-    QList<QString> out;
-    for (int i = 0; i < m_entries.size(); ++i) {
-        const QJsonObject e = m_entries.at(i).toObject();
-        if (e["has_draw"].toBool())
-            out.append(e["number"].toString());
-    }
-    std::sort(out.begin(), out.end());
-    m_favNums = out;
-    m_favNumsValid = true;
-}
-
-QList<QString> PageStore::favNumbers() const
-{
-    if (!m_favNumsValid)
-        refreshFavNums();
-    return m_favNums;
-}
-
-int PageStore::favCount() const
-{
-    return favNumbers().size();
-}
-
-void PageStore::enterFav(int index)
-{
-    remarkxSetCtx("enterFav");
-    const QList<QString> nums = favNumbers();
-    if (nums.isEmpty())
-        return;
-    index = qBound(0, index, nums.size() - 1);
-    saveInkNow();
-    m_mode = FavMode;
-    m_favIndex = index;
-    m_loading = false;
-    m_imageSlots.clear();
-    emit imageSlotsChanged();
-    loadLocal(nums.at(index));
-    updateLabel();
-    emit stateChanged();
-    // 页切换计数
-    const QString key = QStringLiteral("v") + nums.at(index);
-    if (m_lastDisplayKey != key) {
-        m_lastDisplayKey = key;
-        ++m_pageKey;
-    }
-}
-
-// 删除当前收藏页：移除笔迹图与页面 PNG，从索引剔除，跳到下一张收藏
-void PageStore::deleteCurrentFav()
-{
-    if (m_mode != FavMode)
-        return;
-    const QList<QString> nums = favNumbers();
-    if (nums.isEmpty() || m_favIndex < 0 || m_favIndex >= nums.size())
-        return;
-    const QString number = nums.at(m_favIndex);
-    qInfo() << "deleteFav" << number;
-    // 先清笔迹与编号，避免 enterFav 里的 saveInkNow 把已删笔迹又写回
-    if (m_ink)
-        m_ink->clear();
-    m_currentNumber.clear();
-    QFile::remove(m_bookDir + "/" + number + ".draw.png");
-    QFile::remove(m_bookDir + "/" + number + ".png");
-    for (int i = 0; i < m_entries.size(); ++i) {
-        QJsonObject e = m_entries.at(i).toObject();
-        if (e["number"].toString() == number) {
-            m_entries.removeAt(i);
-            break;
-        }
-    }
-    persistBook();
-    if (favCount() > 0)
-        enterFav(qMin(m_favIndex, favCount() - 1));
-    else {
-        m_mode = FeedMode;
-        goPage(0);
-    }
 }
 
 void PageStore::refresh()
@@ -457,16 +359,6 @@ void PageStore::next()
     remarkxSetCtx("next");
     if (m_loading || m_waitingOlder) {
         qInfo() << "next ignored: busy";
-        return;
-    }
-    if (m_mode == FavMode) {
-        if (m_favIndex + 1 < favCount()) {
-            enterFav(m_favIndex + 1);
-        } else {
-            qInfo() << "fav last -> feed page 0";
-            m_mode = FeedMode;
-            goPage(0);
-        }
         return;
     }
     if (m_feedPage + 1 < m_totalPages) {
@@ -496,22 +388,12 @@ void PageStore::prev()
         qInfo() << "prev ignored: busy";
         return;
     }
-    if (m_mode == FavMode) {
-        if (m_favIndex > 0)
-            enterFav(m_favIndex - 1);
-        return;
-    }
     if (m_feedPage > 0) {
         goPage(m_feedPage - 1);
         maybePrefetchOlder();
     } else {
-        // 第 1 页继续上一页 → 进入收藏（带笔迹页）浏览
-        if (favCount() > 0) {
-            qInfo() << "prev at first page -> fav view";
-            enterFav(favCount() - 1);
-        } else {
-            qInfo() << "prev at first page: no fav pages";
-        }
+        // 第 1 页继续上一页：没有收藏夹了，停留原地
+        qInfo() << "prev at first page";
     }
 }
 
@@ -563,9 +445,7 @@ void PageStore::goPage(int n)
 {
     remarkxSetCtx("goPage");
     saveInkNow();
-    if (m_mode == FavMode)
-        m_mode = FeedMode;
-    // 离开当前页：收藏编号交给 m_pageNumbers 记录，避免后续误用旧编号
+    // 离开当前页：笔迹编号交给 m_pageNumbers 记录，避免后续误用旧编号
     m_currentNumber.clear();
     m_feedPage = qBound(0, n, qMax(0, m_totalPages - 1));
     m_loading = false;
@@ -599,8 +479,6 @@ void PageStore::maybePrefetchOlder()
     if (m_loading || m_waitingOlder || m_prefetchOlder)
         return;
     if (m_client->fetching())
-        return;
-    if (m_mode != FeedMode)
         return;
     if (m_feedPage + 2 < m_totalPages)
         return;   // 距书尾 ≥2 页：不预抓
@@ -734,7 +612,7 @@ int PageStore::hitSlot(int x, int y)
 QString PageStore::hitFullText(int x, int y)
 {
     remarkxSetCtx("hitFullText");
-    if (m_mode != FeedMode || m_pages.isEmpty())
+    if (m_pages.isEmpty())
         return {};
     if (m_feedPage < 0 || m_feedPage >= m_pages.size())
         return {};
@@ -799,40 +677,18 @@ QStringList PageStore::slotFiles(int slotIndex)
     return files;
 }
 
-void PageStore::loadLocal(const QString &number)
-{
-    const QString base = m_bookDir + "/" + number;
-    if (!QFile::exists(base + ".png")) {
-        qInfo() << "loadLocal: page missing" << number;
-        m_error = "收藏页缺失：" + number;
-        emit errorChanged();
-        return;
-    }
-    m_currentNumber = number;
-    m_currentFile = "file://" + base + ".png";
-    m_loading = false;
-    setStatus("");
-    if (m_ink) {
-        if (!m_ink->loadDraw(base + ".draw.png"))
-            m_ink->clear();
-    }
-    emit currentFileChanged();
-    emit stateChanged();
-}
-
 void PageStore::saveInkNow()
 {
     remarkxSetCtx("saveInkNow");
     if (!m_ink || !m_ink->hasInk())
         return;
-    // 优先用当前页已分配编号；收藏页（loadLocal）直接沿用 m_currentNumber
+    if (!m_ink->hasInkPixels())
+        return;   // 只有擦除痕迹，没有实际墨迹，不收藏
+    // 优先用当前页已分配编号
     QString number = m_currentNumber;
     if (number.isEmpty())
         number = m_pageNumbers.value(m_feedPage);
-    const bool isNew = number.isEmpty();
-    if (isNew) {
-        if (m_mode != FeedMode)
-            return;
+    if (number.isEmpty()) {
         const QString today = QDate::currentDate().toString("yyyyMMdd");
         if (m_date != today) {
             m_date = today;
@@ -845,34 +701,19 @@ void PageStore::saveInkNow()
     }
     m_currentNumber = number;
     const QString base = m_bookDir + "/" + number;
-    if (m_mode == FeedMode) {
-        // 合成完整页（文本 + 已就绪图片）落盘，供收藏浏览
-        QImage full = m_renderer->renderPage(m_feed, m_pages, m_feedPage, true);
-        full.save(base + ".png", "PNG", 30);
-    }
-    if (m_ink->saveDraw(base + ".draw.png")) {
-        bool found = false;
-        for (int i = 0; i < m_entries.size(); ++i) {
-            QJsonObject e = m_entries.at(i).toObject();
-            if (e["number"].toString() == number) {
-                if (!e["has_draw"].toBool()) {
-                    e["has_draw"] = true;
-                    m_entries.replace(i, e);
-                }
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            QJsonObject e;
-            e["number"] = number;
-            e["date"] = QDate::currentDate().toString("yyyy-MM-dd");
-            e["feed_page"] = m_feedPage;
-            e["version"] = m_version;
-            e["has_draw"] = true;
-            m_entries.append(e);
-        }
-        persistBook();
+    // 笔迹层落盘（翻页回来恢复）
+    if (!m_ink->saveDraw(base + ".draw.png"))
+        return;
+
+    // 按笔迹起始位置锁定帖子，渲染"帖+笔迹"独立图落盘；新收藏推 Telegram
+    const QPoint start = m_ink->inkStart();
+    const int ti = hitTweetIndex(start.x(), start.y());
+    if (ti >= 0 && ti < m_feed.size()) {
+        const XTweet &t = m_feed.at(ti);
+        const bool fresh = upsertFav(number, t);
+        updateFavImage(number, t.id);
+        if (fresh)
+            m_telegram->enqueue(number, t.url);
     }
 }
 
@@ -888,15 +729,113 @@ void PageStore::persistState()
     }
 }
 
-void PageStore::persistBook()
+void PageStore::persistFavs()
 {
-    QFile f(m_bookJsonFile);
+    QFile f(m_favsJsonFile);
     if (f.open(QIODevice::WriteOnly)) {
         QJsonObject o;
-        o["entries"] = m_entries;
+        o["favs"] = m_favs;
         f.write(QJsonDocument(o).toJson(QJsonDocument::Indented));
         f.close();
     }
-    // 条目集合已变：收藏页编号缓存作废，下次访问时重建
-    m_favNumsValid = false;
+}
+
+// 收藏索引写回：存在同名编号则更新（保留 created），否则追加。
+// 返回 true = 新收藏（触发 Telegram 推送）。
+bool PageStore::upsertFav(const QString &number, const XTweet &t)
+{
+    for (int i = 0; i < m_favs.size(); ++i) {
+        QJsonObject e = m_favs.at(i).toObject();
+        if (e["number"].toString() == number) {
+            e["tweet_id"] = t.id;
+            e["url"] = t.url;
+            e["feed_page"] = m_feedPage;
+            m_favs.replace(i, e);
+            persistFavs();
+            return false;
+        }
+    }
+    QJsonObject e;
+    e["number"] = number;
+    e["tweet_id"] = t.id;
+    e["url"] = t.url;
+    e["feed_page"] = m_feedPage;
+    e["created"] = QDateTime::currentDateTime()
+                       .toString("yyyy-MM-dd HH:mm:ss");
+    m_favs.append(e);
+    persistFavs();
+    return true;
+}
+
+// 用当前 feed/排版重渲染某收藏的"帖+笔迹"图（媒体到位后补图用）
+void PageStore::updateFavImage(const QString &number, const QString &tweetId)
+{
+    int ti = -1;
+    for (int i = 0; i < m_feed.size(); ++i) {
+        if (m_feed.at(i).id == tweetId) {
+            ti = i;
+            break;
+        }
+    }
+    if (ti < 0)
+        return;
+    // 收藏时所在页（笔迹只画在那页的块上）
+    int inkPage = -1;
+    for (int i = 0; i < m_favs.size(); ++i) {
+        const QJsonObject e = m_favs.at(i).toObject();
+        if (e["number"].toString() == number) {
+            inkPage = e["feed_page"].toInt(-1);
+            break;
+        }
+    }
+    QImage ink;
+    if (inkPage >= 0)
+        ink.load(m_bookDir + "/" + number + ".draw.png");
+    const QImage post = m_renderer->renderFavorite(m_feed, m_pages, ti,
+                                                   inkPage, ink);
+    if (!post.isNull())
+        post.save(m_bookDir + "/" + number + ".png", "PNG", 30);
+}
+
+// Telegram 推送成功：删除本地帖图（占空间大头）并移出索引。
+// 笔迹层 .draw.png 保留——翻页回来还要恢复笔迹，且体积很小。
+void PageStore::onFavSent(const QString &number)
+{
+    qInfo() << "fav sent, drop local image" << number;
+    QFile::remove(m_bookDir + "/" + number + ".png");
+    for (int i = m_favs.size() - 1; i >= 0; --i) {
+        const QJsonObject e = m_favs.at(i).toObject();
+        if (e["number"].toString() == number) {
+            m_favs.removeAt(i);
+            break;
+        }
+    }
+    persistFavs();
+}
+
+// 笔迹起始位置命中当前页的哪个帖子（m_feed 下标）。
+// 写到卡片外空白时取距离最近的块，保证总有归属。
+int PageStore::hitTweetIndex(int x, int y)
+{
+    remarkxSetCtx("hitTweetIndex");
+    if (m_pages.isEmpty() || m_feedPage >= m_pages.size())
+        return -1;
+    syncFeed();
+    const RenderPage &pg = m_pages.at(m_feedPage);
+    int best = -1;
+    qint64 bestDist = Q_INT64_C(1) << 62;
+    for (const RenderChunk &c : pg.chunks) {
+        if (c.tweetIndex < 0 || c.tweetIndex >= m_feed.size())
+            continue;
+        if (c.rect.contains(x, y))
+            return c.tweetIndex;
+        const int dx = qMax(0, qMax(c.rect.left() - x, x - c.rect.right() - 1));
+        const int dy = qMax(0, qMax(c.rect.top() - y, y - c.rect.bottom() - 1));
+        const qint64 d = qint64(dx) * dx + qint64(dy) * dy;
+        if (d < bestDist) {
+            bestDist = d;
+            best = c.tweetIndex;
+        }
+    }
+    return best;
 }

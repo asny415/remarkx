@@ -111,6 +111,32 @@ bool InkItem::loadDraw(const QString &path)
     return true;
 }
 
+bool InkItem::hasInkPixels() const
+{
+    for (int y = 0; y < m_img.height(); ++y) {
+        const QRgb *line = reinterpret_cast<const QRgb *>(m_img.constScanLine(y));
+        for (int x = 0; x < m_img.width(); ++x) {
+            if (qAlpha(line[x]) > 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+QPoint InkItem::inkStart() const
+{
+    // 起始位置取"最上、最左"的墨迹像素：首次落笔点（或加载笔迹后的首个墨点），
+    // 用于 PageStore 判断这笔是写给哪个帖子的。
+    for (int y = 0; y < m_img.height(); ++y) {
+        const QRgb *line = reinterpret_cast<const QRgb *>(m_img.constScanLine(y));
+        for (int x = 0; x < m_img.width(); ++x) {
+            if (qAlpha(line[x]) > 0)
+                return QPoint(x, y);
+        }
+    }
+    return QPoint(0, 0);
+}
+
 void InkItem::onPenDown(int x, int y, int pressure)
 {
     strokeDown(x, y, pressure, false);

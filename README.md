@@ -29,12 +29,13 @@ Qt 6.8 交叉编译的单一可执行文件 `xr`，运行于系统自带 epaper 
   原槽位贴图，失败保持"加载失败"占位；头像下载到位自动重绘
 - **图片全屏**：手指点按任意图片 → 全屏居中最大化显示，左右滑在
   该推文的多张图间切换，点按/顶部下滑关闭
-- **手势**：左右滑翻页、顶部下滑退出、底部上滑刷新（边缘手势任何时候可用）；
-  收藏页手指长按 = 删除当前收藏
+- **手势**：左右滑翻页、顶部下滑退出、底部上滑刷新（边缘手势任何时候可用）
 - **笔迹**：笔即书写，压感线宽；笔迹逐页保存（`.draw.png`），翻页自动保存恢复；
   笔点底部区域可点击 UI（合成鼠标事件）
-- **收藏**：带笔迹的页面连同合成位图存入 `book/`（`book.json` 索引），
-  支持断点续读与收藏浏览
+- **收藏**：写字即收藏——按笔迹起始位置锁定对应帖子，单独渲染"帖+笔迹"图
+  （帖子跨页/跨栏拆分时各块自上而下拼合，笔迹保持相对帖子的位置），连同原始
+  帖子链接存入 `book/`（`favs.json` 索引），**不在 UI 展示**；若安装脚本配置了
+  Telegram bot，则把图片连同原始帖子 id 作为说明推送到目标 chat
 - **电源键**：短按 = 屏显提示后挂起休眠（进度已存），再按唤醒回到原处；
   5 分钟无操作自动休眠
 - **容错**：无 Cookie/网络失败显示错误页，重试按钮可用；触屏 Y 轴经
@@ -70,6 +71,12 @@ cmake -B build && cmake --build build   # 在 SDK 环境中
 ./deploy/install-remarkable.sh <设备IP> \
     --proxy http://192.168.1.100:7890 \
     --browser brave        # 或 --cookie-file /path/cookies.json
+# 可选：笔迹收藏推送到 Telegram
+./deploy/install-remarkable.sh <设备IP> \
+    --proxy http://192.168.1.100:7890 \
+    --browser brave \
+    --telegram-bot 123456789:AAF... \
+    --telegram-chat 987654321   # 或 @频道名
 ```
 
 脚本会：交叉编译 `xr` + `hello-hotkey` → 从 PC 浏览器导入 X Cookie →
@@ -81,9 +88,19 @@ cmake -B build && cmake --build build   # 在 SDK 环境中
 ```json
 {
   "proxy": "http://192.168.1.100:7890",
-  "cookies": "/home/root/xreader/cookies.json"
+  "cookies": "/home/root/xreader/cookies.json",
+  "telegram_bot": "123456789:AAF...",
+  "telegram_chat": "987654321"
 }
 ```
+
+- `proxy` / `cookies`：X 直连所需（见安装脚本）
+- `telegram_bot` / `telegram_chat`（可选）：写字收藏后把"帖+笔迹"图推送到该
+  Telegram 聊天，图片说明为该帖的完整链接；不配置则只本地保存。发送全程后台，
+  直接走 HTTP POST（multipart）到 `api.telegram.org`，并复用 `proxy`（若已配置）；
+  待发消息先写入 `pending.json`（`book/` 同目录），发送成功才出队，失败按
+  指数退避自动重试，程序异常退出/重启后也会自动补发未完成的消息；**推送成功即
+  删除本地帖图以节约空间**（笔迹层 `.draw.png` 保留，供翻页恢复）
 
 ### 字体
 

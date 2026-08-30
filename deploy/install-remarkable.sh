@@ -5,12 +5,15 @@
 #
 # 用法：
 #   ./install-remarkable.sh <设备IP> [--proxy http://PC:7890] \
-#       [--cookie-file /path/cookies.json | --browser brave,chromium]
+#       [--cookie-file /path/cookies.json | --browser brave,chromium] \
+#       [--telegram-bot BOT_TOKEN] [--telegram-chat CHAT_ID]
 #
 #   设备IP      reMarkable 的局域网 IP（需已开启开发者模式/SSH）
 #   --proxy     X 直连用的代理（须设备能访问，如家里 PC 的 Clash/V2Ray）
 #   --cookie-file  直接提供 X Cookie JSON（{auth_token,ct0,...}）
 #   --browser      从 PC 浏览器自动提取（逗号分隔多个，任一成功即可）
+#   --telegram-bot Telegram Bot Token（可选：笔迹收藏推送）
+#   --telegram-chat 目标 chat id / 频道名（可选：与 bot 配套）
 #   都不给时：交互式询问代理，并尝试从浏览器提取 Cookie
 #
 # 认证：优先 SSH 密钥；否则若装了 sshpass 且设了 SSHPASS 环境变量用密码；
@@ -34,12 +37,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROXY=""
 COOKIE_FILE=""
 BROWSERS=""
+TG_BOT=""
+TG_CHAT=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --proxy) PROXY="${2:-}"; shift 2 ;;
         --cookie-file) COOKIE_FILE="${2:-}"; shift 2 ;;
         --browser) BROWSERS="${2:-}"; shift 2 ;;
+        --telegram-bot) TG_BOT="${2:-}"; shift 2 ;;
+        --telegram-chat) TG_CHAT="${2:-}"; shift 2 ;;
         *) echo "未知参数: $1"; exit 2 ;;
     esac
 done
@@ -179,7 +186,13 @@ fi
 {
     printf '{\n'
     printf '  "proxy": "%s",\n' "$PROXY"
-    printf '  "cookies": "/home/root/xreader/cookies.json"\n'
+    printf '  "cookies": "/home/root/xreader/cookies.json"'
+    if [ -n "$TG_BOT" ] || [ -n "$TG_CHAT" ]; then
+        printf ',\n  "telegram_bot": "%s",\n  "telegram_chat": "%s"\n' \
+            "${TG_BOT:-}" "${TG_CHAT:-}"
+    else
+        printf '\n'
+    fi
     printf '}\n'
 } > "${ROOT}/deploy/build/config.json"
 check_changed "${ROOT}/deploy/build/config.json" "/home/root/xreader/config.json"
@@ -218,3 +231,8 @@ pgrep -x xochitl >/dev/null && echo "xochitl 运行中（原声界面正常）"'
 echo
 echo "安装完成。长按顶部中央 3 秒进入阅读器。"
 echo "代理: ${PROXY:-<未配置>}；Cookie 已部署到 /home/root/xreader/cookies.json"
+if [ -n "$TG_BOT" ] && [ -n "$TG_CHAT" ]; then
+    echo "Telegram 收藏推送: 已配置"
+else
+    echo "Telegram 收藏推送: 未配置（如需可加 --telegram-bot / --telegram-chat）"
+fi

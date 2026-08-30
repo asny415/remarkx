@@ -18,6 +18,7 @@ class QNetworkReply;
 class QQuickWindow;
 class QTimer;
 class PageStore;
+class Telegram;
 
 // 为 QML 提供当前页基础位图（image://pages/base）
 class PageImageProvider : public QQuickImageProvider {
@@ -34,7 +35,8 @@ private:
     PageStore *m_store;
 };
 // 页面状态机：抓取（XClient）→ 排版渲染（Renderer）→ 基础页 + 图片槽位。
-// 保留 book/ 收藏（带笔迹页）、断点续读、休眠/退出逻辑。
+// 笔迹即收藏：写字后用笔迹起始位置锁定对应帖子，渲染"帖+笔迹"独立图，
+// 连同原始链接存入 book/（favs.json 索引），可推送 Telegram；不在 UI 展示。
 class PageStore : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString currentFile READ currentFile NOTIFY currentFileChanged)
@@ -43,7 +45,6 @@ class PageStore : public QObject {
     Q_PROPERTY(int totalPages READ totalPages NOTIFY stateChanged)
     Q_PROPERTY(int pageKey READ pageKey NOTIFY stateChanged)
     Q_PROPERTY(bool loading READ loading NOTIFY stateChanged)
-    Q_PROPERTY(bool favMode READ favMode NOTIFY stateChanged)
     Q_PROPERTY(QString status READ status NOTIFY stateChanged)
     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
     Q_PROPERTY(QString bookLabel READ bookLabel NOTIFY stateChanged)
@@ -61,7 +62,6 @@ public:
     int totalPages() const { return m_totalPages; }
     int pageKey() const { return m_pageKey; }
     bool loading() const { return m_loading; }
-    bool favMode() const { return m_mode == FavMode; }
     QString status() const { return m_status; }
     QString error() const { return m_error; }
     QString bookLabel() const { return m_bookLabel; }
@@ -77,8 +77,6 @@ public slots:
     Q_INVOKABLE void suspendNow();
     Q_INVOKABLE void menuExit(int code);
     Q_INVOKABLE void setCalib(const QString &file);
-    // 收藏页长按删除当前页（笔迹+缓存+索引一并移除）
-    Q_INVOKABLE void deleteCurrentFav();
     // 页面展示后请求一次全屏强制刷新，清除墨水屏残影
     Q_INVOKABLE void requestFullRefresh();
     // 手指点按命中图片槽位 → 返回槽位索引（-1 = 未命中）
@@ -99,11 +97,8 @@ signals:
     void imageSlotsChanged();
 
 private:
-    enum Mode { FeedMode, FavMode };
-
     void goPage(int n);
     void maybePrefetchOlder();
-    void loadLocal(const QString &number);
     void rebuildPages(bool resetPageNumbers);
     void syncFeed();
     void renderCurrent(bool force = false);
@@ -115,19 +110,22 @@ private:
     void onMediaReady(const QString &tweetId);
     void saveInkNow();
     void persistState();
-    void persistBook();
+    void persistFavs();
+    // 更新或追加收藏索引；返回 true = 新收藏（触发 Telegram 推送）
+    bool upsertFav(const QString &number, const XTweet &t);
+    void updateFavImage(const QString &number, const QString &tweetId);
+    void onFavSent(const QString &number);
     void setStatus(const QString &s);
     void updateLabel();
     void doFullRefresh();
     void forceEpdFullRefresh();
-    QList<QString> favNumbers() const;
-    int favCount() const;
-    void refreshFavNums() const;
-    void enterFav(int index);
+    // 笔迹起始位置命中当前页的哪个帖子（返回 m_feed 下标；未命中取最近块）
+    int hitTweetIndex(int x, int y);
     void cleanupOnStartup();
 
     XClient *m_client = nullptr;
     Renderer *m_renderer = nullptr;
+    Telegram *m_telegram = nullptr;
     QQuickImageProvider *m_provider = nullptr;
 
     QVector<XTweet> m_feed;
@@ -135,31 +133,27 @@ private:
     QImage m_currentBase;
     QVariantList m_imageSlots;
     QSet<QString> m_avatarWanted;     // 正在等头像下载的推文
-    QHash<int, QString> m_pageNumbers; // feedPage -> 已分配收藏页编号
+    QHash<int, QString> m_pageNumbers; // feedPage -> 已分配笔迹编号
     // 已渲染页面位图 LRU 缓存：翻页回看直接复用，不再每次重排版渲染
     QHash<int, QImage> m_pageCache;
     QVector<int> m_pageCacheOrder;    // 访问顺序（末尾=最近）
     quint64 m_feedRev = ~0ull;        // 上次同步的 feed 版本（~0 强制首次拷贝）
-    mutable QList<QString> m_favNums;      // 收藏页编号缓存（升序）
-    mutable bool m_favNumsValid = false;
 
     QString m_baseDir;
     QString m_bookDir;
     QString m_stateFile;
-    QString m_bookJsonFile;
+    QString m_favsJsonFile;
     QString m_calibFile;
     InkItem *m_ink = nullptr;
     QQuickWindow *m_window = nullptr;
     QMetaObject::Connection m_refreshConn;
     bool m_refreshArmed = false;
 
-    QJsonArray m_entries;
+    QJsonArray m_favs;         // 收藏索引：{number,tweet_id,url,feed_page,created}
     QString m_date;
     int m_seq = 0;
     int m_feedPage = 0;
     int m_totalPages = 1;
-    int m_sessionSeq = 0;
-    QString m_version;
     QString m_currentFile;
     QString m_currentNumber;
     bool m_loading = false;
@@ -170,8 +164,6 @@ private:
     bool m_prefetchOlder = false;      // 后台预抓更早内容（不阻塞翻页）
     bool m_lastPrefetchEmpty = false;  // 上次预抓无新内容（时间线已到头）
     bool m_extendErrorWas = false;   // 上次错误是否来自续抓（重试走续抓而非首页刷新）
-    Mode m_mode = FeedMode;
-    int m_favIndex = 0;
     int m_baseRev = 0;
     int m_pageKey = 0;
     QString m_lastDisplayKey;

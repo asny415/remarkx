@@ -115,17 +115,6 @@ Window {
         anchors.fill: parent
         property point pressPt
         property bool armed: false
-        Timer {
-            id: longPressTimer
-            interval: 1200
-            onTriggered: {
-                // 收藏页手指长按 → 删除当前页（仅 FavMode 生效）
-                if (pageStore.favMode) {
-                    pageStore.deleteCurrentFav()
-                    armed = false
-                }
-            }
-        }
         onPressed: (mouse) => {
             idleTimer.restart()
             // 手写笔触摸不算手势
@@ -133,18 +122,8 @@ Window {
                 return
             armed = true
             pressPt = Qt.point(mouse.x, mouse.y)
-            longPressTimer.restart()
-        }
-        onPositionChanged: (mouse) => {
-            if (!armed)
-                return
-            // 手指明显移动则取消长按
-            if (Math.abs(mouse.x - pressPt.x) > 20
-                    || Math.abs(mouse.y - pressPt.y) > 20)
-                longPressTimer.stop()
         }
         onReleased: (mouse) => {
-            longPressTimer.stop()
             idleTimer.restart()
             if (!armed)
                 return

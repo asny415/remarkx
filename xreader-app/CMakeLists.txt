@@ -13,7 +13,8 @@ qt_add_executable(xreader
     inkitem.h inkitem.cpp
     pagestore.h pagestore.cpp
     xclient.h xclient.cpp
-    renderer.h renderer.cpp)
+    renderer.h renderer.cpp
+    telegram.h telegram.cpp)
 
 set_target_properties(xreader PROPERTIES OUTPUT_NAME "xr")
 

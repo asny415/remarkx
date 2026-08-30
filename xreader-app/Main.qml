@@ -55,6 +55,28 @@ Window {
                     cache: false
                     visible: modelData.ready
                 }
+                // 视频封面：中心圆形播放按钮（仅用于辨识视频，实际不支持播放）
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 76
+                    height: 76
+                    visible: modelData.video && modelData.ready
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        ctx.fillStyle = "rgba(0, 0, 0, 0.55)"
+                        ctx.beginPath()
+                        ctx.arc(width / 2, height / 2, width / 2 - 2, 0, Math.PI * 2)
+                        ctx.fill()
+                        ctx.fillStyle = "#ffffff"
+                        ctx.beginPath()
+                        ctx.moveTo(width / 2 - 13, height / 2 - 22)
+                        ctx.lineTo(width / 2 - 13, height / 2 + 22)
+                        ctx.lineTo(width / 2 + 25, height / 2)
+                        ctx.closePath()
+                        ctx.fill()
+                    }
+                }
                 Text {
                     anchors.centerIn: parent
                     text: modelData.ready ? "" : (modelData.failed ? "加载失败" : "图片加载中")

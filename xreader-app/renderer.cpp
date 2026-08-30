@@ -1112,34 +1112,184 @@ QImage Renderer::renderFavorite(const QVector<XTweet> &feed,
                                 const QImage &inkPage)
 {
     remarkxSetCtx("render:renderFavorite");
+    if (tweetIndex < 0 || tweetIndex >= feed.size())
+        return {};
+
+    // 帖子在整本 feed 里的各个拆分块（跨页/跨栏），按阅读顺序收集；
+    // firstAtom 记录该块第一个 op 对应的 atom 下标（各块的 ops 拼接
+    // 就是 buildAtoms 的结果，逐块累积）。
     struct Loc {
         int page;
-        QRect rect;
+        int chunk;
+        int firstAtom;
     };
     QVector<Loc> locs;
+    int atomCount = 0;
     for (int pi = 0; pi < pages.size(); ++pi) {
-        for (const RenderChunk &c : pages.at(pi).chunks) {
+        const RenderPage &pg = pages.at(pi);
+        for (int ci = 0; ci < pg.chunks.size(); ++ci) {
+            const RenderChunk &c = pg.chunks.at(ci);
             if (c.tweetIndex != tweetIndex || c.rect.isEmpty())
                 continue;
-            locs.append({pi, c.rect});
+            locs.append({pi, ci, atomCount});
+            atomCount += c.ops.size();
         }
     }
     if (locs.isEmpty())
         return {};
 
-    const int gap = 24;
-    int totalH = gap;
-    // 帖子各块的水平占位：裁掉无内容的半版空白，只保留帖子实际宽度
-    int minX = W, maxX = 0;
-    for (const Loc &l : locs) {
-        totalH += l.rect.height() + gap;
-        minX = qMin(minX, l.rect.x());
-        maxX = qMax(maxX, l.rect.x() + l.rect.width());
+    // 收藏图永远只画一张卡片：把帖子的原子在单栏里连续排成一块
+    // （与分页同一套 atom.h，只是不再拆栏/拆页）。页面里跨栏/跨页的
+    // 拆分块此时按阅读顺序自然首尾相接成一体，不再各自带边框。
+    const QVector<Atom> atoms = buildAtoms(feed, tweetIndex);
+    if (atoms.isEmpty())
+        return {};
+    if (atomCount != atoms.size()) {
+        // 防御：feed 与排版不一致（正常流程不可达），不渲染以免错位
+        qWarning() << "renderFavorite: atom count mismatch" << atomCount
+                   << atoms.size();
+        return {};
     }
-    const int edge = 12;   // 左右留一点边，避免卡片边框贴着图片边缘
-    minX = qMax(0, minX - edge);
-    maxX = qMin(W, maxX + edge);
-    const int outW = qMax(1, maxX - minX);
+
+    const int edge = 12;     // 卡片左右留边（边框不贴图片边缘）
+    const int topGap = 24;   // 顶部/底部留白
+    const int bottomGap = 24;
+    const int cardX = edge;
+    const int cardW = COL_W;
+
+    // 单栏连续排版：记录每个 atom 在收藏图里的 y，同时生成 ops 与图片槽位
+    QVector<int> favY;
+    favY.reserve(atoms.size());
+    RenderChunk chunk;
+    chunk.rect = QRect(cardX, topGap, cardW, 0);
+    chunk.isCont = false;
+    chunk.hasCont = false;
+    chunk.tweetIndex = tweetIndex;
+    RenderPage favPage;
+    int cy = topGap + PAD_TOP;
+    for (int ai = 0; ai < atoms.size(); ++ai) {
+        const Atom &a = atoms.at(ai);
+        Op op;
+        op.kind = a.kind;
+        switch (a.kind) {
+        case Op::Head:
+            op.y = cy;
+            cy += HEAD_H;
+            break;
+        case Op::FloatCard: {
+            op.y = cy;
+            cy += a.h;
+            const int y0 = op.y + HEAD_H + 8;
+            const int imgX = cardX + PAD + TEXT_W - a.dw;
+            ImageSlot s;
+            s.x = imgX;
+            s.y = y0;
+            s.w = a.dw;
+            s.h = a.dh;
+            s.tweetIndex = a.tweetIndex;
+            s.isQuoted = false;
+            s.mediaIndex = a.mediaIndex;
+            s.video = a.video;
+            s.nMedia = a.nMedia;
+            favPage.images.append(s);
+            op.slotIndex = favPage.images.size() - 1;
+            op.imgW = a.dw;
+            op.imgH = a.dh;
+            op.floatLines = a.floatLines;
+            op.belowLines = a.belowLines;
+            op.btnLabel = a.btnLabel;
+            op.statsLeft = a.statsLeft;
+            op.statsRight = a.statsRight;
+            break;
+        }
+        case Op::QFloatCard: {
+            op.y = cy;
+            cy += a.h;
+            const int commentH = a.commentLines.size() * TEXT_LH;
+            const int imgY = op.y + HEAD_H + commentH + QHEAD_H + 8;
+            const int imgX = cardX + PAD + TEXT_W - a.dw;
+            ImageSlot s;
+            s.x = imgX;
+            s.y = imgY;
+            s.w = a.dw;
+            s.h = a.dh;
+            s.tweetIndex = a.tweetIndex;
+            s.isQuoted = true;
+            s.mediaIndex = a.mediaIndex;
+            s.video = a.video;
+            s.nMedia = a.nMedia;
+            favPage.images.append(s);
+            op.slotIndex = favPage.images.size() - 1;
+            op.imgW = a.dw;
+            op.imgH = a.dh;
+            op.commentLines = a.commentLines;
+            op.qname = a.qname;
+            op.qhandle = a.qhandle;
+            op.floatLines = a.floatLines;
+            op.belowLines = a.belowLines;
+            op.btnLabel = a.btnLabel;
+            op.statsLeft = a.statsLeft;
+            op.statsRight = a.statsRight;
+            break;
+        }
+        case Op::Line:
+        case Op::QLine:
+            op.y = cy;
+            cy += a.h;
+            op.text = a.text;
+            op.btnSuffix = a.btnSuffix;
+            break;
+        case Op::FullText:
+            op.y = cy;
+            cy += a.h;
+            op.text = a.text;
+            break;
+        case Op::QHead:
+            op.y = cy;
+            cy += a.h;
+            op.qname = a.qname;
+            op.qhandle = a.qhandle;
+            break;
+        case Op::Img:
+        case Op::QImg: {
+            op.y = cy;
+            cy += a.h;
+            const int tw = TEXT_W - a.ind;
+            const int ix = cardX + PAD + a.ind + (tw - a.dw) / 2;
+            ImageSlot s;
+            s.x = ix;
+            s.y = op.y;
+            s.w = a.dw;
+            s.h = a.dh;
+            s.tweetIndex = a.tweetIndex;
+            s.isQuoted = a.isQuoted;
+            s.mediaIndex = a.mediaIndex;
+            s.video = a.video;
+            s.nMedia = a.nMedia;
+            favPage.images.append(s);
+            op.slotIndex = favPage.images.size() - 1;
+            break;
+        }
+        case Op::Stats:
+            op.y = cy;
+            cy += a.h;
+            op.statsLeft = a.statsLeft;
+            op.statsRight = a.statsRight;
+            break;
+        }
+        favY.append(op.y);
+        chunk.ops.append(op);
+    }
+    // 卡内底部留白（与分页排版同一规则）
+    const int lastKind =
+        (atoms.last().kind == Op::FloatCard || atoms.last().kind == Op::QFloatCard)
+            ? Op::Stats
+            : atoms.last().kind;
+    cy += (lastKind == Op::Stats) ? CARD_GAP : (PAD_BOTTOM + CARD_GAP);
+    chunk.rect.setHeight(cy - chunk.rect.y());
+
+    const int outW = cardW + 2 * edge;
+    const int totalH = cy + bottomGap;
 
     QImage out(outW, totalH, QImage::Format_RGB32);
     out.fill(BG);
@@ -1147,27 +1297,28 @@ QImage Renderer::renderFavorite(const QVector<XTweet> &feed,
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setRenderHint(QPainter::TextAntialiasing, true);
 
-    // 同一页多个块只渲染一次（收藏图跨页时会重排渲染多页）
-    QHash<int, QImage> pageCache;
-    int y = gap;
-    for (int i = 0; i < locs.size(); ++i) {
-        const Loc &l = locs.at(i);
-        auto it = pageCache.constFind(l.page);
-        if (it == pageCache.constEnd())
-            it = pageCache.insert(l.page,
-                                  renderPage(feed, pages, l.page, true));
-        const QImage &pg = it.value();
-        // 块与笔迹整体平移到裁剪后的左边界（相对帖子的位置不变）
-        p.drawImage(QPoint(l.rect.x() - minX, y), pg, l.rect);
-        if (l.page == inkPageIndex && !inkPage.isNull())
-            p.drawImage(QPoint(l.rect.x() - minX, y), inkPage, l.rect);
-        if (i + 1 < locs.size()) {
-            // 拆分块之间画分隔线
-            p.setPen(QPen(CARD_BORDER, 2));
-            p.drawLine(0, y + l.rect.height() + gap / 2, outW,
-                       y + l.rect.height() + gap / 2);
-        }
-        y += l.rect.height() + gap;
+    drawCard(p, feed, chunk, favPage, true);
+
+    // 笔迹叠加：笔迹画在页面原块的位置上；每块用"该块内容在收藏图里
+    // 的起始 y − 页面上该块内容的起始 y"做整体平移（块内各 op 相对间距
+    // 在页面与收藏图里完全相同，平移后整块笔迹与单栏内容逐行对应）。
+    // 这样无论是左栏块还是右栏块的笔迹，都能精确落到重新拼成的单卡上。
+    for (const Loc &l : locs) {
+        if (l.page != inkPageIndex || inkPage.isNull())
+            continue;
+        const RenderChunk &c = pages.at(l.page).chunks.at(l.chunk);
+        if (c.ops.isEmpty())
+            continue;
+        const int firstOpY = c.ops.first().y;
+        const int lastAtom = l.firstAtom + c.ops.size() - 1;
+        if (lastAtom < 0 || lastAtom >= atoms.size())
+            continue;
+        const int lastBottom = c.ops.last().y + atoms.at(lastAtom).h;
+        if (lastBottom <= firstOpY)
+            continue;
+        const QRect src(c.rect.x(), firstOpY, c.rect.width(),
+                        lastBottom - firstOpY);
+        p.drawImage(QPoint(cardX, favY.at(l.firstAtom)), inkPage, src);
     }
     p.end();
     return out;

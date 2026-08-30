@@ -88,10 +88,11 @@ public:
                       const QVector<RenderPage> &pages, int pageIndex,
                       bool withPhotos);
 
-    // 渲染某条推文的独立收藏图：把该帖在整本 feed 排版中的各个拆分块
-    // （跨页/跨栏）按阅读顺序自上而下拼成一张图，宽度裁剪到帖子实际
-    // 占位（去掉无内容的半版空白）；inkPage 页上的笔迹 inkPage 会按
-    // 块矩形原位叠加（其他页的拆分块无笔迹）。无块时返回空图。
+    // 渲染某条推文的独立收藏图：永远只画一张单栏卡片——把该帖在整本
+    // feed 排版中的各个拆分块（跨页/跨栏）按阅读顺序重新连续排版成
+    // 一体（不再各自带边框，也不左右拼两栏）；inkPage 页上的笔迹按
+    // 各块"页面位置 → 收藏图位置"的偏移精确叠加，左右两栏写下的笔迹
+    // 都能对应到单卡上的正确内容（其他页的拆分块无笔迹）。无块时返回空图。
     QImage renderFavorite(const QVector<XTweet> &feed,
                           const QVector<RenderPage> &pages, int tweetIndex,
                           int inkPageIndex, const QImage &inkPage);

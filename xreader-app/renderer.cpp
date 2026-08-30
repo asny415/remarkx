@@ -751,6 +751,10 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
         chunkWasSplit = false;
         int lastKind = Op::Head;
         int ai = 0;
+        // 当前帖排版起点快照：放不下需整体后移时，据此撤销本次已排的内容
+        const int tweetY0 = y;
+        const int tweetImgs0 = pages[p].images.size();
+        bool tweetMoved = false;
 
         auto placeAtom = [&](Atom &a, int pti) -> bool {
             const int extra = (chunkIdx >= 0) ? 0 : openContNeeded();
@@ -956,10 +960,8 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             return true;
         };
 
-        // 栏底补位：当前帖在剩余高度内放不下（多为图片/竖版图卡）时，若空白较大，
-        // 把后面若干条纯文本帖整卡提前填入空白（能放几条放几条，尽量吃满空白）；
-        // 当前帖其余部分照常续排下一栏。不回退当前帖已排的头部/文本（否则把它
-        // 整体搬去下一栏会挤压下一栏，可能在那里留下更大的新空白）。
+        // 栏底补位：一个帖在剩余高度内放不下时，若空白较大，把后面若干条纯文本帖
+        // 整卡提前填入空白（能放几条放几条，尽量吃满空白）。
         auto tryFillGap = [&](int curTi) -> bool {
             // 只在该帖真正留下的可见空白较大时才补位（文本截断的小缝不值得调序）。
             // 不做"补位卡要占空白多少比例"的限制：空白越大越该补，短文本帖也能填。
@@ -1024,10 +1026,43 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             return placedAny;
         };
 
+        // 当前帖能否整帖放进一栏（放不下需整体后移时，先确认后移后放得下）
+        auto tweetFitsFresh = [&]() -> bool {
+            int need = PAD_TOP;
+            for (const Atom &a : atoms)
+                need += a.h;
+            const int lk = (atoms.last().kind == Op::Stats
+                            || atoms.last().kind == Op::FloatCard
+                            || atoms.last().kind == Op::QFloatCard)
+                               ? Op::Stats : atoms.last().kind;
+            need += (lk == Op::Stats) ? CARD_GAP : (PAD_BOTTOM + CARD_GAP);
+            return need <= BOTTOM_Y - TOP_Y;
+        };
+
         while (ai < atoms.size()) {
             if (!placeAtom(atoms[ai], ti)) {
+                // 一个帖已排了部分内容、剩余放不下时：
+                // · 整帖能放进一栏 → 撤销已排、把整帖整体后移到下一栏，空白由
+                //   后续纯文本帖提前补位（绝不把别的帖插进同一个帖的两段之间）；
+                // · 帖子本身超出一栏（必须续排）→ 拆分处的空白不补位，
+                //   同样避免别的帖出现在该帖中间。
+                if (ai > 0 && !tweetMoved && tweetFitsFresh()) {
+                    if (chunkIdx >= 0) {
+                        pages[p].chunks.removeLast();
+                        chunkIdx = -1;
+                    }
+                    pages[p].images.resize(tweetImgs0);
+                    y = tweetY0;
+                    chunkWasSplit = false;
+                    tweetMoved = true;
+                    tryFillGap(ti);
+                    jump();
+                    ai = 0;
+                    continue;
+                }
                 close();
-                tryFillGap(ti);
+                if (ai == 0)
+                    tryFillGap(ti);
                 jump();
             } else {
                 ++ai;

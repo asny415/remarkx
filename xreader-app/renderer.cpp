@@ -11,6 +11,7 @@
 #include <QPainterPath>
 #include <QPolygonF>
 #include <QRegularExpression>
+#include <QSet>
 #include <QTimeZone>
 
 // ---- 版面参数（原 relay/render.py 一致） ----
@@ -48,6 +49,12 @@ static const int QUOTED_MAX_LINES = 4;
 // 窄图卡片（FloatCard）：图片与文字的间距、总高上限（超限回退普通布局）
 static const int FLOAT_GAP = 14;
 static const int FLOAT_MAX_H = 1600;
+
+// 栏底补位：图片卡在剩余高度内放不下时，若空白较大，把后面某个纯文本帖整卡
+// 提前填入空白，避免大片留白（图片仍不截断、整体下移）。
+static const int FILL_MIN_H = 240;    // 空白高度达到该值才考虑补位
+static const int FILL_MIN_CARD = 200; // 补位卡至少要有这个高度（避免小卡填大洞）
+static const int FILL_SCAN = 6;       // 最多向前扫描这么多条找纯文本帖
 
 // 有界 LRU 缓存：插入并把最旧的一条淘汰掉。整清缓存会让翻页回看时
 // 头像/图片重新从磁盘解码缩放，是"省内存伤翻页"的过度优化。
@@ -721,7 +728,12 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
         ensurePage();
     };
 
+    // 已被补位提前排掉的帖子（主循环跳过，避免重复排版）
+    QSet<int> consumed;
+
     for (int ti = 0; ti < feed.size(); ++ti) {
+        if (consumed.contains(ti))
+            continue;
         const XTweet &t = feed.at(ti);
         bool hasMedia = false, hasQMedia = false;
         for (const XMedia &m : t.media)
@@ -741,8 +753,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
         int lastKind = Op::Head;
         int ai = 0;
 
-        auto placeAtom = [&]() -> bool {
-            Atom &a = atoms[ai];
+        auto placeAtom = [&](Atom &a, int pti) -> bool {
             const int extra = (chunkIdx >= 0) ? 0 : openContNeeded();
             if (freeSpace() < a.h + extra)
                 return false;
@@ -750,7 +761,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 const bool cont = chunkWasSplit
                                   && (a.kind == Op::Line || a.kind == Op::QLine
                                       || a.kind == Op::FullText);
-                openChunk(cont, ti);
+                openChunk(cont, pti);
             }
             RenderChunk &ch = pages[p].chunks[chunkIdx];
             Op op;
@@ -803,7 +814,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     btn.rect = QRect(bx, btnY,
                                      int(textWidth(font(26, true), a.btnLabel)),
                                      TEXT_LH);
-                    btn.tweetIndex = ti;
+                    btn.tweetIndex = pti;
                     pages[p].buttons.append(btn);
                 }
                 break;
@@ -856,7 +867,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     btn.rect = QRect(bx, btnY,
                                      int(textWidth(font(26, true), a.btnLabel)),
                                      TEXT_LH_Q);
-                    btn.tweetIndex = ti;
+                    btn.tweetIndex = pti;
                     pages[p].buttons.append(btn);
                 }
                 break;
@@ -876,7 +887,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     btn.rect = QRect(bx, op.y,
                                      int(textWidth(font(26, true), a.btnSuffix)),
                                      a.h);
-                    btn.tweetIndex = ti;
+                    btn.tweetIndex = pti;
                     pages[p].buttons.append(btn);
                 }
                 break;
@@ -889,7 +900,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     btn.rect = QRect(colX(col) + PAD, op.y,
                                      int(textWidth(font(26, true), a.text)),
                                      a.h);
-                    btn.tweetIndex = ti;
+                    btn.tweetIndex = pti;
                     pages[p].buttons.append(btn);
                 }
                 break;
@@ -927,13 +938,79 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             lastKind = (a.kind == Op::FloatCard || a.kind == Op::QFloatCard)
                            ? Op::Stats
                            : a.kind;
-            ++ai;
             return true;
         };
 
+        // 栏底补位：当前帖在剩余高度内放不下（多为图片卡）时，若空白较大，
+        // 把后面某个纯文本帖整卡提前填入空白；当前帖其余部分照常续排下一栏。
+        // 不回退当前帖已排的头部/文本（否则把它整体搬去下一栏会挤压下一栏，
+        // 可能在那里留下更大的新空白）。
+        auto tryFillGap = [&](int curTi) -> bool {
+            // 只在该帖真正留下的可见空白较大时才补位（文本截断的小缝不值得调序）
+            if (freeSpace() < FILL_MIN_H)
+                return false;
+            const int gap = freeSpace();
+            const int minNeed = qMax(FILL_MIN_CARD, gap * 3 / 5);
+            for (int fi = curTi + 1; fi < feed.size() && fi - curTi <= FILL_SCAN;
+                 ++fi) {
+                if (consumed.contains(fi))
+                    continue;
+                const XTweet &ft = feed.at(fi);
+                bool hasMedia = false, hasQMedia = false;
+                for (const XMedia &m : ft.media)
+                    if (!m.url.isEmpty()) { hasMedia = true; break; }
+                for (const XMedia &m : ft.quoted.media)
+                    if (!m.url.isEmpty()) { hasQMedia = true; break; }
+                const bool hasQuoted = !ft.quoted.authorName.isEmpty()
+                                       || !ft.quoted.text.trimmed().isEmpty()
+                                       || hasQMedia;
+                if (ft.text.trimmed().isEmpty() && ft.comment.trimmed().isEmpty()
+                        && !hasMedia && !hasQuoted && !hasQMedia)
+                    continue;
+                QVector<Atom> fats = buildAtoms(feed, fi);
+                // 只补纯文本/纯引用文本卡（可整卡放入，不涉及不可拆分的图片块）
+                bool splittable = true;
+                for (const Atom &a : fats) {
+                    if (a.kind == Op::Img || a.kind == Op::QImg
+                        || a.kind == Op::FloatCard || a.kind == Op::QFloatCard) {
+                        splittable = false;
+                        break;
+                    }
+                }
+                if (!splittable)
+                    continue;
+                const int pad = (fats.last().kind == Op::Stats)
+                                    ? CARD_GAP : (PAD_BOTTOM + CARD_GAP);
+                int need = PAD_TOP + pad;
+                for (const Atom &a : fats)
+                    need += a.h;
+                if (need < minNeed || need > gap)
+                    continue;
+
+                // 补位帖整卡放入空白（先验证过需要高度 ≤ 空白，不会再失败）。
+                // 保存/恢复 chunkWasSplit：补位卡是全新卡，但当前帖续排仍需它。
+                const bool savedSplit = chunkWasSplit;
+                chunkIdx = -1;
+                chunkWasSplit = false;
+                int fai = 0;
+                while (fai < fats.size()) {
+                    if (!placeAtom(fats[fai], fi))
+                        break;
+                }
+                if (chunkIdx >= 0 && y + pad <= BOTTOM_Y)
+                    grow(pad);
+                consumed.insert(fi);
+                chunkIdx = -1;
+                chunkWasSplit = savedSplit;
+                return true;
+            }
+            return false;
+        };
+
         while (ai < atoms.size()) {
-            if (!placeAtom()) {
+            if (!placeAtom(atoms[ai], ti)) {
                 close();
+                tryFillGap(ti);
                 jump();
             }
         }

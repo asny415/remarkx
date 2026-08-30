@@ -151,4 +151,7 @@ private:
     mutable QHash<QPair<int, bool>, QFont> m_fonts;
     mutable QHash<QString, QImage> m_avatarCache;
     mutable QHash<QString, QImage> m_photoCache;
+    // 有界缓存淘汰顺序（末尾=最近）：超限只淘汰最旧一条，不整清
+    mutable QList<QString> m_avatarOrder;
+    mutable QList<QString> m_photoOrder;
 };

@@ -504,6 +504,7 @@ void XClient::ingest(const QVector<XTweet> &batch, bool append)
         m_seen.insert(t.id);
         m_tweets.append(t);
     }
+    ++m_feedRev;
 }
 
 // 两个时间线按推文 id 去重后 1:1 交错合并，同一条只出现一次。
@@ -867,6 +868,7 @@ bool XClient::cacheHit(const QString &tweetId, const Job &job)
             const QString full = m_mediaDir + "/" + rel;
             if (QFile::exists(full) && QFileInfo(full).size() > 0) {
                 m_tweets[idx].avatar = rel;
+                ++m_feedRev;
                 return true;
             }
             return false;
@@ -889,6 +891,7 @@ bool XClient::cacheHit(const QString &tweetId, const Job &job)
                         && job.mediaIndex < m_tweets[idx].quoted.media.size()) {
                     m_tweets[idx].quoted.media[job.mediaIndex].path = m.path;
                 }
+                ++m_feedRev;
                 return true;
             }
         }
@@ -954,6 +957,7 @@ void XClient::saveMedia(const QString &tweetId, const Job &job,
             }
         }
     }
+    ++m_feedRev;
     if (!job.isAvatar)
         m_failedMedia.remove(mediaKey(tweetId,
                                       job.quotedMediaIndex >= 0

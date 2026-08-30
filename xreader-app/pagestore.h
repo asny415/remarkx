@@ -3,6 +3,7 @@
 #include <QHash>
 #include <QImage>
 #include <QJsonArray>
+#include <QList>
 #include <QObject>
 #include <QQuickImageProvider>
 #include <QSet>
@@ -121,6 +122,7 @@ private:
     void forceEpdFullRefresh();
     QList<QString> favNumbers() const;
     int favCount() const;
+    void refreshFavNums() const;
     void enterFav(int index);
     void cleanupOnStartup();
 
@@ -134,6 +136,12 @@ private:
     QVariantList m_imageSlots;
     QSet<QString> m_avatarWanted;     // 正在等头像下载的推文
     QHash<int, QString> m_pageNumbers; // feedPage -> 已分配收藏页编号
+    // 已渲染页面位图 LRU 缓存：翻页回看直接复用，不再每次重排版渲染
+    QHash<int, QImage> m_pageCache;
+    QVector<int> m_pageCacheOrder;    // 访问顺序（末尾=最近）
+    quint64 m_feedRev = ~0ull;        // 上次同步的 feed 版本（~0 强制首次拷贝）
+    mutable QList<QString> m_favNums;      // 收藏页编号缓存（升序）
+    mutable bool m_favNumsValid = false;
 
     QString m_baseDir;
     QString m_bookDir;

@@ -49,6 +49,18 @@ static const int QUOTED_MAX_LINES = 4;
 static const int FLOAT_GAP = 14;
 static const int FLOAT_MAX_H = 1600;
 
+// 有界 LRU 缓存：插入并把最旧的一条淘汰掉。整清缓存会让翻页回看时
+// 头像/图片重新从磁盘解码缩放，是"省内存伤翻页"的过度优化。
+static void lruInsert(QHash<QString, QImage> &cache, QList<QString> &order,
+                      const QString &key, const QImage &img, int cap)
+{
+    order.removeAll(key);
+    cache.insert(key, img);
+    order.append(key);
+    while (order.size() > cap)
+        cache.remove(order.takeFirst());
+}
+
 QString Renderer::langName(const QString &code)
 {
     static const QHash<QString, QString> m = {
@@ -760,8 +772,12 @@ QImage Renderer::avatar(const XTweet &t) const
         return {};
     const QString full = m_mediaDir + "/" + t.avatar;
     auto it = m_avatarCache.constFind(full);
-    if (it != m_avatarCache.constEnd())
+    if (it != m_avatarCache.constEnd()) {
+        // 命中即移到末尾（LRU）
+        m_avatarOrder.removeAll(full);
+        m_avatarOrder.append(full);
         return it.value();
+    }
     QImage src(full);
     if (src.isNull())
         return {};
@@ -786,10 +802,7 @@ QImage Renderer::avatar(const XTweet &t) const
         op.setCompositionMode(QPainter::CompositionMode_DestinationIn);
         op.drawImage(0, 0, mask);
     }
-    m_avatarCache.insert(full, out);
-    // 有界缓存：防长时间阅读导致内存无限增长
-    if (m_avatarCache.size() > 256)
-        m_avatarCache.clear();
+    lruInsert(m_avatarCache, m_avatarOrder, full, out, 512);
     return out;
 }
 
@@ -905,8 +918,13 @@ void Renderer::drawPhoto(QPainter &p, const XTweet &t, const ImageSlot &s,
     const QString full = m_mediaDir + "/" + m->path;
     const QString key = full + QLatin1Char('@') + QString::number(dw)
                         + QLatin1Char('x') + QString::number(dh);
-    QImage photo = m_photoCache.value(key);
-    if (photo.isNull()) {
+    auto it = m_photoCache.constFind(key);
+    QImage photo;
+    if (it != m_photoCache.constEnd()) {
+        photo = it.value();
+        m_photoOrder.removeAll(key);
+        m_photoOrder.append(key);
+    } else {
         QImage src(full);
         if (src.isNull()) {
             drawPlaceholder(p, ix, py, dw, dh);
@@ -915,10 +933,7 @@ void Renderer::drawPhoto(QPainter &p, const XTweet &t, const ImageSlot &s,
         photo = src.scaled(dw, dh, Qt::IgnoreAspectRatio,
                            Qt::FastTransformation)
                      .convertToFormat(QImage::Format_RGB32);
-        m_photoCache.insert(key, photo);
-        // 有界缓存：防长时间阅读导致内存无限增长
-        if (m_photoCache.size() > 96)
-            m_photoCache.clear();
+        lruInsert(m_photoCache, m_photoOrder, key, photo, 128);
     }
     p.drawImage(ix, py, photo);
     if (s.video) {

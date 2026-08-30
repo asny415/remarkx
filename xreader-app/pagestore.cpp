@@ -218,6 +218,12 @@ void PageStore::cleanupOnStartup()
 
 void PageStore::syncFeed()
 {
+    // 只在 feed 真正变更时重新快照，避免每次翻页都整体深拷贝
+    // （QVector 的隐式共享在媒体写回/续抓后失效，此处做"按需拷贝"）
+    const quint64 rev = m_client->feedRevision();
+    if (rev == m_feedRev)
+        return;
+    m_feedRev = rev;
     m_feed = m_client->feed();
 }
 
@@ -228,6 +234,9 @@ void PageStore::rebuildPages(bool resetPageNumbers)
     m_pages = m_renderer->paginate(m_feed);
     m_totalPages = qMax(1, m_pages.size());
     m_version = QStringLiteral("s%1").arg(++m_sessionSeq);
+    // feed/排版已变：已渲染位图全部作废（页码可能映射到不同内容）
+    m_pageCache.clear();
+    m_pageCacheOrder.clear();
     // 只有整批刷新（homeReady）才清收藏编号映射；续抓（extend）只是尾部追加，
     // 已展示页面不变，编号必须保留，否则同页反复收藏出重复页
     if (resetPageNumbers)
@@ -349,8 +358,10 @@ void PageStore::updateLabel()
                       .arg(m_totalPages);
 }
 
-// 收藏页 = 所有带笔迹(has_draw)的书页，按编号（时间）升序
-QList<QString> PageStore::favNumbers() const
+// 收藏页 = 所有带笔迹(has_draw)的书页，按编号（时间）升序。
+// 结果缓存：收藏夹翻页时 favNumbers/favCount 会被反复调用，每次全量
+// 重建+排序在收藏较多时明显拖慢翻页。
+void PageStore::refreshFavNums() const
 {
     QList<QString> out;
     for (int i = 0; i < m_entries.size(); ++i) {
@@ -359,7 +370,15 @@ QList<QString> PageStore::favNumbers() const
             out.append(e["number"].toString());
     }
     std::sort(out.begin(), out.end());
-    return out;
+    m_favNums = out;
+    m_favNumsValid = true;
+}
+
+QList<QString> PageStore::favNumbers() const
+{
+    if (!m_favNumsValid)
+        refreshFavNums();
+    return m_favNums;
 }
 
 int PageStore::favCount() const
@@ -601,8 +620,27 @@ void PageStore::renderCurrent(bool force)
         return;
     }
     syncFeed();
-    // 不缓存页面位图：翻页实时重建，节省内存（e-ink 渲染 ~100ms 可接受）
-    m_currentBase = m_renderer->renderPage(m_feed, m_pages, m_feedPage, false);
+    const int cur = m_feedPage;
+    // LRU 页面位图缓存：翻页回看直接复用位图，省掉整页 QPainter 重排
+    // 渲染（一次渲染 ~100ms，缓存小页集换来明显更快的翻页手感）。
+    // 头像/媒体到达时才以 force=true 重渲染当前页并更新缓存条目。
+    auto touch = [&](int key) {
+        m_pageCacheOrder.removeAll(key);
+        m_pageCacheOrder.append(key);
+    };
+    auto it = m_pageCache.constFind(cur);
+    if (!force && it != m_pageCache.constEnd()) {
+        m_currentBase = it.value();
+        touch(cur);
+    } else {
+        m_currentBase = m_renderer->renderPage(m_feed, m_pages, cur, false);
+        m_pageCache.insert(cur, m_currentBase);
+        touch(cur);
+        while (m_pageCache.size() > 6) {   // 6 页 ≈ 63MB，换翻页免重渲染
+            const int oldest = m_pageCacheOrder.takeFirst();
+            m_pageCache.remove(oldest);
+        }
+    }
     m_currentFile = QStringLiteral("image://pages/base?r=%1").arg(++m_baseRev);
     buildSlotList();
     requestSlotMedia();
@@ -628,8 +666,8 @@ void PageStore::buildSlotList()
         remarkxSetCtx(ctx);
         if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
             continue;
-        // 值拷贝而非引用：杜绝 t 指向被释放的 feed 缓冲区（use-after-free 防护）
-        const XTweet t = m_feed.at(s.tweetIndex);
+        // 只读遍历（无任何会改写 feed 的调用），用引用避免拷贝整个推文
+        const XTweet &t = m_feed.at(s.tweetIndex);
         const QVector<XMedia> *ml = s.isQuoted ? &t.quoted.media : &t.media;
         const XMedia *m = (s.mediaIndex < ml->size()) ? &(*ml).at(s.mediaIndex)
                                                       : nullptr;
@@ -666,17 +704,17 @@ void PageStore::requestSlotMedia()
     for (const ImageSlot &s : m_pages.at(m_feedPage).images) {
         if (s.tweetIndex < 0 || s.tweetIndex >= m_feed.size())
             continue;
-        // 值拷贝而非引用：ensureMediaFor 在媒体已缓存时会在调用栈内同步触发
-        // mediaReady→onMediaReady→syncFeed，重新赋值 m_feed 会释放共享缓冲区，
-        // 引用随即悬垂（use-after-free，同 buildSlotList 的防护）。id 也先快照
-        // 成局部值，确保调用前后都不触碰可能被释放的 feed 内存。
-        const XTweet t = m_feed.at(s.tweetIndex);
+        // 只快照用到的 id/avatar 两个字符串（而非整条推文）：ensureMediaFor
+        // 在媒体已缓存时会在调用栈内同步触发 mediaReady→onMediaReady→syncFeed，
+        // 重新赋值 m_feed 会释放共享缓冲区，其后不得再触碰 feed 内存。
+        const XTweet &t = m_feed.at(s.tweetIndex);
         if (seen.contains(t.id))
             continue;
         const QString tid = t.id;
+        const QString avatar = t.avatar;
         seen.insert(tid);
         m_client->ensureMediaFor(tid);
-        if (!t.avatar.isEmpty() && !t.avatar.startsWith("avatars/"))
+        if (!avatar.isEmpty() && !avatar.startsWith("avatars/"))
             m_avatarWanted.insert(tid);
     }
 }
@@ -859,4 +897,6 @@ void PageStore::persistBook()
         f.write(QJsonDocument(o).toJson(QJsonDocument::Indented));
         f.close();
     }
+    // 条目集合已变：收藏页编号缓存作废，下次访问时重建
+    m_favNumsValid = false;
 }

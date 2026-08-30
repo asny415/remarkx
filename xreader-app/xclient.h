@@ -83,6 +83,9 @@ public:
 
     const QVector<XTweet> &feed() const { return m_tweets; }
     int count() const { return m_tweets.size(); }
+    // feed 内容每变更一次（追加/重建/媒体路径写回）自增，供 PageStore
+    // 判断是否需要重新同步其快照，避免每次翻页都深拷贝整个 feed
+    quint64 feedRevision() const { return m_feedRev; }
     bool hasSession() const;
     bool fetching() const { return m_fetching; }
     QString lastError() const { return m_lastError; }
@@ -155,6 +158,7 @@ private:
     QString m_sessionError;
 
     QVector<XTweet> m_tweets;
+    quint64 m_feedRev = 0;
     QSet<QString> m_seen;
     QString m_cursor;            // For You 向后翻页游标
     QString m_cursorFollowing;   // Following 向后翻页游标

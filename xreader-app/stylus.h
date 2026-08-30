@@ -14,7 +14,9 @@ public:
     Q_PROPERTY(bool calibrated READ calibrated NOTIFY calibChanged)
     Q_PROPERTY(bool penActive READ penActive NOTIFY penActiveChanged)
     bool calibrated() const { return m_calibrated; }
-    // 手写笔是否处于使用中（笔按下，或刚合成过点击）。手势只在非 penActive 时生效。
+    // 手写笔是否处于使用中（笔尖在有效范围内，含悬停与按下，或刚离开后的一小段
+    // 保护窗口）。手势只在非 penActive 时生效——笔靠近屏幕（准备写/正在写）时
+    // 手掌误触屏幕不会触发任何手势。
     bool penActive() const { return m_penActive; }
 
     bool start();
@@ -40,6 +42,7 @@ private:
     void onData();
     void touchPoint(bool eraser);
     void synthesizeTap(int x, int y);
+    void onPenNear(bool near);
     void setPenActive(bool active);
 
     int m_fd = -1;
@@ -48,6 +51,7 @@ private:
     bool m_touching = false;
     bool m_penActive = false;
     bool m_eraser = false;
+    bool m_penNear = false;    // 笔尖在有效范围内（悬停/按下），未离开屏幕上方
     bool m_started = false;
     int m_lastX = 0, m_lastY = 0, m_lastP = 0;
     qreal m_a = 0, m_b = 0.0893, m_c = 0;

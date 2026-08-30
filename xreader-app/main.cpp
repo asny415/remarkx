@@ -16,6 +16,7 @@
 #include "pagestore.h"
 #include "powerkey.h"
 #include "stylus.h"
+#include "touchguard.h"
 #include "crashctx.h"
 
 // 全局崩溃上下文（供 pagestore/xclient/renderer 记录当前操作）
@@ -135,6 +136,11 @@ int main(int argc, char *argv[])
     stylus.start();
     stylus.loadCalib(baseDir + "/calib.json");
 
+    // 手掌误触过滤：写笔记时把接触面积明显偏大的手掌触摸整段吞掉
+    TouchGuard *touchGuard =
+        new TouchGuard([&stylus]() { return stylus.penActive(); });
+    app.installEventFilter(touchGuard);
+
     PowerKey powerKey;
     powerKey.start();
 
@@ -147,6 +153,7 @@ int main(int argc, char *argv[])
     engine.rootContext()->setContextProperty("powerKeyObj", &powerKey);
     engine.rootContext()->setContextProperty("pageStore", &pageStore);
     engine.rootContext()->setContextProperty("baseDir", baseDir);
+    engine.rootContext()->setContextProperty("touchGuard", touchGuard);
 
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreated, &engine,
                      [&](QObject *obj, const QUrl &url) {

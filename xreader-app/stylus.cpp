@@ -20,14 +20,17 @@ static const qreal TAP_MAX_TRAVEL = 24.0;
 
 Stylus::Stylus(QObject *parent) : QObject(parent)
 {
-    // 笔按下/抬起后的一段时间内保持 penActive：
-    // 手写时手掌可能碰到屏幕，这段时间内忽略手指手势；笔抬起后再延时
+    // 笔/橡皮在有效范围内（悬停或按下）及刚离开后的一段时间内保持 penActive：
+    // 手写时手掌可能碰到屏幕，这段时间内忽略手指手势。笔离开有效范围后再延时
     // 1s 清除，避免刚停笔时手掌误触翻页。合成点击的鼠标事件也在此窗口内。
     m_tapTimer = new QTimer(this);
     m_tapTimer->setSingleShot(true);
     m_tapTimer->setInterval(1000);
-    connect(m_tapTimer, &QTimer::timeout, this,
-            [this]() { setPenActive(false); });
+    connect(m_tapTimer, &QTimer::timeout, this, [this]() {
+        // 只有笔/橡皮都不在有效范围、也未按下时才清除
+        if (!m_penNear && !m_eraser && !m_touching)
+            setPenActive(false);
+    });
 }
 
 Stylus::~Stylus()
@@ -116,6 +119,20 @@ void Stylus::synthesizeTap(int x, int y)
     qInfo() << "TAP synthesized" << x << y;
 }
 
+// 笔/橡皮进入或离开有效范围。进入时立即保持 penActive（手带笔靠近屏幕、
+// 笔尖还没碰到屏幕就已算"在用"，手掌此时触屏不会误触）；离开时用定时器
+// 留一小段保护窗口。
+void Stylus::onPenNear(bool near)
+{
+    qInfo() << (near ? "pen near" : "pen far");
+    if (near) {
+        m_tapTimer->stop();
+        setPenActive(true);
+    } else if (!m_touching) {
+        m_tapTimer->start();
+    }
+}
+
 void Stylus::setPenActive(bool active)
 {
     if (m_penActive == active)
@@ -145,6 +162,10 @@ void Stylus::onData()
         if (ev.type == EV_KEY) {
             if (ev.code == BTN_TOOL_RUBBER) {
                 m_eraser = ev.value != 0;
+                onPenNear(m_eraser);
+            } else if (ev.code == BTN_TOOL_PEN) {
+                m_penNear = ev.value != 0;
+                onPenNear(m_penNear);
             } else if (ev.code == BTN_TOUCH) {
                 if (ev.value) {
                     m_touching = true;
@@ -160,13 +181,17 @@ void Stylus::onData()
                     if (!m_eraser && m_tapEnabled && m_calibrated
                         && dur < TAP_MAX_MS && m_travel < TAP_MAX_TRAVEL) {
                         synthesizeTap(int(m_pressPt.x()), int(m_pressPt.y()));
-                        // 1s 窗口内忽略手指手势，覆盖合成鼠标事件的处理
-                        m_tapTimer->start();
+                        // 笔抬起后若已离开有效范围，1s 窗口内忽略手指手势，
+                        // 覆盖合成鼠标事件的处理
+                        if (!m_penNear && !m_eraser)
+                            m_tapTimer->start();
                         emit penUp();
                         return;
                     }
-                    // 笔抬起后仍保留 penActive（1s 窗口），忽略手掌误触
-                    m_tapTimer->start();
+                    // 笔抬起后仍保留 penActive（1s 窗口，或笔仍在有效范围则更久），
+                    // 忽略手掌误触
+                    if (!m_penNear && !m_eraser)
+                        m_tapTimer->start();
                     if (m_eraser)
                         emit eraserUp();
                     else

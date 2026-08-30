@@ -8,6 +8,7 @@ qt_standard_project_setup(REQUIRES 6.5)
 qt_add_executable(xreader
     main.cpp
     stylus.h stylus.cpp
+    touchguard.h touchguard.cpp
     powerkey.h powerkey.cpp
     inkitem.h inkitem.cpp
     pagestore.h pagestore.cpp

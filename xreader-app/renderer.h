@@ -36,6 +36,7 @@ struct Op {
     int kind = Head;
     int y = 0;
     QString text;                 // Line/QLine/FullText 文本
+    QString btnSuffix;            // Line/QLine 行尾内联"显示全文"按钮（空=无）
     QString qname, qhandle;       // QHead
     int slotIndex = -1;           // Img/QImg/FloatCard → RenderPage::slots 下标
     QString statsLeft, statsRight; // Stats
@@ -103,6 +104,7 @@ private:
         int kind = Op::Head;
         int h = 0;
         QString text;
+        QString btnSuffix;   // Line/QLine 行尾内联"显示全文"按钮（空=无）
         QString qname, qhandle;
         QString statsLeft, statsRight;
         QStringList floatLines, belowLines;   // FloatCard/QFloatCard 用
@@ -123,6 +125,13 @@ private:
 
     // 引用/转推帖竖版图卡片：头部 + 评论 + 引用作者 + 引用右上图环绕 + 统计。
     Atom makeQFloatCard(const XTweet &t, const Atom &img);
+
+    // 把"显示全文"按钮内联到一行文本末尾：放不下则截断行文本并加"…"。
+    void attachInlineBtn(QString *line, const QFont &lineFont,
+                         const QString &btn, qreal lineMaxWidth) const;
+    // 在 (x, y) 处绘制行尾内联"显示全文"按钮（蓝色 + 下划线）。
+    void drawInlineBtn(QPainter &p, int x, int y, const QString &btn,
+                       int lineH) const;
 
     QFont font(int pixel, bool bold = false) const;
     qreal textWidth(const QFont &f, const QString &text) const;

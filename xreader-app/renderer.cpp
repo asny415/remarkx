@@ -352,7 +352,7 @@ Renderer::Atom Renderer::makeFloatCard(const XTweet &t, const Atom &img)
     QList<int> offs;
     const QStringList allNarrow =
         wrapText(font(30), text, floatTextW, 100000, nullptr, &offs);
-    const QStringList beside = allNarrow.mid(0, K);
+    QStringList beside = allNarrow.mid(0, K);
     QStringList below;
     if (allNarrow.size() > K) {
         QString rest = text.mid(offs.value(K - 1));
@@ -371,16 +371,21 @@ Renderer::Atom Renderer::makeFloatCard(const XTweet &t, const Atom &img)
         statsRight = st.mid(sep + 1);
     }
 
-    // 卡片内"显示全文"按钮：长文（is_expandable）时提供完整内容
+    // 卡片内"显示全文"按钮：长文（is_expandable）时内联到最后一个文本行末尾
     const QString btnLabel = t.isExpandable ? QStringLiteral("显示全文")
                                             : QString();
+    if (!btnLabel.isEmpty()) {
+        if (!below.isEmpty())
+            attachInlineBtn(&below.last(), font(30), btnLabel, TEXT_W);
+        else if (!beside.isEmpty())
+            attachInlineBtn(&beside.last(), font(30), btnLabel, floatTextW);
+    }
 
     const int besideH = beside.size() * TEXT_LH;
     const int belowH = below.size() * TEXT_LH;
-    const int btnH = btnLabel.isEmpty() ? 0 : TEXT_LH;
     const int statsH = st.isEmpty() ? 0 : (STATS_GAP_TOP + STATS_H);
     const int contentH = qMax(dh, besideH) + belowH + 8;
-    const int totalH = HEAD_H + 8 + contentH + btnH + statsH;
+    const int totalH = HEAD_H + 8 + contentH + statsH;
     if (totalH > FLOAT_MAX_H)
         return bad;   // 太高 → 回退普通布局（可跨页拆分）
 
@@ -421,7 +426,7 @@ Renderer::Atom Renderer::makeQFloatCard(const XTweet &t, const Atom &img)
     QList<int> offs;
     const QStringList allNarrow =
         wrapText(font(26), qtext, floatTextW, 100000, nullptr, &offs);
-    const QStringList beside = allNarrow.mid(0, K);
+    QStringList beside = allNarrow.mid(0, K);
     QStringList below;
     if (allNarrow.size() > K) {
         QString rest = qtext.mid(offs.value(K - 1));
@@ -450,13 +455,18 @@ Renderer::Atom Renderer::makeQFloatCard(const XTweet &t, const Atom &img)
     const QString btnLabel = (t.isExpandable || t.quoted.isExpandable)
                                  ? QStringLiteral("显示全文")
                                  : QString();
+    if (!btnLabel.isEmpty()) {
+        if (!below.isEmpty())
+            attachInlineBtn(&below.last(), font(26), btnLabel, qtw);
+        else if (!beside.isEmpty())
+            attachInlineBtn(&beside.last(), font(26), btnLabel, floatTextW);
+    }
 
     const int commentH = comments.size() * TEXT_LH;
     const int floatH = qMax(dh, beside.size() * TEXT_LH_Q)
                        + below.size() * TEXT_LH_Q;
-    const int btnH = btnLabel.isEmpty() ? 0 : TEXT_LH;
     const int statsH = st.isEmpty() ? 0 : (STATS_GAP_TOP + STATS_H);
-    const int totalH = HEAD_H + commentH + QHEAD_H + 8 + floatH + btnH + statsH;
+    const int totalH = HEAD_H + commentH + QHEAD_H + 8 + floatH + statsH;
     if (totalH > FLOAT_MAX_H)
         return bad;
 
@@ -614,13 +624,34 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     if (hasQuoted && t.quoted.isExpandable)
         needFullText = true;
 
-    // 有完整文本可看 → 追加"显示全文"按钮（放在统计行之前）
+    // 有完整文本可看 → "显示全文"内联到最后一个文本行末尾（不另占一行）
     if (needFullText) {
-        Atom a;
-        a.kind = Op::FullText;
-        a.h = TEXT_LH;
-        a.text = QStringLiteral("显示全文");
-        atoms.append(a);
+        bool attached = false;
+        for (int i = atoms.size() - 1; i >= 0; --i) {
+            Atom &a = atoms[i];
+            if (a.kind == Op::Line) {
+                attachInlineBtn(&a.text, font(30), QStringLiteral("显示全文"),
+                                TEXT_W);
+                a.btnSuffix = QStringLiteral("显示全文");
+                attached = true;
+                break;
+            }
+            if (a.kind == Op::QLine) {
+                attachInlineBtn(&a.text, font(26), QStringLiteral("显示全文"),
+                                TEXT_W - QIND);
+                a.btnSuffix = QStringLiteral("显示全文");
+                attached = true;
+                break;
+            }
+        }
+        // 兜底：找不到文本行（极端情况）时仍独立成行
+        if (!attached) {
+            Atom a;
+            a.kind = Op::FullText;
+            a.h = TEXT_LH;
+            a.text = QStringLiteral("显示全文");
+            atoms.append(a);
+        }
     }
 
     const QString st = statsText(t);
@@ -752,14 +783,24 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 op.btnLabel = a.btnLabel;
                 op.statsLeft = a.statsLeft;
                 op.statsRight = a.statsRight;
-                // 卡片内"显示全文"按钮热区
+                // 行尾内联"显示全文"按钮热区（挂在最后一个文本行）
                 if (!a.btnLabel.isEmpty()) {
                     const int besideH = a.floatLines.size() * TEXT_LH;
                     const int belowH = a.belowLines.size() * TEXT_LH;
-                    const int btnY = op.y + HEAD_H + 8
-                                     + qMax(a.dh, besideH) + belowH;
+                    const QFont lf = font(30);
+                    int bx, btnY;
+                    if (!a.belowLines.isEmpty()) {
+                        btnY = op.y + HEAD_H + 8 + qMax(a.dh, besideH)
+                               + belowH - TEXT_LH;
+                        bx = colX(col) + PAD
+                             + int(textWidth(lf, a.belowLines.last())) + 10;
+                    } else {
+                        btnY = op.y + HEAD_H + 8 + besideH - TEXT_LH;
+                        bx = colX(col) + PAD
+                             + int(textWidth(lf, a.floatLines.last())) + 10;
+                    }
                     TextButton btn;
-                    btn.rect = QRect(colX(col) + PAD, btnY,
+                    btn.rect = QRect(bx, btnY,
                                      int(textWidth(font(26, true), a.btnLabel)),
                                      TEXT_LH);
                     btn.tweetIndex = ti;
@@ -795,15 +836,26 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 op.btnLabel = a.btnLabel;
                 op.statsLeft = a.statsLeft;
                 op.statsRight = a.statsRight;
-                // 卡片内"显示全文"按钮热区
+                // 行尾内联"显示全文"按钮热区（挂在最后一个引用文本行）
                 if (!a.btnLabel.isEmpty()) {
                     const int besideH = a.floatLines.size() * TEXT_LH_Q;
                     const int belowH = a.belowLines.size() * TEXT_LH_Q;
-                    const int btnY = imgY + qMax(a.dh, besideH) + belowH;
+                    const QFont lf = font(26);
+                    int bx, btnY;
+                    if (!a.belowLines.isEmpty()) {
+                        btnY = imgY + qMax(a.dh, besideH) + belowH
+                               - TEXT_LH_Q;
+                        bx = colX(col) + PAD + QIND
+                             + int(textWidth(lf, a.belowLines.last())) + 10;
+                    } else {
+                        btnY = imgY + besideH - TEXT_LH_Q;
+                        bx = colX(col) + PAD + QIND
+                             + int(textWidth(lf, a.floatLines.last())) + 10;
+                    }
                     TextButton btn;
-                    btn.rect = QRect(colX(col) + PAD + QIND, btnY,
+                    btn.rect = QRect(bx, btnY,
                                      int(textWidth(font(26, true), a.btnLabel)),
-                                     TEXT_LH);
+                                     TEXT_LH_Q);
                     btn.tweetIndex = ti;
                     pages[p].buttons.append(btn);
                 }
@@ -813,6 +865,20 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             case Op::QLine:
                 op.y = grow(a.h);
                 op.text = a.text;
+                op.btnSuffix = a.btnSuffix;
+                // 行尾内联"显示全文"按钮热区
+                if (!a.btnSuffix.isEmpty()) {
+                    const bool isQ = (a.kind == Op::QLine);
+                    const QFont lf = isQ ? font(26) : font(30);
+                    const int tx = colX(col) + PAD + (isQ ? QIND : 0);
+                    const int bx = tx + int(textWidth(lf, a.text)) + 10;
+                    TextButton btn;
+                    btn.rect = QRect(bx, op.y,
+                                     int(textWidth(font(26, true), a.btnSuffix)),
+                                     a.h);
+                    btn.tweetIndex = ti;
+                    pages[p].buttons.append(btn);
+                }
                 break;
             case Op::FullText:
                 op.y = grow(a.h);
@@ -1066,6 +1132,29 @@ void Renderer::drawLine(QPainter &p, const QString &text, int x, int y,
     p.drawText(QRectF(x, y, TEXT_W, 4000), Qt::AlignLeft | Qt::AlignTop, text);
 }
 
+void Renderer::attachInlineBtn(QString *line, const QFont &lineFont,
+                               const QString &btn, qreal lineMaxWidth) const
+{
+    const QFont bf = font(26, true);
+    const int gap = 10;
+    const qreal avail = lineMaxWidth - textWidth(bf, btn) - gap;
+    if (avail <= 0)
+        return;
+    if (textWidth(lineFont, *line) > avail)
+        *line = ellipsize(lineFont, *line, avail);
+}
+
+void Renderer::drawInlineBtn(QPainter &p, int x, int y, const QString &btn,
+                             int lineH) const
+{
+    const QFont bf = font(26, true);
+    p.setFont(bf);
+    p.setPen(QColor("#1a6b9c"));
+    p.drawText(QRectF(x, y, TEXT_W, lineH), Qt::AlignLeft | Qt::AlignTop, btn);
+    const int tw = int(textWidth(bf, btn));
+    p.drawLine(x, y + lineH - 8, x + tw, y + lineH - 8);
+}
+
 void Renderer::drawQuotedBar(QPainter &p, int x, int y0, int y1) const
 {
     p.setPen(QPen(FG_FAINT, 2));
@@ -1184,13 +1273,22 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
         case Op::Head:
             drawHead(p, t, px, op.y);
             break;
-        case Op::Line:
+        case Op::Line: {
             drawLine(p, op.text, px, op.y, font(30), FG);
+            if (!op.btnSuffix.isEmpty())
+                drawInlineBtn(p, px + int(textWidth(font(30), op.text)) + 10,
+                              op.y, op.btnSuffix, TEXT_LH);
             break;
-        case Op::QLine:
+        }
+        case Op::QLine: {
             drawQuotedBar(p, r.x() + 10, op.y - 2, op.y + TEXT_LH_Q + 2);
             drawLine(p, op.text, px + QIND, op.y, font(26), FG_DIM);
+            if (!op.btnSuffix.isEmpty())
+                drawInlineBtn(p, px + QIND
+                                    + int(textWidth(font(26), op.text)) + 10,
+                              op.y, op.btnSuffix, TEXT_LH_Q);
             break;
+        }
         case Op::Img:
             if (op.slotIndex < 0 || op.slotIndex >= page.images.size())
                 break;
@@ -1252,16 +1350,17 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
                 drawLine(p, ln, px, by, font(30), FG);
                 by += TEXT_LH;
             }
-            // 卡片内"显示全文"按钮
+            // "显示全文"内联在最后一个文本行末尾（不另占一行）
             if (!op.btnLabel.isEmpty()) {
-                const QFont fb = font(26, true);
-                p.setFont(fb);
-                p.setPen(QColor("#1a6b9c"));
-                p.drawText(QRectF(px, by, TEXT_W, TEXT_LH),
-                           Qt::AlignLeft | Qt::AlignTop, op.btnLabel);
-                const int tw = int(textWidth(fb, op.btnLabel));
-                p.drawLine(px, by + TEXT_LH - 8, px + tw, by + TEXT_LH - 8);
-                by += TEXT_LH;
+                const QFont lf = font(30);
+                if (!op.belowLines.isEmpty())
+                    drawInlineBtn(p, px + int(textWidth(lf, op.belowLines.last()))
+                                          + 10,
+                                  by - TEXT_LH, op.btnLabel, TEXT_LH);
+                else if (!op.floatLines.isEmpty())
+                    drawInlineBtn(p, px + int(textWidth(lf, op.floatLines.last()))
+                                          + 10,
+                                  ly - TEXT_LH, op.btnLabel, TEXT_LH);
             }
             // 统计行
             if (!op.statsLeft.isEmpty()) {
@@ -1344,16 +1443,17 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
                 drawLine(p, ln, qx, by, font(26), FG_DIM);
                 by += TEXT_LH_Q;
             }
-            // 卡片内"显示全文"按钮
+            // "显示全文"内联在最后一个引用文本行末尾（不另占一行）
             if (!op.btnLabel.isEmpty()) {
-                const QFont fb = font(26, true);
-                p.setFont(fb);
-                p.setPen(QColor("#1a6b9c"));
-                p.drawText(QRectF(qx, by, TEXT_W - QIND, TEXT_LH),
-                           Qt::AlignLeft | Qt::AlignTop, op.btnLabel);
-                const int tw = int(textWidth(fb, op.btnLabel));
-                p.drawLine(qx, by + TEXT_LH - 8, qx + tw, by + TEXT_LH - 8);
-                by += TEXT_LH;
+                const QFont lf = font(26);
+                if (!op.belowLines.isEmpty())
+                    drawInlineBtn(p, qx + int(textWidth(lf, op.belowLines.last()))
+                                         + 10,
+                                  by - TEXT_LH_Q, op.btnLabel, TEXT_LH_Q);
+                else if (!op.floatLines.isEmpty())
+                    drawInlineBtn(p, qx + int(textWidth(lf, op.floatLines.last()))
+                                         + 10,
+                                  ly - TEXT_LH_Q, op.btnLabel, TEXT_LH_Q);
             }
             // 统计行
             if (!op.statsLeft.isEmpty()) {

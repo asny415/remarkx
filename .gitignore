@@ -10,6 +10,7 @@ xreader-app/cookies.json
 xreader-app/pending.json
 xreader-app/favs.json
 xreader-app/state.json
+xreader-app/calib.json
 
 # Python
 __pycache__/

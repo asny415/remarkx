@@ -7,6 +7,8 @@
 [![平台](https://img.shields.io/badge/platform-reMarkable%202-e02a28)]()
 [![数据源](https://img.shields.io/badge/data-X%20%28Twitter%29%20Web%20GraphQL-black)]()
 
+![remarkx on reMarkable 2](readme.jpg)
+
 ---
 
 ## 目录

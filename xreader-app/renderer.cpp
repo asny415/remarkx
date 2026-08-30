@@ -996,6 +996,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 while (fai < fats.size()) {
                     if (!placeAtom(fats[fai], fi))
                         break;
+                    ++fai;
                 }
                 if (chunkIdx >= 0 && y + pad <= BOTTOM_Y)
                     grow(pad);
@@ -1012,6 +1013,8 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 close();
                 tryFillGap(ti);
                 jump();
+            } else {
+                ++ai;
             }
         }
         const int pad = (lastKind == Op::Stats) ? CARD_GAP

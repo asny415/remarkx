@@ -53,9 +53,11 @@ static const int FLOAT_MAX_H = 1600;
 // 栏底补位：图片/竖版图卡在剩余高度内放不下时，若空白较大，把后面若干条纯文本
 // 帖提前填入空白，避免大片留白（图片仍不截断、整体下移）。纯文本卡整张放不下时
 // 允许截断跨栏：前半填当前栏空白，后半在下一栏续排（图片卡仍不截断）。
+// 原则是尽可能不留空白：多向前扫几条，中间的图片/卡放不下也不挡道，后面能填的
+// 纯文本帖尽量补上来。
 static const int FILL_MIN_H = 200;    // 空白高度达到该值才考虑补位
-static const int FILL_MIN_CARD = 150; // 补位卡至少要有这个高度（只挡异常小的卡）
-static const int FILL_SCAN = 6;       // 最多向前扫描这么多条找纯文本帖
+static const int FILL_MIN_CARD = 100; // 补位卡至少要有这个高度（只挡异常小的卡）
+static const int FILL_SCAN = 16;      // 最多向前扫描这么多条找纯文本帖
 
 // 有界 LRU 缓存：插入并把最旧的一条淘汰掉。整清缓存会让翻页回看时
 // 头像/图片重新从磁盘解码缩放，是"省内存伤翻页"的过度优化。
@@ -764,7 +766,8 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             if (chunkIdx < 0) {
                 const bool cont = chunkWasSplit
                                   && (a.kind == Op::Line || a.kind == Op::QLine
-                                      || a.kind == Op::FullText);
+                                      || a.kind == Op::FullText
+                                      || a.kind == Op::QHead);
                 openChunk(cont, pti);
             }
             RenderChunk &ch = pages[p].chunks[chunkIdx];
@@ -1002,10 +1005,12 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     continue;
                 const int pad = (fats.last().kind == Op::Stats)
                                     ? CARD_GAP : (PAD_BOTTOM + CARD_GAP);
-                int need = PAD_TOP + pad;
+                // 内容高（PAD_TOP+各原子）：只差尾部间距也算放得下，整卡贴栏底
+                // 收尾也不留白；内容真正放不下才走"截断跨栏"。
+                int contentNeed = PAD_TOP;
                 for (const Atom &a : fats)
-                    need += a.h;
-                if (need < FILL_MIN_CARD)
+                    contentNeed += a.h;
+                if (contentNeed < FILL_MIN_CARD)
                     continue;
 
                 // 保存/恢复 chunkWasSplit：补位卡是全新卡，但当前帖续排仍需它。
@@ -1013,9 +1018,10 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 chunkIdx = -1;
                 chunkWasSplit = false;
 
-                if (need <= freeSpace()) {
-                    // 整卡放得下 → 整卡放入空白（先验证过需要高度 ≤ 剩余空白，
-                    // 不会再失败），继续向后扫描尽量把剩余空白也补上。
+                if (contentNeed <= freeSpace()) {
+                    // 内容放得下 → 整卡放入空白（先验证过内容高度 ≤ 剩余空白，
+                    // 不会再失败）；末尾间距放得下才补，放不下就贴栏底收尾。
+                    // 继续向后扫描尽量把剩余空白也补上。
                     int fai = 0;
                     while (fai < fats.size()) {
                         if (!placeAtom(fats[fai], fi))
@@ -1030,7 +1036,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     continue;
                 }
 
-                // 整卡放不下但可拆（纯文本）→ 截断跨栏续排：当前栏先放前半部分，
+                // 内容放不下但可拆（纯文本）→ 截断跨栏续排：当前栏先放前半部分，
                 // 余下在下一栏起接着续排（后面的 C、D 顺延）。先在当前栏算好能放
                 // 多少原子（与 placeAtom 的判定一致），避免放一半再回滚。
                 int total = PAD_TOP;
@@ -1040,11 +1046,13 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     if (total > freeSpace())
                         break;
                 }
-                // 续排起点必须是文本行，才接得出无上边框的续排卡；全部放得下
-                // （只差尾部间距）或拆点不对 → 放弃这张卡，继续向后找。
-                if (fai == 0 || fai >= fats.size()
+                // 续排起点必须是文本行或引用作者头（QHead 自带左侧引用条），才接
+                // 得出无上边框的续排卡；头部/统计/按钮行开头接续排卡不成样子 →
+                // 放弃这张卡，继续向后找。
+                if (fai == 0
                         || (fats[fai].kind != Op::Line
-                            && fats[fai].kind != Op::QLine)) {
+                            && fats[fai].kind != Op::QLine
+                            && fats[fai].kind != Op::QHead)) {
                     chunkWasSplit = savedSplit;
                     continue;
                 }

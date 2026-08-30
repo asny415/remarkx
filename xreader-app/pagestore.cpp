@@ -15,6 +15,7 @@
 #include <QQuickWindow>
 #include <QTimer>
 
+#include <algorithm>
 #include <dlfcn.h>
 
 #include "crashctx.h"
@@ -687,37 +688,58 @@ void PageStore::saveInkNow()
         return;
     if (!m_ink->hasInkPixels())
         return;   // 只有擦除痕迹，没有实际墨迹，不收藏
-    // 优先用当前页已分配编号
-    QString number = m_currentNumber;
-    if (number.isEmpty())
-        number = m_pageNumbers.value(m_feedPage);
-    if (number.isEmpty()) {
-        const QString today = QDate::currentDate().toString("yyyyMMdd");
-        if (m_date != today) {
-            m_date = today;
-            m_seq = 0;
-        }
-        m_seq += 1;
-        number = m_date + QString::number(m_seq).rightJustified(3, '0');
-        m_pageNumbers[m_feedPage] = number;
+    // 页面笔迹层编号：一页一个（翻页回来恢复笔迹）
+    QString pageNum = m_currentNumber;
+    if (pageNum.isEmpty())
+        pageNum = m_pageNumbers.value(m_feedPage);
+    if (pageNum.isEmpty()) {
+        pageNum = allocNumber();
+        m_pageNumbers[m_feedPage] = pageNum;
         persistState();
     }
-    m_currentNumber = number;
-    const QString base = m_bookDir + "/" + number;
+    m_currentNumber = pageNum;
+    const QString base = m_bookDir + "/" + pageNum;
     // 笔迹层落盘（翻页回来恢复）
     if (!m_ink->saveDraw(base + ".draw.png"))
         return;
 
-    // 按笔迹起始位置锁定帖子，渲染"帖+笔迹"独立图落盘；新收藏推 Telegram
-    const QPoint start = m_ink->inkStart();
-    const int ti = hitTweetIndex(start.x(), start.y());
-    if (ti >= 0 && ti < m_feed.size()) {
+    // 按笔迹像素命中的帖子逐帖收藏：每帖一个独立编号，一页可收藏多条帖子。
+    // 一笔划过多个帖子块（起笔跨卡/跨栏）时就收藏多次，不再一页只收一条。
+    QVector<int> tis;
+    hitTweets(&m_ink->inkImage(), &tis);
+    if (tis.isEmpty()) {
+        // 写到卡片外空白：兜底取最近块，保证总有归属
+        const QPoint start = m_ink->inkStart();
+        const int ti = hitTweetIndex(start.x(), start.y());
+        if (ti >= 0)
+            tis.append(ti);
+    }
+    QSet<QString> done;
+    for (int i = 0; i < tis.size(); ++i) {
+        const int ti = tis.at(i);
+        if (ti < 0 || ti >= m_feed.size())
+            continue;
         const XTweet &t = m_feed.at(ti);
-        const bool fresh = upsertFav(number, t);
+        if (done.contains(t.id))
+            continue;
+        done.insert(t.id);
+        bool fresh = false;
+        const QString number = upsertFav(t, pageNum, &fresh);
         updateFavImage(number, t.id);
         if (fresh)
             m_telegram->enqueue(number, t.url);
     }
+}
+
+QString PageStore::allocNumber()
+{
+    const QString today = QDate::currentDate().toString("yyyyMMdd");
+    if (m_date != today) {
+        m_date = today;
+        m_seq = 0;
+    }
+    m_seq += 1;
+    return m_date + QString::number(m_seq).rightJustified(3, '0');
 }
 
 void PageStore::persistState()
@@ -743,34 +765,42 @@ void PageStore::persistFavs()
     }
 }
 
-// 收藏索引写回：存在同名编号则更新（保留 created），否则追加。
-// 返回 true = 新收藏（触发 Telegram 推送）。
-bool PageStore::upsertFav(const QString &number, const XTweet &t)
+// 收藏索引写回：同页同帖（feed_page + tweet_id）只保留一条收藏（更新链接，
+// 保留编号/创建时间）；不同帖子、或同一帖子在不同页，各自分配独立编号。
+// 返回该收藏的编号；新收藏时 *fresh=true（触发 Telegram 推送）。
+QString PageStore::upsertFav(const XTweet &t, const QString &pageNum,
+                             bool *fresh)
 {
+    if (fresh)
+        *fresh = false;
     for (int i = 0; i < m_favs.size(); ++i) {
         QJsonObject e = m_favs.at(i).toObject();
-        if (e["number"].toString() == number) {
-            e["tweet_id"] = t.id;
+        if (e["feed_page"].toInt(-1) == m_feedPage
+                && e["tweet_id"].toString() == t.id) {
             e["url"] = t.url;
-            e["feed_page"] = m_feedPage;
             m_favs.replace(i, e);
             persistFavs();
-            return false;
+            return e["number"].toString();
         }
     }
+    if (fresh)
+        *fresh = true;
+    const QString number = allocNumber();
     QJsonObject e;
     e["number"] = number;
     e["tweet_id"] = t.id;
     e["url"] = t.url;
     e["feed_page"] = m_feedPage;
+    e["page_num"] = pageNum;
     e["created"] = QDateTime::currentDateTime()
                        .toString("yyyy-MM-dd HH:mm:ss");
     m_favs.append(e);
     persistFavs();
-    return true;
+    return number;
 }
 
-// 用当前 feed/排版重渲染某收藏的"帖+笔迹"图（媒体到位后补图用）
+// 用当前 feed/排版重渲染某收藏的"帖+笔迹"图（媒体到位后补图用）。
+// 笔迹层按页面编号（page_num）存，多帖共用同一页的笔迹层。
 void PageStore::updateFavImage(const QString &number, const QString &tweetId)
 {
     int ti = -1;
@@ -782,18 +812,22 @@ void PageStore::updateFavImage(const QString &number, const QString &tweetId)
     }
     if (ti < 0)
         return;
-    // 收藏时所在页（笔迹只画在那页的块上）
+    // 该收藏所在页的笔迹层编号与页号
+    QString pageNum;
     int inkPage = -1;
     for (int i = 0; i < m_favs.size(); ++i) {
         const QJsonObject e = m_favs.at(i).toObject();
         if (e["number"].toString() == number) {
+            pageNum = e["page_num"].toString();
             inkPage = e["feed_page"].toInt(-1);
             break;
         }
     }
+    if (pageNum.isEmpty())
+        pageNum = number;   // 兼容旧版收藏：编号即页面笔迹层编号
     QImage ink;
     if (inkPage >= 0)
-        ink.load(m_bookDir + "/" + number + ".draw.png");
+        ink.load(m_bookDir + "/" + pageNum + ".draw.png");
     const QImage post = m_renderer->renderFavorite(m_feed, m_pages, ti,
                                                    inkPage, ink);
     if (!post.isNull())
@@ -814,6 +848,50 @@ void PageStore::onFavSent(const QString &number)
         }
     }
     persistFavs();
+}
+
+// 笔迹像素命中的当前页所有帖子（m_feed 下标，去重、按 feed 顺序）。
+// 一笔跨过多个帖子块（跨卡/跨栏）时全部命中，实现"一页收藏多条帖子"。
+// 精确到像素：只有墨迹真正落在帖子块内才命中，栏间/页边空白处的长笔
+// 不会误伤相邻卡片。
+void PageStore::hitTweets(const QImage *ink, QVector<int> *out)
+{
+    remarkxSetCtx("hitTweets");
+    out->clear();
+    if (!ink || ink->isNull() || m_pages.isEmpty()
+            || m_feedPage >= m_pages.size())
+        return;
+    syncFeed();
+    QSet<int> seen;
+    const RenderPage &pg = m_pages.at(m_feedPage);
+    for (const RenderChunk &c : pg.chunks) {
+        if (c.tweetIndex < 0 || c.tweetIndex >= m_feed.size())
+            continue;
+        if (seen.contains(c.tweetIndex))
+            continue;
+        const QRect r = c.rect.intersected(
+            QRect(0, 0, ink->width(), ink->height()));
+        if (r.isEmpty())
+            continue;
+        bool hasInk = false;
+        for (int y = r.top(); y <= r.bottom(); ++y) {
+            const QRgb *line =
+                reinterpret_cast<const QRgb *>(ink->constScanLine(y));
+            for (int x = r.left(); x <= r.right(); ++x) {
+                if (qAlpha(line[x]) > 0) {
+                    hasInk = true;
+                    break;
+                }
+            }
+            if (hasInk)
+                break;
+        }
+        if (!hasInk)
+            continue;
+        seen.insert(c.tweetIndex);
+        out->append(c.tweetIndex);
+    }
+    std::sort(out->begin(), out->end());
 }
 
 // 笔迹起始位置命中当前页的哪个帖子（m_feed 下标）。

@@ -111,14 +111,18 @@ private:
     void saveInkNow();
     void persistState();
     void persistFavs();
-    // 更新或追加收藏索引；返回 true = 新收藏（触发 Telegram 推送）
-    bool upsertFav(const QString &number, const XTweet &t);
+    // 按 (feed_page, tweet_id) 更新或新增收藏，返回该收藏编号；
+    // 新收藏返回时 *fresh=true（触发 Telegram 推送）
+    QString upsertFav(const XTweet &t, const QString &pageNum, bool *fresh);
+    QString allocNumber();
     void updateFavImage(const QString &number, const QString &tweetId);
     void onFavSent(const QString &number);
     void setStatus(const QString &s);
     void updateLabel();
     void doFullRefresh();
     void forceEpdFullRefresh();
+    // 笔迹像素命中的当前页所有帖子（返回 m_feed 下标，去重、按 feed 顺序）
+    void hitTweets(const QImage *ink, QVector<int> *out);
     // 笔迹起始位置命中当前页的哪个帖子（返回 m_feed 下标；未命中取最近块）
     int hitTweetIndex(int x, int y);
     void cleanupOnStartup();

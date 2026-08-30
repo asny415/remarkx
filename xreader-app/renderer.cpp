@@ -50,10 +50,10 @@ static const int QUOTED_MAX_LINES = 4;
 static const int FLOAT_GAP = 14;
 static const int FLOAT_MAX_H = 1600;
 
-// 栏底补位：图片卡在剩余高度内放不下时，若空白较大，把后面某个纯文本帖整卡
-// 提前填入空白，避免大片留白（图片仍不截断、整体下移）。
-static const int FILL_MIN_H = 240;    // 空白高度达到该值才考虑补位
-static const int FILL_MIN_CARD = 200; // 补位卡至少要有这个高度（避免小卡填大洞）
+// 栏底补位：图片/竖版图卡在剩余高度内放不下时，若空白较大，把后面若干条纯文本
+// 帖整卡提前填入空白，避免大片留白（图片仍不截断、整体下移）。
+static const int FILL_MIN_H = 200;    // 空白高度达到该值才考虑补位
+static const int FILL_MIN_CARD = 150; // 补位卡至少要有这个高度（只挡异常小的卡）
 static const int FILL_SCAN = 6;       // 最多向前扫描这么多条找纯文本帖
 
 // 有界 LRU 缓存：插入并把最旧的一条淘汰掉。整清缓存会让翻页回看时
@@ -941,18 +941,18 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             return true;
         };
 
-        // 栏底补位：当前帖在剩余高度内放不下（多为图片卡）时，若空白较大，
-        // 把后面某个纯文本帖整卡提前填入空白；当前帖其余部分照常续排下一栏。
-        // 不回退当前帖已排的头部/文本（否则把它整体搬去下一栏会挤压下一栏，
-        // 可能在那里留下更大的新空白）。
+        // 栏底补位：当前帖在剩余高度内放不下（多为图片/竖版图卡）时，若空白较大，
+        // 把后面若干条纯文本帖整卡提前填入空白（能放几条放几条，尽量吃满空白）；
+        // 当前帖其余部分照常续排下一栏。不回退当前帖已排的头部/文本（否则把它
+        // 整体搬去下一栏会挤压下一栏，可能在那里留下更大的新空白）。
         auto tryFillGap = [&](int curTi) -> bool {
-            // 只在该帖真正留下的可见空白较大时才补位（文本截断的小缝不值得调序）
+            // 只在该帖真正留下的可见空白较大时才补位（文本截断的小缝不值得调序）。
+            // 不做"补位卡要占空白多少比例"的限制：空白越大越该补，短文本帖也能填。
             if (freeSpace() < FILL_MIN_H)
                 return false;
-            const int gap = freeSpace();
-            const int minNeed = qMax(FILL_MIN_CARD, gap * 3 / 5);
-            for (int fi = curTi + 1; fi < feed.size() && fi - curTi <= FILL_SCAN;
-                 ++fi) {
+            bool placedAny = false;
+            const int scanEnd = qMin(feed.size(), curTi + 1 + FILL_SCAN);
+            for (int fi = curTi + 1; fi < scanEnd; ++fi) {
                 if (consumed.contains(fi))
                     continue;
                 const XTweet &ft = feed.at(fi);
@@ -984,10 +984,10 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 int need = PAD_TOP + pad;
                 for (const Atom &a : fats)
                     need += a.h;
-                if (need < minNeed || need > gap)
+                if (need < FILL_MIN_CARD || need > freeSpace())
                     continue;
 
-                // 补位帖整卡放入空白（先验证过需要高度 ≤ 空白，不会再失败）。
+                // 补位卡整卡放入空白（先验证过需要高度 ≤ 剩余空白，不会再失败）。
                 // 保存/恢复 chunkWasSplit：补位卡是全新卡，但当前帖续排仍需它。
                 const bool savedSplit = chunkWasSplit;
                 chunkIdx = -1;
@@ -1003,9 +1003,10 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 consumed.insert(fi);
                 chunkIdx = -1;
                 chunkWasSplit = savedSplit;
-                return true;
+                placedAny = true;
+                // 继续向后扫描，尽量把剩余空白也补上
             }
-            return false;
+            return placedAny;
         };
 
         while (ai < atoms.size()) {

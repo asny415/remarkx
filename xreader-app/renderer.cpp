@@ -368,6 +368,82 @@ Renderer::Atom Renderer::makeFloatCard(const XTweet &t, const Atom &img)
     return fb;
 }
 
+Renderer::Atom Renderer::makeQFloatCard(const XTweet &t, const Atom &img)
+{
+    remarkxSetCtx("render:makeQFloatCard");
+    Atom bad;
+    bad.kind = -1;
+    const QString qtext = cleanText(t.quoted.text);
+    if (qtext.isEmpty())
+        return bad;
+    const int dw = img.dw, dh = img.dh;
+    const int qtw = TEXT_W - QIND;
+    const int floatTextW = qtw - dw - FLOAT_GAP;
+    if (floatTextW < 200)
+        return bad;
+
+    // 引用文字：先按"图旁窄宽"包裹全部文本，取前 K 行放在图片旁；
+    // 剩余文本重新全宽包裹，落到图片下方（消除图片下面的空白）。
+    const int K = (dh + TEXT_LH_Q - 1) / TEXT_LH_Q;
+    const QStringList allNarrow = wrapText(font(26), qtext, floatTextW, 100000);
+    const QStringList beside = allNarrow.mid(0, K);
+    QStringList below;
+    if (allNarrow.size() > K) {
+        const QString rest = allNarrow.mid(K).join(QLatin1Char('\n'));
+        below = wrapText(font(26), rest, qtw, 100000);
+    }
+
+    // 引用者自己的评论（纯转推时为空）
+    QStringList comments;
+    if (!t.isRetweet) {
+        const QString text = cleanText(t.text);
+        if (!text.isEmpty())
+            comments = wrapText(font(30), text, TEXT_W, 100000);
+    }
+
+    // 统计行
+    QString statsLeft, statsRight;
+    const QString st = statsText(t);
+    if (!st.isEmpty()) {
+        const int sep = st.indexOf(QChar(1));
+        statsLeft = st.left(sep);
+        statsRight = st.mid(sep + 1);
+    }
+
+    const QString btnLabel = (t.isExpandable || t.quoted.isExpandable)
+                                 ? QStringLiteral("显示全文")
+                                 : QString();
+
+    const int commentH = comments.size() * TEXT_LH;
+    const int floatH = qMax(dh, beside.size() * TEXT_LH_Q)
+                       + below.size() * TEXT_LH_Q;
+    const int btnH = btnLabel.isEmpty() ? 0 : TEXT_LH;
+    const int statsH = st.isEmpty() ? 0 : (STATS_GAP_TOP + STATS_H);
+    const int totalH = HEAD_H + commentH + QHEAD_H + 8 + floatH + btnH + statsH;
+    if (totalH > FLOAT_MAX_H)
+        return bad;
+
+    Atom qf;
+    qf.kind = Op::QFloatCard;
+    qf.h = totalH;
+    qf.tweetIndex = img.tweetIndex;
+    qf.dw = dw;
+    qf.dh = dh;
+    qf.mediaIndex = img.mediaIndex;
+    qf.video = img.video;
+    qf.nMedia = img.nMedia;
+    qf.commentLines = comments;
+    qf.qname = t.quoted.authorName.isEmpty() ? QStringLiteral("?")
+                                             : t.quoted.authorName;
+    qf.qhandle = t.quoted.authorHandle;
+    qf.floatLines = beside;
+    qf.belowLines = below;
+    qf.btnLabel = btnLabel;
+    qf.statsLeft = statsLeft;
+    qf.statsRight = statsRight;
+    return qf;
+}
+
 QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
                                              int ti)
 {
@@ -379,16 +455,37 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
                            || !t.quoted.text.trimmed().isEmpty()
                            || !t.quoted.media.isEmpty();
 
-    // 窄图卡片（FloatCard）：简单卡片（无引用/转推、有窄主图、有正文）尝试
-    // "右上图 + 文字环绕"布局，消除窄图两侧大片空白。
+    // 竖版图卡片（FloatCard）：简单卡片（无引用/转推、有竖版主图、有正文）尝试
+    // "右上图 + 文字环绕"布局，消除竖图两侧大片空白。
     // FloatCard 是原子块（头部+图+文字+统计一体），不可拆分，随列整体移动。
     if (!hasQuoted && !t.isRetweet) {
         const Atom img = imgAtom(feed, ti, false, 0);
-        if (img.kind == Op::Img && img.dw < TEXT_W / 2) {
+        if (img.kind == Op::Img && img.dh > img.dw) {
             Atom fb = makeFloatCard(t, img);
             if (fb.kind == Op::FloatCard) {
                 atoms.append(fb);
                 return atoms;
+            }
+        }
+    }
+
+    // 引用/转推帖（QFloatCard）：引用块带竖版图时整卡
+    // "头部+评论+引用作者+右上图环绕"一体排版，消除引用图两侧空白。
+    // 纯转推的 t.media 与原帖媒体相同，不视为"自己的媒体"；
+    // 引用评论自带媒体时布局复杂，回退普通排版。
+    if (hasQuoted) {
+        bool hasOwnMedia = false;
+        if (!t.isRetweet)
+            for (const XMedia &m : t.media)
+                if (!m.url.isEmpty()) { hasOwnMedia = true; break; }
+        if (!hasOwnMedia) {
+            const Atom qimg = imgAtom(feed, ti, true, QIND);
+            if (qimg.kind == Op::QImg && qimg.dh > qimg.dw) {
+                Atom qf = makeQFloatCard(t, qimg);
+                if (qf.kind == Op::QFloatCard) {
+                    atoms.append(qf);
+                    return atoms;
+                }
             }
         }
     }
@@ -633,6 +730,48 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 }
                 break;
             }
+            case Op::QFloatCard: {
+                op.y = grow(a.h);
+                // 引用图槽位（右上，位于引用作者行之后）
+                const int commentH = a.commentLines.size() * TEXT_LH;
+                const int imgY = op.y + HEAD_H + commentH + QHEAD_H + 8;
+                const int imgX = colX(col) + PAD + TEXT_W - a.dw;
+                ImageSlot s;
+                s.x = imgX;
+                s.y = imgY;
+                s.w = a.dw;
+                s.h = a.dh;
+                s.tweetIndex = a.tweetIndex;
+                s.isQuoted = true;
+                s.mediaIndex = a.mediaIndex;
+                s.video = a.video;
+                s.nMedia = a.nMedia;
+                pages[p].images.append(s);
+                op.slotIndex = pages[p].images.size() - 1;
+                op.imgW = a.dw;
+                op.imgH = a.dh;
+                op.commentLines = a.commentLines;
+                op.qname = a.qname;
+                op.qhandle = a.qhandle;
+                op.floatLines = a.floatLines;
+                op.belowLines = a.belowLines;
+                op.btnLabel = a.btnLabel;
+                op.statsLeft = a.statsLeft;
+                op.statsRight = a.statsRight;
+                // 卡片内"显示全文"按钮热区
+                if (!a.btnLabel.isEmpty()) {
+                    const int besideH = a.floatLines.size() * TEXT_LH_Q;
+                    const int belowH = a.belowLines.size() * TEXT_LH_Q;
+                    const int btnY = imgY + qMax(a.dh, besideH) + belowH;
+                    TextButton btn;
+                    btn.rect = QRect(colX(col) + PAD + QIND, btnY,
+                                     int(textWidth(font(26, true), a.btnLabel)),
+                                     TEXT_LH);
+                    btn.tweetIndex = ti;
+                    pages[p].buttons.append(btn);
+                }
+                break;
+            }
             case Op::Line:
             case Op::QLine:
                 op.y = grow(a.h);
@@ -682,7 +821,9 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 break;
             }
             ch.ops.append(op);
-            lastKind = (a.kind == Op::FloatCard) ? Op::Stats : a.kind;
+            lastKind = (a.kind == Op::FloatCard || a.kind == Op::QFloatCard)
+                           ? Op::Stats
+                           : a.kind;
             ++ai;
             return true;
         };
@@ -739,15 +880,16 @@ void Renderer::drawCardBorder(QPainter &p, int x, int y0, int y1, int w,
     p.setPen(QPen(CARD_BORDER, 2));
     p.drawLine(l, y0, l, y1);
     p.drawLine(r, y0, r, y1);
+    // QPainter 角度约定：0°=右、90°=上、180°=左、270°=下（逆时针为正）。
     if (top) {
         p.drawLine(l, y0, r, y0);
-        p.drawArc(QRectF(l, y0, 2 * rad, 2 * rad), 180 * 16, 90 * 16);
-        p.drawArc(QRectF(r - 2 * rad, y0, 2 * rad, 2 * rad), 270 * 16, 90 * 16);
+        p.drawArc(QRectF(l, y0, 2 * rad, 2 * rad), 90 * 16, 90 * 16);
+        p.drawArc(QRectF(r - 2 * rad, y0, 2 * rad, 2 * rad), 0 * 16, 90 * 16);
     }
     if (bottom) {
         p.drawLine(l, y1, r, y1);
-        p.drawArc(QRectF(l, y1 - 2 * rad, 2 * rad, 2 * rad), 90 * 16, 90 * 16);
-        p.drawArc(QRectF(r - 2 * rad, y1 - 2 * rad, 2 * rad, 2 * rad), 0 * 16,
+        p.drawArc(QRectF(l, y1 - 2 * rad, 2 * rad, 2 * rad), 180 * 16, 90 * 16);
+        p.drawArc(QRectF(r - 2 * rad, y1 - 2 * rad, 2 * rad, 2 * rad), 270 * 16,
                   90 * 16);
     }
 }
@@ -1082,6 +1224,98 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
                            Qt::AlignLeft | Qt::AlignTop, op.btnLabel);
                 const int tw = int(textWidth(fb, op.btnLabel));
                 p.drawLine(px, by + TEXT_LH - 8, px + tw, by + TEXT_LH - 8);
+                by += TEXT_LH;
+            }
+            // 统计行
+            if (!op.statsLeft.isEmpty()) {
+                const int yy = by + STATS_GAP_TOP;
+                const QFont fs = font(22);
+                p.setFont(fs);
+                p.setPen(FG_FAINT);
+                if (!op.statsRight.isEmpty()) {
+                    const int rw = int(textWidth(fs, op.statsRight));
+                    const int rx = r.x() + r.width() - PAD - rw;
+                    const int lw = TEXT_W - rw - 14;
+                    QString left = op.statsLeft;
+                    if (lw > 0 && textWidth(fs, left) > lw)
+                        left = ellipsize(fs, left, lw);
+                    p.drawText(QRectF(rx, yy, rw + 4, STATS_H),
+                               Qt::AlignLeft | Qt::AlignTop, op.statsRight);
+                    if (lw > 0)
+                        p.drawText(QRectF(px, yy, lw, STATS_H),
+                                   Qt::AlignLeft | Qt::AlignTop, left);
+                } else {
+                    p.drawText(QRectF(px, yy, TEXT_W, STATS_H),
+                               Qt::AlignLeft | Qt::AlignTop, op.statsLeft);
+                }
+            }
+            break;
+        }
+        case Op::QFloatCard: {
+            // 头部
+            drawHead(p, t, px, op.y);
+            int y = op.y + HEAD_H;
+            // 引用者自己的评论（全宽）
+            for (const QString &ln : op.commentLines) {
+                drawLine(p, ln, px, y, font(30), FG);
+                y += TEXT_LH;
+            }
+            // 引用块整体左竖线（作者行 + 图旁 + 图下连续一条）
+            const int qbarY0 = y - 2;
+            const int qx = px + QIND;
+            {
+                const QFont fn = font(24, true), fh = font(22);
+                const QString combo = op.qname + QStringLiteral("  @")
+                                      + op.qhandle;
+                if (textWidth(fn, combo) <= TEXT_W - QIND) {
+                    p.setFont(fn);
+                    p.setPen(FG);
+                    p.drawText(QRectF(qx, y + 2, TEXT_W - QIND, QHEAD_H),
+                               Qt::AlignLeft | Qt::AlignTop, op.qname);
+                    const int wn = int(textWidth(fn, op.qname));
+                    p.setFont(fh);
+                    p.setPen(FG_FAINT);
+                    p.drawText(QRectF(qx + wn + 8, y + 4,
+                                      TEXT_W - QIND - wn - 8, QHEAD_H),
+                               Qt::AlignLeft | Qt::AlignTop,
+                               QStringLiteral("@") + op.qhandle);
+                } else {
+                    p.setFont(fh);
+                    p.setPen(FG_DIM);
+                    p.drawText(QRectF(qx, y + 4, TEXT_W - QIND, QHEAD_H),
+                               Qt::AlignLeft | Qt::AlignTop,
+                               ellipsize(fh, combo, TEXT_W - QIND));
+                }
+            }
+            y += QHEAD_H + 8;
+            // 右上引用图（占位/已下载）
+            if (op.slotIndex >= 0 && op.slotIndex < page.images.size())
+                drawPhoto(p, t, page.images.at(op.slotIndex), withPhotos);
+            const int besideH = int(op.floatLines.size()) * TEXT_LH_Q;
+            const int belowH = int(op.belowLines.size()) * TEXT_LH_Q;
+            drawQuotedBar(p, r.x() + 10, qbarY0,
+                          y + qMax(op.imgH, besideH) + belowH + 2);
+            // 图片旁侧窄行（左侧）
+            int ly = y;
+            for (const QString &ln : op.floatLines) {
+                drawLine(p, ln, qx, ly, font(26), FG_DIM);
+                ly += TEXT_LH_Q;
+            }
+            // 图片下方全宽行（超过图片高度后扩展环绕）
+            int by = y + qMax(op.imgH, besideH);
+            for (const QString &ln : op.belowLines) {
+                drawLine(p, ln, qx, by, font(26), FG_DIM);
+                by += TEXT_LH_Q;
+            }
+            // 卡片内"显示全文"按钮
+            if (!op.btnLabel.isEmpty()) {
+                const QFont fb = font(26, true);
+                p.setFont(fb);
+                p.setPen(QColor("#1a6b9c"));
+                p.drawText(QRectF(qx, by, TEXT_W - QIND, TEXT_LH),
+                           Qt::AlignLeft | Qt::AlignTop, op.btnLabel);
+                const int tw = int(textWidth(fb, op.btnLabel));
+                p.drawLine(qx, by + TEXT_LH - 8, qx + tw, by + TEXT_LH - 8);
                 by += TEXT_LH;
             }
             // 统计行

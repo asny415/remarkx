@@ -10,6 +10,8 @@
 #include <QStringList>
 #include <QVector>
 
+class QFile;
+
 #include "xclient.h"
 
 class QFontMetricsF;
@@ -155,6 +157,9 @@ private:
     Atom imgAtom(const QVector<XTweet> &feed, int ti, bool isQuoted, int ind);
     QString statsText(const XTweet &t) const;
 
+    // 分栏留白诊断日志：追加一行（带时间戳）到 baseDir/layout.log。
+    void logLayoutLine(const QString &line) const;
+
     void drawCard(QPainter &p, const QVector<XTweet> &feed,
                   const RenderChunk &chunk, const RenderPage &page,
                   bool withPhotos);
@@ -174,6 +179,7 @@ private:
 
     QString m_fontPath;
     QString m_mediaDir;
+    QString m_logFile;
     QString m_family;
     mutable QHash<QPair<int, bool>, QFont> m_fonts;
     mutable QHash<QString, QImage> m_avatarCache;

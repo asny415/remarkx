@@ -12,7 +12,6 @@
 #include <QPolygonF>
 #include <QRegularExpression>
 #include <QSet>
-#include <QTextStream>
 #include <QTimeZone>
 
 // ---- 版面参数（原 relay/render.py 一致） ----
@@ -60,22 +59,13 @@ static const int FILL_MIN_H = 200;    // 空白高度达到该值才考虑补位
 static const int FILL_MIN_CARD = 100; // 补位卡至少要有这个高度（只挡异常小的卡）
 static const int FILL_SCAN = 16;      // 最多向前扫描这么多条找纯文本帖
 
-// 布局日志用：Op 类型 -> 中文名
-static const char *opKindName(int kind)
+// 该原子能否作为"截断跨栏"续排的起点：文本行/引用头可以接出无上边框的续排卡；
+// 图片也允许——图片原子块不可拆，整张（连同后面文字）在下一栏续排，只是图片
+// 开头用有边框的新卡承接。头部/统计/按钮/浮卡开头接续排卡不成样子，不允许。
+static bool opCanContinue(int kind)
 {
-    switch (kind) {
-    case Op::Head:      return "头部";
-    case Op::Line:      return "正文行";
-    case Op::Img:       return "图片";
-    case Op::QHead:     return "引用头";
-    case Op::QLine:     return "引用行";
-    case Op::QImg:      return "引用图";
-    case Op::Stats:     return "统计行";
-    case Op::FullText:  return "显示全文";
-    case Op::FloatCard: return "竖版图卡";
-    case Op::QFloatCard:return "引用竖版图卡";
-    }
-    return "?";
+    return kind == Op::Line || kind == Op::QLine || kind == Op::QHead
+           || kind == Op::Img || kind == Op::QImg;
 }
 
 // 有界 LRU 缓存：插入并把最旧的一条淘汰掉。整清缓存会让翻页回看时
@@ -120,7 +110,6 @@ Renderer::Renderer(QObject *parent) : QObject(parent)
 void Renderer::configure(const QString &baseDir)
 {
     m_mediaDir = baseDir + "/media";
-    m_logFile = baseDir + "/layout.log";
     const QStringList candidates = {
         baseDir + "/fonts/remarkx-cjk.ttf",
         baseDir + "/remarkx-cjk.ttf",
@@ -143,19 +132,6 @@ void Renderer::configure(const QString &baseDir)
     if (!fams.isEmpty())
         m_family = fams.first();
     qInfo() << "Renderer: font" << m_fontPath << "family" << m_family;
-}
-
-void Renderer::logLayoutLine(const QString &line) const
-{
-    if (m_logFile.isEmpty())
-        return;
-    QFile f(m_logFile);
-    if (!f.open(QIODevice::Append | QIODevice::Text))
-        return;
-    QTextStream ts(&f);
-    ts << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz")
-       << "  " << line << '\n';
-    f.close();
 }
 
 QFont Renderer::font(int pixel, bool bold) const
@@ -763,20 +739,6 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
         ensurePage();
     };
 
-    // ---- 分栏留白诊断（写入 layout.log） ----
-    // colReason: 每栏"为何留白"的原因；colTrace: 该栏补位扫描的逐条明细。
-    // 键均为 "页:栏"。空白大小在收尾时从最终 geometry 精确重算。
-    QHash<QString, QString> colReason;
-    QHash<QString, QStringList> colTrace;
-    QString gapFailReason;   // tryFillGap 最近一次失败的结论
-    QStringList gapTrace;    // tryFillGap 逐候选明细
-    auto closeCol = [&](const QString &reason) {
-        const QString key = QString("%1:%2").arg(p).arg(col);
-        colReason.insert(key, reason);
-        colTrace.insert(key, gapTrace);
-        gapTrace.clear();
-    };
-
     // 已被补位提前排掉的帖子（主循环跳过，避免重复排版）
     QSet<int> consumed;
 
@@ -1011,26 +973,18 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             return true;
         };
 
-        // 栏底补位：一个帖在剩余高度内放不下时，若空白较大，把后面若干条纯文本帖
-        // 提前填入空白（能放几条放几条，尽量吃满空白）。纯文本/纯引用文本卡整张
-        // 放不下时允许"截断跨栏"：前半放当前栏空白，余下部分在下一栏起接着续排
-        // （图片块原子不可拆分，仍整卡后移，绝不把别的帖插进同一帖的两段之间）。
+        // 栏底补位：一个帖在剩余高度内放不下时，若空白较大，把后面若干条帖提前
+        // 填入空白（能放几条放几条，尽量吃满空白）。先文本后图片的卡整卡放得下
+        // 就整卡补；放不下但前置文字能基本填满空白（不留大片空洞）时才"截断跨栏"：
+        // 文字填本栏、图片（及剩余文字）整张不截断在下一栏续排——绝不把别的帖
+        // 插进同一帖的两段之间，也不在栏底留下一块填不上的空洞。
         // 返回是否已续排到下一栏（是则调用方无需再 jump）。
         auto tryFillGap = [&](int curTi) -> bool {
             // 只在该帖真正留下的可见空白较大时才补位（文本截断的小缝不值得调序）。
             // 不做"补位卡要占空白多少比例"的限制：空白越大越该补，短文本帖也能填。
-            gapFailReason.clear();
-            gapTrace.clear();
-            if (freeSpace() < FILL_MIN_H) {
-                gapFailReason = QString("空白 %1px < FILL_MIN_H(%2px)，不值得补位")
-                                    .arg(freeSpace()).arg(FILL_MIN_H);
-                gapTrace << QString("空白 %1px 未达补位门槛 FILL_MIN_H(%2px)")
-                                .arg(freeSpace()).arg(FILL_MIN_H);
+            if (freeSpace() < FILL_MIN_H)
                 return false;
-            }
             bool advanced = false;
-            bool anyCandidate = false;
-            bool placedWhole = false;
             const int scanEnd = qMin(feed.size(), curTi + 1 + FILL_SCAN);
             for (int fi = curTi + 1; fi < scanEnd; ++fi) {
                 if (consumed.contains(fi))
@@ -1047,24 +1001,10 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 if (ft.text.trimmed().isEmpty() && ft.comment.trimmed().isEmpty()
                         && !hasMedia && !hasQuoted && !hasQMedia)
                     continue;
-                anyCandidate = true;
                 QVector<Atom> fats = buildAtoms(feed, fi);
-                // 只补纯文本/纯引用文本卡（可拆可分栏；图片块原子不可拆分）
-                bool splittable = true;
-                for (const Atom &a : fats) {
-                    if (a.kind == Op::Img || a.kind == Op::QImg
-                        || a.kind == Op::FloatCard || a.kind == Op::QFloatCard) {
-                        splittable = false;
-                        break;
-                    }
-                }
-                if (!splittable) {
-                    gapFailReason = QString("候选 #%1 含图片/浮卡，不可拆分，跳过")
-                                        .arg(fi);
-                    gapTrace << QString("候选 #%1 含图片/浮卡，不可拆分，跳过")
-                                    .arg(fi);
-                    continue;
-                }
+                // 先文本后图片的卡也能补位：整卡放得下就整卡补；放不下但前面有
+                // 文字时，把文字截断续排进当前栏，图片（及剩余文字）整张不截断，
+                // 在下一栏续排（不打断图片，也不把别的帖插进该帖两段之间）。
                 const int pad = (fats.last().kind == Op::Stats)
                                     ? CARD_GAP : (PAD_BOTTOM + CARD_GAP);
                 // 内容高（PAD_TOP+各原子）：只差尾部间距也算放得下，整卡贴栏底
@@ -1072,13 +1012,8 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 int contentNeed = PAD_TOP;
                 for (const Atom &a : fats)
                     contentNeed += a.h;
-                if (contentNeed < FILL_MIN_CARD) {
-                    gapFailReason = QString("候选 #%1 内容高 %2px < FILL_MIN_CARD(%3px)，跳过")
-                                        .arg(fi).arg(contentNeed).arg(FILL_MIN_CARD);
-                    gapTrace << QString("候选 #%1 内容高 %2px，低于门槛 %3px，跳过")
-                                    .arg(fi).arg(contentNeed).arg(FILL_MIN_CARD);
+                if (contentNeed < FILL_MIN_CARD)
                     continue;
-                }
 
                 // 保存/恢复 chunkWasSplit：补位卡是全新卡，但当前帖续排仍需它。
                 const bool savedSplit = chunkWasSplit;
@@ -1101,15 +1036,12 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     consumed.insert(fi);
                     chunkIdx = -1;
                     chunkWasSplit = savedSplit;
-                    placedWhole = true;
-                    gapTrace << QString("候选 #%1 内容高 %2px ≤ 空白 %3px → 整卡补位")
-                                    .arg(fi).arg(contentNeed).arg(blankBefore);
                     continue;
                 }
 
-                // 内容放不下但可拆（纯文本）→ 截断跨栏续排：当前栏先放前半部分，
-                // 余下在下一栏起接着续排（后面的 C、D 顺延）。先在当前栏算好能放
-                // 多少原子（与 placeAtom 的判定一致），避免放一半再回滚。
+                // 内容放不下但前面有文字可拆 → 截断跨栏续排：当前栏先放前半部分，
+                // 余下（含图片）在下一栏起接着续排。先在当前栏算好能放多少原子
+                // （与 placeAtom 的判定一致），避免放一半再回滚。
                 int total = PAD_TOP;
                 int fai = 0;
                 for (; fai < fats.size(); ++fai) {
@@ -1117,34 +1049,31 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     if (total > freeSpace())
                         break;
                 }
-                // 续排起点必须是文本行或引用作者头（QHead 自带左侧引用条），才接
-                // 得出无上边框的续排卡；头部/统计/按钮行开头接续排卡不成样子 →
-                // 放弃这张卡，继续向后找。
-                if (fai == 0
-                        || (fats[fai].kind != Op::Line
-                            && fats[fai].kind != Op::QLine
-                            && fats[fai].kind != Op::QHead)) {
+                // 续排起点必须能自然衔接：文本行/引用头，或图片（图片原子不可拆，
+                // 整张续排）；且当前栏要放进该卡前面的文字（不是只有头部就断）。
+                // 头部/统计/按钮行开头接续排卡不成样子 → 放弃这张卡，继续向后找。
+                // 关键：截断续排会把"前半文字留本栏、后半(含图)去下一栏"，若前半
+                // 填不满本栏空白，会留下一块再也无法填补的空洞 → 宁可跳过这张卡，
+                // 让其他能整卡/基本填满的候选来补，或者留作普通栏底空白。
+                bool textPlaced = false;
+                for (int k = 0; k < fai; ++k)
+                    if (fats[k].kind == Op::Line || fats[k].kind == Op::QLine) {
+                        textPlaced = true;
+                        break;
+                    }
+                const int hole = freeSpace() - (total - fats[fai].h);
+                if (fai == 0 || !textPlaced || !opCanContinue(fats[fai].kind)
+                        || hole >= FILL_MIN_H) {
                     chunkWasSplit = savedSplit;
-                    gapFailReason = QString("候选 #%1 需 %2px > 空白 %3px，续排起点(%4)不合法，跳过")
-                                        .arg(fi).arg(contentNeed).arg(freeSpace())
-                                        .arg(opKindName(fats[fai].kind));
-                    gapTrace << QString("候选 #%1 需 %2px > 空白 %3px，但首个续排原子为 %4，不能续排，跳过")
-                                    .arg(fi).arg(contentNeed).arg(freeSpace())
-                                    .arg(opKindName(fats[fai].kind));
                     continue;
                 }
-                gapFailReason = QString("截断补位 #%1 前半已放入当前栏").arg(fi);
-                gapTrace << QString("候选 #%1 需 %2px > 空白 %3px → 截断跨栏（前半填本栏 %4px，后半续排下一栏）")
-                                .arg(fi).arg(contentNeed).arg(blankBefore).arg(total);
                 for (int k = 0; k < fai; ++k)
                     placeAtom(fats[k], fi);
                 close();    // 前半标 hasCont，置 chunkWasSplit
-                closeCol(QString("截断补位卡 #%1 前半已填满本栏，后半在下一栏续排").arg(fi));
                 jump();     // 到下一栏，续排后半
                 while (fai < fats.size()) {
                     if (!placeAtom(fats[fai], fi)) {
                         close();
-                        closeCol(QString("补位卡 #%1 续排，本栏已放满").arg(fi));
                         jump();
                         continue;
                     }
@@ -1157,15 +1086,6 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 chunkWasSplit = savedSplit;
                 advanced = true;
                 break;      // 空白已由前半截断卡占满，无需再扫
-            }
-            if (!advanced) {
-                if (placedWhole)
-                    gapFailReason = "已连续补位多卡，扫描范围内后续候选无适合再补的";
-                else if (gapFailReason.isEmpty())
-                    gapFailReason = anyCandidate
-                                        ? "扫描范围内无适合补位的卡"
-                                        : QString("扫描 %1 条内无候选补位卡").arg(FILL_SCAN);
-                gapTrace << gapFailReason;
             }
             return advanced;
         };
@@ -1185,21 +1105,29 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
 
         while (ai < atoms.size()) {
             if (!placeAtom(atoms[ai], ti)) {
-                // 放不下的是哪个原子（诊断空白原因用）
-                const int needExtra = (chunkIdx >= 0) ? 0 : openContNeeded();
-                const QString placeReason =
-                    QString("原子 #%1(%2) 需 %3px(含间距%4) > 剩余 %5px")
-                        .arg(ai)
-                        .arg(opKindName(atoms[ai].kind))
-                        .arg(atoms[ai].h + needExtra)
-                        .arg(needExtra)
-                        .arg(freeSpace());
                 // 一个帖已排了部分内容、剩余放不下时：
-                // · 整帖能放进一栏 → 撤销已排、把整帖整体后移到下一栏，空白由
-                //   后续纯文本帖提前补位（绝不把别的帖插进同一个帖的两段之间）；
-                // · 帖子本身超出一栏（必须续排）→ 拆分处的空白不补位，
-                //   同样避免别的帖出现在该帖中间。
-                if (ai > 0 && !tweetMoved && tweetFitsFresh()) {
+                // · 只有当已排文字把本栏几乎填满（剩余 < FILL_MIN_H，不会留下大片
+                //   无法填补的空洞）且续排起点合理（文本行/引用头/图片开头）时，
+                //   才让当前帖文字留本栏、剩余（含图片）整张在下一栏续排；
+                // · 否则撤销已排、整帖后移到下一栏，本栏空白由后续帖补位填满——
+                //   避免"文字在左栏、图片在右栏"造成左栏一大块再也填不上的空白。
+                // · 帖子本身超出一栏（必须续排）→ 拆分处的空白不补位。
+                bool splitSelf = false;
+                if (ai > 0 && !tweetMoved && opCanContinue(atoms[ai].kind)
+                        && freeSpace() < FILL_MIN_H) {
+                    bool textPlaced = false;
+                    for (int k = 0; k < ai; ++k)
+                        if (atoms[k].kind == Op::Line || atoms[k].kind == Op::QLine) {
+                            textPlaced = true;
+                            break;
+                        }
+                    splitSelf = textPlaced;
+                }
+                if (ai > 0 && !tweetMoved && splitSelf) {
+                    close();
+                    jump();
+                    tweetMoved = true;   // 已拆分：后续放不下直接续排，不再整帖回滚
+                } else if (ai > 0 && !tweetMoved && tweetFitsFresh()) {
                     if (chunkIdx >= 0) {
                         pages[p].chunks.removeLast();
                         chunkIdx = -1;
@@ -1208,28 +1136,18 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                     y = tweetY0;
                     chunkWasSplit = false;
                     tweetMoved = true;
-                    if (!tryFillGap(ti)) {
-                        closeCol(gapFailReason.isEmpty()
-                                     ? placeReason
-                                     : placeReason + "；" + gapFailReason);
+                    if (!tryFillGap(ti))
                         jump();
-                    }
                     ai = 0;
                     continue;
-                }
-                close();
-                if (ai == 0) {
-                    if (!tryFillGap(ti)) {
-                        closeCol(gapFailReason.isEmpty()
-                                     ? placeReason
-                                     : placeReason + "；" + gapFailReason);
+                } else {
+                    close();
+                    if (ai == 0) {
+                        if (!tryFillGap(ti))
+                            jump();
+                    } else {
                         jump();
                     }
-                } else {
-                    closeCol(QStringLiteral("当前帖 #%1 内容超出一栏，拆分续排；"
-                                            "拆分处不补位（避免别的帖插入该帖两段之间）")
-                                 .arg(ti));
-                    jump();
                 }
             } else {
                 ++ai;
@@ -1240,55 +1158,11 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
         if (chunkIdx >= 0 && y + pad <= BOTTOM_Y)
             grow(pad);
     }
-    closeCol("feed 已到头");
 
     QVector<RenderPage> out;
     for (RenderPage &pg : pages)
         if (!pg.chunks.isEmpty())
             out.append(pg);
-
-    // ---- 分栏留白诊断日志：每页每栏记录空白大小与未填充原因 ----
-    {
-        int lastPg = -1;
-        for (int pi = 0; pi < pages.size(); ++pi)
-            if (!pages.at(pi).chunks.isEmpty())
-                lastPg = pi;
-        if (lastPg >= 0) {
-            QStringList log;
-            log << QString("===== paginate: feed=%1 帖 → %2 页 =====")
-                       .arg(feed.size())
-                       .arg(out.size());
-            for (int pi = 0; pi <= lastPg; ++pi) {
-                const RenderPage &pg = pages.at(pi);
-                for (int c = 0; c < 2; ++c) {
-                    const int cx = MARGIN + c * (COL_W + COL_GUTTER);
-                    int bottom = TOP_Y;
-                    int nchunk = 0;
-                    for (const RenderChunk &ch : pg.chunks) {
-                        if (ch.rect.x() == cx) {
-                            bottom = qMax(bottom, ch.rect.y() + ch.rect.height());
-                            ++nchunk;
-                        }
-                    }
-                    const int blank = BOTTOM_Y - bottom;
-                    const QString key = QString("%1:%2").arg(pi).arg(c);
-                    QString reason = colReason.value(key);
-                    if (reason.isEmpty()) {
-                        reason = (nchunk == 0) ? "本栏无内容（feed 到头）"
-                                               : "本栏已填满";
-                    }
-                    log << QString("页%1 栏%2(%3卡): 内容底 y=%4, 空白 %5px | %6")
-                               .arg(pi + 1).arg(c).arg(nchunk).arg(bottom)
-                               .arg(blank).arg(reason);
-                    const QStringList tr = colTrace.value(key);
-                    for (const QString &t : tr)
-                        log << QString("  ├ 补位扫描: %1").arg(t);
-                }
-            }
-            for (const QString &l : log)
-                logLayoutLine(l);
-        }
-    }
     return out;
 }
 

@@ -1276,19 +1276,25 @@ QImage Renderer::renderFavorite(const QVector<XTweet> &feed,
             atomCount += c.ops.size();
         }
     }
-    if (locs.isEmpty())
+    if (locs.isEmpty()) {
+        qWarning() << "xr:fav renderFavorite: no chunks for tweet"
+                   << tweetIndex;
         return {};
+    }
 
     // 收藏图永远只画一张卡片：把帖子的原子在单栏里连续排成一块
     // （与分页同一套 atom.h，只是不再拆栏/拆页）。页面里跨栏/跨页的
     // 拆分块此时按阅读顺序自然首尾相接成一体，不再各自带边框。
     const QVector<Atom> atoms = buildAtoms(feed, tweetIndex);
-    if (atoms.isEmpty())
+    if (atoms.isEmpty()) {
+        qWarning() << "xr:fav renderFavorite: no atoms for tweet"
+                   << tweetIndex;
         return {};
+    }
     if (atomCount != atoms.size()) {
         // 防御：feed 与排版不一致（正常流程不可达），不渲染以免错位
-        qWarning() << "renderFavorite: atom count mismatch" << atomCount
-                   << atoms.size();
+        qWarning() << "xr:fav renderFavorite: atom count mismatch"
+                   << atomCount << atoms.size();
         return {};
     }
 

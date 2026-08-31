@@ -126,18 +126,23 @@ Window {
         id: gest
         anchors.fill: parent
         property point pressPt
-        property int pressMs: 0
+        property real pressMs: 0   // Date.now() 是 64 位毫秒，int(32 位)会截断导致 dur 恒为天文数字
         property bool armed: false
         onPressed: (mouse) => {
             idleTimer.restart()
             // 新的手指按下 = 后续操作：先取消待确认的 tap
             root.cancelTap()
             // 手写笔在用/最近写过字：手指触摸一律不算手势
-            if (root.penBusy())
+            if (root.penBusy()) {
+                pageStore.dbg("xr:tap gest press BLOCKED pen="
+                    + stylusObj.penActive + " idleMs="
+                    + Math.round(stylusObj.penIdleMs()))
                 return
+            }
             armed = true
             pressPt = Qt.point(mouse.x, mouse.y)
             pressMs = Date.now()
+            pageStore.dbg("xr:tap gest press @" + mouse.x + "," + mouse.y)
         }
         onReleased: (mouse) => {
             idleTimer.restart()
@@ -145,8 +150,12 @@ Window {
                 return
             armed = false
             // 抬起时也要复查：手掌落屏后笔可能已开始写，此时抬手不得触发任何手势
-            if (root.penBusy())
+            if (root.penBusy()) {
+                pageStore.dbg("xr:tap gest release BLOCKED pen="
+                    + stylusObj.penActive + " idleMs="
+                    + Math.round(stylusObj.penIdleMs()))
                 return
+            }
             const dx = mouse.x - pressPt.x
             const dy = mouse.y - pressPt.y
             const adx = Math.abs(dx)
@@ -154,14 +163,25 @@ Window {
             if (adx < 90 && ady < 90) {
                 // 小位移区：短按且位移 <=24px 才算干净 tap（arm 进确认窗口）；
                 // 按太久 = 手掌托屏，24<位移<90 = 不确定，都不算
-                if (Date.now() - pressMs <= root.palmDwellMs
-                        && Math.sqrt(dx * dx + dy * dy) <= 24)
+                const dist = Math.sqrt(dx * dx + dy * dy)
+                const dur = Date.now() - pressMs
+                if (dur <= root.palmDwellMs && dist <= 24) {
                     root.armTap(mouse.x, mouse.y)
+                } else {
+                    pageStore.dbg("xr:tap gest release @" + mouse.x + ","
+                        + mouse.y + " rejected dist=" + Math.round(dist)
+                        + " dur=" + dur + "ms")
+                }
                 return
             }
             // 有效距离 + 主方向水平，移动一点点不算
-            if (adx < 90 || adx <= ady)
+            if (adx < 90 || adx <= ady) {
+                pageStore.dbg("xr:tap gest release ignored dx=" + dx
+                    + " dy=" + dy + " (not a swipe)")
                 return
+            }
+            pageStore.dbg("xr:tap swipe dx=" + dx + " dy=" + dy
+                + (dx < 0 ? " -> next" : " -> prev"))
             dx < 0 ? pageStore.next() : pageStore.prev()
         }
     }
@@ -181,6 +201,7 @@ Window {
             root.pendingTapX = -1
             if (x < 0)
                 return
+            pageStore.dbg("xr:tap confirm @" + x + "," + y)
             root.doTap(x, y)
         }
     }
@@ -188,8 +209,12 @@ Window {
         root.pendingTapX = x
         root.pendingTapY = y
         tapConfirm.restart()
+        pageStore.dbg("xr:tap arm @" + x + "," + y + " (1s window)")
     }
     function cancelTap() {
+        if (root.pendingTapX < 0)
+            return
+        pageStore.dbg("xr:tap cancel (new press/pen before confirm)")
         root.pendingTapX = -1
         tapConfirm.stop()
     }
@@ -199,16 +224,27 @@ Window {
     function doTap(x, y) {
         if (calib.visible || sleepOverlay.visible || fullscreen.visible
                 || textFs.visible || pageStore.loading
-                || pageStore.error.length > 0)
+                || pageStore.error.length > 0) {
+            pageStore.dbg("xr:tap doTap BLOCKED calib=" + calib.visible
+                + " sleep=" + sleepOverlay.visible + " fs=" + fullscreen.visible
+                + " textFs=" + textFs.visible + " loading=" + pageStore.loading
+                + " error=" + (pageStore.error.length > 0))
             return
+        }
         const idx = pageStore.hitSlot(x, y)
         if (idx >= 0) {
+            pageStore.dbg("xr:tap doTap @" + x + "," + y + " -> slot " + idx)
             fullscreen.open(idx)
             return
         }
         const tid = pageStore.hitCardFullText(x, y)
-        if (tid.length > 0)
+        if (tid.length > 0) {
+            pageStore.dbg("xr:tap doTap @" + x + "," + y
+                + " -> fullText tid=" + tid)
             textFs.open(tid)
+            return
+        }
+        pageStore.dbg("xr:tap doTap @" + x + "," + y + " -> MISS (no slot/card)")
     }
 
     Text {
@@ -520,7 +556,7 @@ Window {
     }
     MouseArea {
         property point p0
-        property int pressMs: 0
+        property real pressMs: 0   // Date.now() 是 64 位毫秒，int(32 位)会截断导致 dur 恒为天文数字
         property bool armed: false
         x: 0
         y: 0
@@ -530,19 +566,28 @@ Window {
         onPressed: (m) => {
             idleTimer.restart()
             root.cancelTap()
-            if (root.penBusy())
+            if (root.penBusy()) {
+                pageStore.dbg("xr:tap edge-top press BLOCKED pen="
+                    + stylusObj.penActive + " idleMs="
+                    + Math.round(stylusObj.penIdleMs()))
                 return
+            }
             armed = true
             p0 = Qt.point(m.x, m.y)
             pressMs = Date.now()
+            pageStore.dbg("xr:tap edge-top press @" + m.x + "," + m.y)
         }
         onReleased: (m) => {
             idleTimer.restart()
             if (!armed)
                 return
             armed = false
-            if (root.penBusy())
+            if (root.penBusy()) {
+                pageStore.dbg("xr:tap edge-top release BLOCKED pen="
+                    + stylusObj.penActive + " idleMs="
+                    + Math.round(stylusObj.penIdleMs()))
                 return
+            }
             const dx = m.x - p0.x
             const dy = m.y - p0.y
             const adx = Math.abs(dx)
@@ -550,19 +595,27 @@ Window {
             if (adx < 90 && ady < 90) {
                 // 小位移：短按且位移 <=24px 才算干净 tap（本条贴顶，
                 // 局部坐标即全屏坐标）
-                if (Date.now() - pressMs <= root.palmDwellMs
-                        && Math.sqrt(dx * dx + dy * dy) <= 24)
+                const dist = Math.sqrt(dx * dx + dy * dy)
+                const dur = Date.now() - pressMs
+                if (dur <= root.palmDwellMs && dist <= 24) {
+                    pageStore.dbg("xr:tap edge-top tap @" + m.x + "," + m.y)
                     root.armTap(m.x, m.y)
+                } else {
+                    pageStore.dbg("xr:tap edge-top release @" + m.x + ","
+                        + m.y + " rejected dist=" + Math.round(dist)
+                        + " dur=" + dur + "ms")
+                }
                 return
             }
             if (dy < 90 || dy <= adx)
                 return
+            pageStore.dbg("xr:tap edge-top swipe down -> quit")
             pageStore.quit()
         }
     }
     MouseArea {
         property point p1
-        property int pressMs: 0
+        property real pressMs: 0   // Date.now() 是 64 位毫秒，int(32 位)会截断导致 dur 恒为天文数字
         property bool armed: false
         x: 0
         y: parent.height - 140
@@ -572,19 +625,28 @@ Window {
         onPressed: (m) => {
             idleTimer.restart()
             root.cancelTap()
-            if (root.penBusy())
+            if (root.penBusy()) {
+                pageStore.dbg("xr:tap edge-bottom press BLOCKED pen="
+                    + stylusObj.penActive + " idleMs="
+                    + Math.round(stylusObj.penIdleMs()))
                 return
+            }
             armed = true
             p1 = Qt.point(m.x, m.y)
             pressMs = Date.now()
+            pageStore.dbg("xr:tap edge-bottom press @" + m.x + "," + m.y)
         }
         onReleased: (m) => {
             idleTimer.restart()
             if (!armed)
                 return
             armed = false
-            if (root.penBusy())
+            if (root.penBusy()) {
+                pageStore.dbg("xr:tap edge-bottom release BLOCKED pen="
+                    + stylusObj.penActive + " idleMs="
+                    + Math.round(stylusObj.penIdleMs()))
                 return
+            }
             const dx = m.x - p1.x
             const dy = p1.y - m.y          // 手势方向（向上）为正
             const adx = Math.abs(dx)
@@ -592,15 +654,23 @@ Window {
             if (adx < 90 && ady < 90) {
                 // 小位移：短按且位移 <=24px 才算干净 tap（本条贴底，
                 // 需 mapToItem 换算成全屏坐标）
-                if (Date.now() - pressMs <= root.palmDwellMs
-                        && Math.sqrt(dx * dx + dy * dy) <= 24) {
+                const dist = Math.sqrt(dx * dx + dy * dy)
+                const dur = Date.now() - pressMs
+                if (dur <= root.palmDwellMs && dist <= 24) {
                     const p = mapToItem(root, Qt.point(m.x, m.y))
+                    pageStore.dbg("xr:tap edge-bottom tap @" + p.x + ","
+                        + p.y)
                     root.armTap(p.x, p.y)
+                } else {
+                    pageStore.dbg("xr:tap edge-bottom release @" + m.x + ","
+                        + m.y + " rejected dist=" + Math.round(dist)
+                        + " dur=" + dur + "ms")
                 }
                 return
             }
             if (dy < 90 || dy <= adx)
                 return
+            pageStore.dbg("xr:tap edge-bottom swipe up -> refresh")
             pageStore.refresh()
         }
     }

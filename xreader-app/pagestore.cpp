@@ -13,6 +13,7 @@
 #include <QLibraryInfo>
 #include <QProcess>
 #include <QQuickWindow>
+#include <QTextStream>
 #include <QTimer>
 
 #include <algorithm>
@@ -90,6 +91,23 @@ void PageStore::configure(const QString &baseDir)
 
 void PageStore::setInk(InkItem *ink) { m_ink = ink; }
 void PageStore::setWindow(QQuickWindow *window) { m_window = window; }
+
+// 设备端调试日志：追加写 baseDir/xrdebug.log（超限截断，防无限增长）。
+// 手势(tap)与收藏(ink/fav)的关键判定点都经此落盘，实机复现后 cat 即可定位。
+void PageStore::dbg(const QString &msg)
+{
+    QFile f(m_baseDir + "/xrdebug.log");
+    if (f.size() > 512 * 1024) {
+        if (f.open(QIODevice::WriteOnly))
+            f.close();
+    }
+    if (!f.open(QIODevice::Append))
+        return;
+    QTextStream ts(&f);
+    ts << '[' << QDateTime::currentDateTime().toString("HH:mm:ss.zzz")
+       << "] " << msg << "\n";
+    f.close();
+}
 
 void PageStore::setStatus(const QString &s)
 {
@@ -727,8 +745,10 @@ void PageStore::saveInkNow()
     remarkxSetCtx("saveInkNow");
     if (!m_ink || !m_ink->hasInk())
         return;
-    if (!m_ink->hasInkPixels())
+    if (!m_ink->hasInkPixels()) {
+        dbg("xr:fav saveInk skip: ink layer has no pixels (erase only)");
         return;   // 只有擦除痕迹，没有实际墨迹，不收藏
+    }
     // 页面笔迹层编号：一页一个（翻页回来恢复笔迹）
     QString pageNum = m_currentNumber;
     if (pageNum.isEmpty())
@@ -741,17 +761,32 @@ void PageStore::saveInkNow()
     m_currentNumber = pageNum;
     const QString base = m_bookDir + "/" + pageNum;
     // 笔迹层落盘（翻页回来恢复）
-    if (!m_ink->saveDraw(base + ".draw.png"))
+    if (!m_ink->saveDraw(base + ".draw.png")) {
+        dbg("xr:fav saveInk FAIL saveDraw " + base + ".draw.png");
         return;
+    }
 
     // 按笔迹像素命中的帖子逐帖收藏：每帖一个独立编号，一页可收藏多条帖子。
     // 一笔划过多个帖子块（起笔跨卡/跨栏）时就收藏多次，不再一页只收一条。
     QVector<int> tis;
     hitTweets(&m_ink->inkImage(), &tis);
+    {
+        QStringList ids;
+        for (int i = 0; i < tis.size(); ++i) {
+            const int ti = tis.at(i);
+            ids << (ti >= 0 && ti < m_feed.size() ? m_feed.at(ti).id
+                                                  : QStringLiteral("?"));
+        }
+        dbg("xr:fav saveInk page=" + QString::number(m_feedPage)
+            + " num=" + pageNum + " hits=[" + ids.join(",") + "]");
+    }
     if (tis.isEmpty()) {
         // 写到卡片外空白：兜底取最近块，保证总有归属
         const QPoint start = m_ink->inkStart();
         const int ti = hitTweetIndex(start.x(), start.y());
+        dbg("xr:fav saveInk no chunk hit, fallback nearest="
+            + QString::number(ti) + " start=" + QString::number(start.x())
+            + "," + QString::number(start.y()));
         if (ti >= 0)
             tis.append(ti);
     }
@@ -765,11 +800,15 @@ void PageStore::saveInkNow()
             continue;
         done.insert(t.id);
         // 已成功推送过的帖子：不再收藏、不再发送（防翻页/刷新后重复）
-        if (m_sentMids.contains(t.id))
+        if (m_sentMids.contains(t.id)) {
+            dbg("xr:fav skip tid=" + t.id + " (already sent)");
             continue;
+        }
         bool fresh = false;
         const QString number = upsertFav(t, pageNum, &fresh);
         updateFavImage(number, t.id);
+        dbg("xr:fav tid=" + t.id + " fresh=" + (fresh ? "1" : "0")
+            + " number=" + number);
         if (fresh)
             m_telegram->enqueue(number, t.id, t.url);
     }
@@ -878,8 +917,12 @@ void PageStore::updateFavImage(const QString &number, const QString &tweetId)
         ink.load(m_bookDir + "/" + pageNum + ".draw.png");
     const QImage post = m_renderer->renderFavorite(m_feed, m_pages, ti,
                                                    inkPage, ink);
-    if (!post.isNull())
+    if (!post.isNull()) {
         post.save(m_bookDir + "/" + number + ".png", "PNG", 30);
+    } else {
+        dbg("xr:fav renderFavorite NULL number=" + number + " tid="
+            + tweetId + " inkPage=" + QString::number(inkPage));
+    }
 }
 
 // Telegram 推送成功：记录该帖子 mid（此后不再收藏/发送），
@@ -917,6 +960,10 @@ void PageStore::hitTweets(const QImage *ink, QVector<int> *out)
     syncFeed();
     QSet<int> seen;
     const RenderPage &pg = m_pages.at(m_feedPage);
+    auto rectStr = [](const QRect &r) {
+        return QString("%1,%2,%3x%4")
+                   .arg(r.x()).arg(r.y()).arg(r.width()).arg(r.height());
+    };
     for (const RenderChunk &c : pg.chunks) {
         if (c.tweetIndex < 0 || c.tweetIndex >= m_feed.size())
             continue;
@@ -924,8 +971,11 @@ void PageStore::hitTweets(const QImage *ink, QVector<int> *out)
             continue;
         const QRect r = c.rect.intersected(
             QRect(0, 0, ink->width(), ink->height()));
-        if (r.isEmpty())
+        if (r.isEmpty()) {
+            dbg("xr:fav chunk tw=" + QString::number(c.tweetIndex)
+                + " rect=" + rectStr(c.rect) + " miss (no overlap)");
             continue;
+        }
         bool hasInk = false;
         for (int y = r.top(); y <= r.bottom(); ++y) {
             const QRgb *line =
@@ -939,8 +989,13 @@ void PageStore::hitTweets(const QImage *ink, QVector<int> *out)
             if (hasInk)
                 break;
         }
-        if (!hasInk)
+        if (!hasInk) {
+            dbg("xr:fav chunk tw=" + QString::number(c.tweetIndex)
+                + " rect=" + rectStr(c.rect) + " miss (no ink)");
             continue;
+        }
+        dbg("xr:fav chunk tw=" + QString::number(c.tweetIndex)
+            + " rect=" + rectStr(c.rect) + " HIT");
         seen.insert(c.tweetIndex);
         out->append(c.tweetIndex);
     }

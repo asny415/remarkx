@@ -89,6 +89,8 @@ public slots:
     Q_INVOKABLE int fullTextPages(const QString &tweetId);
     // 槽位对应媒体的全部本地文件（全屏分页浏览；未下载完的条目为空）
     Q_INVOKABLE QStringList slotFiles(int slotIndex);
+    // 设备端调试日志（追加写 baseDir/xrdebug.log，超限截断）：手势/收藏问题定位
+    Q_INVOKABLE void dbg(const QString &msg);
     // 供 image://pages/text/... provider 渲染全文页（公开给 Provider 调用）
     QImage textPageImage(const QString &tweetId, int page);
 

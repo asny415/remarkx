@@ -142,16 +142,13 @@ Window {
             const dy = mouse.y - pressPt.y
             const adx = Math.abs(dx)
             const ady = Math.abs(dy)
-            // 手掌托屏：按压过长且位移未出 tap 区 → 忽略，不点开图片/全文
+            // 手掌托屏：按压过长且位移未出 tap 区 → 忽略
             if (Date.now() - pressMs > root.palmDwellMs && adx < 90 && ady < 90)
                 return
-            // 手指短点只开全屏看图；"显示全文"只由笔点按打开（见下方 penTap）
-            if (adx < 90 && ady < 90) {
-                var idx = pageStore.hitSlot(mouse.x, mouse.y)
-                if (idx >= 0)
-                    fullscreen.open(idx)
+            // 手指短点不再点开任何内容（图片/全文都改由笔点按打开，见 penTap）
+            // 手指只负责滑动手势
+            if (adx < 90 && ady < 90)
                 return
-            }
             // 有效距离 + 主方向水平，移动一点点不算
             if (adx < 90 || adx <= ady)
                 return
@@ -430,15 +427,23 @@ Window {
         function onPenMove(x, y, p) { idleTimer.restart() }
         function onEraserDown(x, y, p) { idleTimer.restart() }
         function onEraserMove(x, y, p) { idleTimer.restart() }
-        // 笔点（短按+微移）：精确命中"显示全文"按钮热区才打开全文；
-        // 没点到按钮的笔点/一切笔划照旧只是笔迹，不做任何点击
+        // 笔点（短按+微移）：命中图片槽位 → 全屏看图；命中"显示全文"按钮
+        // 热区 → 全屏看全文；都没命中的笔点/一切笔划照旧只是笔迹。
+        // 图片优先（与原手指路径一致，槽位在卡片内先于按钮热区判定）
         function onPenTap(x, y) {
             idleTimer.restart()
-            if (calib.visible)
+            // 校准/全屏看图/全屏全文期间笔点不触发（全屏里笔只写笔迹）
+            if (calib.visible || fullscreen.visible || textFs.visible)
                 return
+            var idx = pageStore.hitSlot(x, y)
+            if (idx >= 0) {
+                ink.eraseLastStroke()   // 抹掉笔点的墨点，图上不残留
+                fullscreen.open(idx)
+                return
+            }
             var tid = pageStore.hitFullText(x, y)
             if (tid.length > 0) {
-                ink.eraseLastStroke()   // 抹掉笔点的墨点，按钮上不残留
+                ink.eraseLastStroke()
                 textFs.open(tid)
             }
         }
@@ -656,7 +661,7 @@ Window {
         }
     }
 
-    // 全文全屏阅读：点卡片上"显示全文"按钮打开；左右滑在长文页间切换
+    // 全文全屏阅读：笔点按卡片上"显示全文"按钮打开；左右滑在长文页间切换
     Item {
         id: textFs
         visible: false

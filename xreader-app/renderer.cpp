@@ -7,6 +7,8 @@
 #include <QFile>
 #include <QFontDatabase>
 #include <QFontMetricsF>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPolygonF>
@@ -110,6 +112,43 @@ Renderer::Renderer(QObject *parent) : QObject(parent)
 void Renderer::configure(const QString &baseDir)
 {
     m_mediaDir = baseDir + "/media";
+    // config.json 可选字段 "timezone"：设备时区可能被设成 UTC，而用户希望按
+    // 自己时区显示帖子时间。支持 IANA 名称（如 "Asia/Shanghai"）或偏移
+    // （"+08:00" / "-5"）；未配置则退回设备本地时区。
+    QFile cf(baseDir + "/config.json");
+    if (cf.open(QIODevice::ReadOnly)) {
+        const QJsonObject o = QJsonDocument::fromJson(cf.readAll()).object();
+        const QString tzStr = o.value("timezone").toString().trimmed();
+        if (!tzStr.isEmpty()) {
+            if (tzStr.startsWith(QLatin1Char('+'))
+                    || tzStr.startsWith(QLatin1Char('-'))) {
+                int sign = 1;
+                QString t = tzStr;
+                if (t.startsWith(QLatin1Char('-'))) {
+                    sign = -1;
+                    t = t.mid(1);
+                } else if (t.startsWith(QLatin1Char('+'))) {
+                    t = t.mid(1);
+                }
+                int hh = 0, mm = 0;
+                const int colon = t.indexOf(QLatin1Char(':'));
+                if (colon > 0) {
+                    hh = t.left(colon).toInt();
+                    mm = t.mid(colon + 1).toInt();
+                } else {
+                    hh = t.toInt();
+                }
+                m_tz = QTimeZone::fromSecondsAheadOfUtc(sign * (hh * 3600
+                                                                + mm * 60));
+            } else {
+                m_tz = QTimeZone(tzStr.toUtf8());
+            }
+            if (m_tz.isValid())
+                qInfo() << "Renderer: timezone" << tzStr;
+            else
+                qWarning() << "Renderer: invalid timezone" << tzStr;
+        }
+    }
     const QStringList candidates = {
         baseDir + "/fonts/remarkx-cjk.ttf",
         baseDir + "/remarkx-cjk.ttf",
@@ -1431,16 +1470,23 @@ void Renderer::drawCardBorder(QPainter &p, int x, int y0, int y1, int w,
     }
 }
 
-QString Renderer::absTime(const QString &createdAt)
+QString Renderer::absTime(const QString &createdAt) const
 {
     QString s = createdAt;
     s.remove(QRegularExpression(QStringLiteral("\\+\\d{4} ")));
     QDateTime dt = QDateTime::fromString(s, QStringLiteral("ddd MMM d HH:mm:ss yyyy"));
+    if (!dt.isValid())
+        return {};
     dt.setTimeZone(QTimeZone::UTC);
-    const QDateTime local = dt.toLocalTime();
+    // 配置了 timezone 就按其显示，否则退回设备本地时区
+    const QDateTime local = m_tz.isValid() ? dt.toTimeZone(m_tz)
+                                           : dt.toLocalTime();
     if (!local.isValid())
-        return QString();
-    if (local.date().year() == QDate::currentDate().year())
+        return {};
+    const QDate today = m_tz.isValid()
+            ? QDateTime::currentDateTime().toTimeZone(m_tz).date()
+            : QDate::currentDate();
+    if (local.date().year() == today.year())
         return local.toString(QStringLiteral("MM-dd HH:mm"));
     return local.toString(QStringLiteral("yyyy-MM-dd HH:mm"));
 }

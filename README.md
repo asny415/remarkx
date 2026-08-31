@@ -184,6 +184,12 @@ cd remarkx
     --browser brave \
     --telegram-bot 123456789:AAF... \
     --telegram-chat 987654321       # 或 @频道名
+
+# 可选：帖子时间按指定时区显示（设备常被设成 UTC，会慢 8 小时）
+./deploy/install-remarkable.sh <设备IP> \
+    --proxy http://192.168.1.100:7890 \
+    --browser brave \
+    --timezone Asia/Shanghai       # 或 +08:00
 ```
 
 脚本选项：
@@ -194,6 +200,7 @@ cd remarkx
 | `--proxy` | X 直连用的代理（设备需能访问） |
 | `--cookie-file` | 直接提供 X Cookie JSON（`{auth_token, ct0, ...}`） |
 | `--browser` | 从 PC 浏览器自动提取（逗号分隔多个，任一成功即可） |
+| `--timezone` | 帖子时间显示时区：IANA 名（`Asia/Shanghai`）或偏移（`+08:00`）；缺省用设备本地时区 |
 | `--telegram-bot` | Telegram Bot Token（可选，收藏推送） |
 | `--telegram-chat` | 目标 chat id / 频道名（可选，与 bot 配套） |
 
@@ -219,6 +226,7 @@ favs.json / pending.json  收藏索引 / Telegram 待发队列
 {
   "proxy": "http://192.168.1.100:7890",
   "cookies": "/home/root/xreader/cookies.json",
+  "timezone": "Asia/Shanghai",
   "telegram_bot": "123456789:AAF...",
   "telegram_chat": "987654321"
 }
@@ -228,6 +236,7 @@ favs.json / pending.json  收藏索引 / Telegram 待发队列
 | --- | --- |
 | `proxy` | X 直连代理；无协议头时自动补 `http://`，支持 `socks5` |
 | `cookies` | X 登录态 Cookie 路径（通常无需修改） |
+| `timezone` | 帖子时间显示时区：IANA 名（`Asia/Shanghai`）或偏移（`+08:00`）；缺省用设备本地时区。设备默认设成 UTC，帖子时间会慢 8 小时 |
 | `telegram_bot` | Telegram Bot Token（不配置则纯本地收藏） |
 | `telegram_chat` | 目标聊天：数字 id（个人/群组 `-100...`）或 `@频道名` |
 

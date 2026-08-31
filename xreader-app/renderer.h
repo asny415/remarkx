@@ -8,6 +8,7 @@
 #include <QPair>
 #include <QRect>
 #include <QStringList>
+#include <QTimeZone>
 #include <QVector>
 
 #include "xclient.h"
@@ -169,12 +170,14 @@ private:
     void drawPlaceholder(QPainter &p, int ix, int py, int dw, int dh) const;
     void drawStats(QPainter &p, const Op &op, const RenderChunk &chunk) const;
     QImage avatar(const XTweet &t) const;
-    static QString absTime(const QString &createdAt);
+    // 帖子时间显示：按 config.json "timezone"（未配置则设备本地时区）换算
+    QString absTime(const QString &createdAt) const;
     static QString fmtCount(int n);
 
     QString m_fontPath;
     QString m_mediaDir;
     QString m_family;
+    QTimeZone m_tz;                        // config.json "timezone"，空=设备本地
     mutable QHash<QPair<int, bool>, QFont> m_fonts;
     mutable QHash<QString, QImage> m_avatarCache;
     mutable QHash<QString, QImage> m_photoCache;

@@ -6,12 +6,15 @@
 # 用法：
 #   ./install-remarkable.sh <设备IP> [--proxy http://PC:7890] \
 #       [--cookie-file /path/cookies.json | --browser brave,chromium] \
+#       [--timezone Asia/Shanghai] \
 #       [--telegram-bot BOT_TOKEN] [--telegram-chat CHAT_ID]
 #
 #   设备IP      reMarkable 的局域网 IP（需已开启开发者模式/SSH）
 #   --proxy     X 直连用的代理（须设备能访问，如家里 PC 的 Clash/V2Ray）
 #   --cookie-file  直接提供 X Cookie JSON（{auth_token,ct0,...}）
 #   --browser      从 PC 浏览器自动提取（逗号分隔多个，任一成功即可）
+#   --timezone  帖子时间显示时区：IANA 名（如 Asia/Shanghai）或偏移（+08:00）；
+#               缺省不写，app 用设备本地时区（设备常被设成 UTC）
 #   --telegram-bot Telegram Bot Token（可选：笔迹收藏推送）
 #   --telegram-chat 目标 chat id / 频道名（可选：与 bot 配套）
 #   都不给时：交互式询问代理，并尝试从浏览器提取 Cookie
@@ -37,6 +40,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROXY=""
 COOKIE_FILE=""
 BROWSERS=""
+TIMEZONE=""
 TG_BOT=""
 TG_CHAT=""
 
@@ -45,6 +49,7 @@ while [ "$#" -gt 0 ]; do
         --proxy) PROXY="${2:-}"; shift 2 ;;
         --cookie-file) COOKIE_FILE="${2:-}"; shift 2 ;;
         --browser) BROWSERS="${2:-}"; shift 2 ;;
+        --timezone) TIMEZONE="${2:-}"; shift 2 ;;
         --telegram-bot) TG_BOT="${2:-}"; shift 2 ;;
         --telegram-chat) TG_CHAT="${2:-}"; shift 2 ;;
         *) echo "未知参数: $1"; exit 2 ;;
@@ -187,6 +192,9 @@ fi
     printf '{\n'
     printf '  "proxy": "%s",\n' "$PROXY"
     printf '  "cookies": "/home/root/xreader/cookies.json"'
+    if [ -n "$TIMEZONE" ]; then
+        printf ',\n  "timezone": "%s"' "$TIMEZONE"
+    fi
     if [ -n "$TG_BOT" ] || [ -n "$TG_CHAT" ]; then
         printf ',\n  "telegram_bot": "%s",\n  "telegram_chat": "%s"\n' \
             "${TG_BOT:-}" "${TG_CHAT:-}"
@@ -231,6 +239,7 @@ pgrep -x xochitl >/dev/null && echo "xochitl 运行中（原声界面正常）"'
 echo
 echo "安装完成。长按顶部中央 3 秒进入阅读器。"
 echo "代理: ${PROXY:-<未配置>}；Cookie 已部署到 /home/root/xreader/cookies.json"
+echo "时区: ${TIMEZONE:-<设备本地时区>}（帖子时间显示）"
 if [ -n "$TG_BOT" ] && [ -n "$TG_CHAT" ]; then
     echo "Telegram 收藏推送: 已配置"
 else

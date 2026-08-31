@@ -618,8 +618,9 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     head.tweetIndex = ti;
     atoms.append(head);
 
-    // 卡片显示 API 默认文本（译文或 full_text 预览），但统一限制行数
-    // （"不需要总是显示全文"，长文/长译文都截断）。
+    // 卡片显示 API 默认文本（译文或 full_text），一律限制行数
+    // （"不需要总是显示全文"：长文/长译文/异常超长文本都截断，
+    //  截断时挂"显示全文"按钮进全屏全文页，防止单条超长帖占满整本书）。
     // "显示全文"触发：卡片被行数截断，或（非译文时）显示的是长推文预览
     // （legacy.full_text）而完整文本在 note_tweet.text。
     bool needFullText = false;
@@ -628,9 +629,7 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
         if (!t.isRetweet) {
             const QString text = cleanText(t.text);
             if (!text.isEmpty()) {
-                // 译文没有"预览"字段（translation 永远是完整译文），只能截断；
-                // 非译文直接用 full_text（API 自带的长文预览），不再自行截断
-                const int maxLines = t.translated ? BODY_MAX_LINES : 100000;
+                const int maxLines = BODY_MAX_LINES;
                 bool truncated = false;
                 const QStringList lns = wrapText(font(30), text, TEXT_W,
                                                  maxLines, &truncated);
@@ -656,7 +655,7 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
         atoms.append(qh);
         const QString qtext = cleanText(t.quoted.text);
         if (!qtext.isEmpty()) {
-            const int qmax = t.quoted.translated ? QUOTED_MAX_LINES : 100000;
+            const int qmax = QUOTED_MAX_LINES;
             bool truncated = false;
             const QStringList lns = wrapText(font(26), qtext, TEXT_W - QIND,
                                              qmax, &truncated);
@@ -675,7 +674,7 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     } else {
         const QString text = cleanText(t.text);
         if (!text.isEmpty()) {
-            const int maxLines = t.translated ? BODY_MAX_LINES : 100000;
+            const int maxLines = BODY_MAX_LINES;
             bool truncated = false;
             const QStringList lns = wrapText(font(30), text, TEXT_W,
                                              maxLines, &truncated);

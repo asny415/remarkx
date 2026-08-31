@@ -196,6 +196,9 @@ QNetworkRequest XClient::apiRequest(const QString &op,
     req.setRawHeader("Accept", "*/*");
     req.setRawHeader("Referer", "https://x.com/");
     req.setRawHeader("Origin", "https://x.com");
+    // 传输超时：代理挂起/无数据时 30s 必触发 finished，
+    // 否则 m_fetching 永久卡死 → 之后所有刷新/续抓静默失效（只能退出）
+    req.setTransferTimeout(30000);
     return req;
 }
 
@@ -288,6 +291,8 @@ static QString replyErrorText(QNetworkReply *reply)
         return "无法解析主机——检查代理地址/DNS";
     case QNetworkReply::TimeoutError:
         return "连接超时——检查代理是否可达";
+    case QNetworkReply::OperationCanceledError:
+        return "请求超时，请重试";
     case QNetworkReply::SslHandshakeFailedError:
         return "TLS 握手失败——代理或网络拦截了连接";
     case QNetworkReply::ProxyConnectionClosedError:
@@ -1070,6 +1075,7 @@ void XClient::ensureMediaFor(QString tweetId)
         }
         QNetworkRequest req(QUrl(job.url));
         req.setHeader(QNetworkRequest::UserAgentHeader, QByteArray(kUA));
+        req.setTransferTimeout(60000);
         QNetworkReply *reply = m_mediaNam.get(req);
         connect(reply, &QNetworkReply::finished, this,
                 [this, reply, tweetId, job, done]() {

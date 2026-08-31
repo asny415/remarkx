@@ -110,28 +110,41 @@ Window {
     }
 
     // 全屏左右滑翻页（上下滑移交给顶部/底部边缘条，避免中间误触）
+    // 防误触：按下与抬起都要确认笔完全空闲（penActive 为假且距最后一次笔活动
+    // >=500ms），堵住"手掌先落屏、笔后开始写、手掌抬起时误触"的竞态；
+    // 按压过长且位移仍很小判定为手掌托屏，不作 tap。
+    property int gestureMinIdleMs: 500
+    property int palmDwellMs: 700
     MouseArea {
         id: gest
         anchors.fill: parent
         property point pressPt
+        property int pressMs: 0
         property bool armed: false
         onPressed: (mouse) => {
             idleTimer.restart()
-            // 手写笔触摸不算手势
-            if (stylusObj.penActive)
+            // 手写笔在用/最近写过字：手指触摸一律不算手势
+            if (root.penBusy())
                 return
             armed = true
             pressPt = Qt.point(mouse.x, mouse.y)
+            pressMs = Date.now()
         }
         onReleased: (mouse) => {
             idleTimer.restart()
             if (!armed)
                 return
             armed = false
+            // 抬起时也要复查：手掌落屏后笔可能已开始写，此时抬手不得触发任何手势
+            if (root.penBusy())
+                return
             const dx = mouse.x - pressPt.x
             const dy = mouse.y - pressPt.y
             const adx = Math.abs(dx)
             const ady = Math.abs(dy)
+            // 手掌托屏：按压过长且位移未出 tap 区 → 忽略，不点开图片/全文
+            if (Date.now() - pressMs > root.palmDwellMs && adx < 90 && ady < 90)
+                return
             // 手指短点：命中图片则打开全屏看图；命中带"显示全文"按钮的帖子任意处则全屏看全文
             if (adx < 90 && ady < 90) {
                 var idx = pageStore.hitSlot(mouse.x, mouse.y)
@@ -452,6 +465,10 @@ Window {
     // 置顶边缘手势：任何时候可用（含加载/错误/任意页面状态）
     // 顶部从上往下滑 → 退出；底部从下往上滑 → 刷新
     // 只认从边缘开始的、距离足够的、手指（非手写笔）的垂直滑动
+    // 防误触：按下与抬起都要求笔完全空闲，手掌/手指贴屏写字时不会触发
+    function penBusy() {
+        return stylusObj.penActive || stylusObj.penIdleMs() < root.gestureMinIdleMs
+    }
     MouseArea {
         property point p0
         property bool armed: false
@@ -462,7 +479,7 @@ Window {
         enabled: stylusObj.calibrated
         onPressed: (m) => {
             idleTimer.restart()
-            if (stylusObj.penActive)
+            if (root.penBusy())
                 return
             armed = true
             p0 = Qt.point(m.x, m.y)
@@ -472,6 +489,8 @@ Window {
             if (!armed)
                 return
             armed = false
+            if (root.penBusy())
+                return
             const ady = m.y - p0.y
             const adx = Math.abs(m.x - p0.x)
             if (ady < 90 || ady <= adx)
@@ -489,7 +508,7 @@ Window {
         enabled: stylusObj.calibrated
         onPressed: (m) => {
             idleTimer.restart()
-            if (stylusObj.penActive)
+            if (root.penBusy())
                 return
             armed = true
             p1 = Qt.point(m.x, m.y)
@@ -499,6 +518,8 @@ Window {
             if (!armed)
                 return
             armed = false
+            if (root.penBusy())
+                return
             const ady = p1.y - m.y
             const adx = Math.abs(m.x - p1.x)
             if (ady < 90 || ady <= adx)
@@ -603,6 +624,9 @@ Window {
             property bool armed: false
             onPressed: (m) => {
                 idleTimer.restart()
+                // 写笔记期间（手掌/手指贴屏）不得误关全屏图
+                if (root.penBusy())
+                    return
                 armed = true
                 p0 = Qt.point(m.x, m.y)
             }
@@ -610,6 +634,8 @@ Window {
                 if (!armed)
                     return
                 armed = false
+                if (root.penBusy())
+                    return
                 const dx = m.x - p0.x
                 const dy = m.y - p0.y
                 if (Math.abs(dx) < 60 && Math.abs(dy) < 60) {
@@ -699,6 +725,9 @@ Window {
             property bool armed: false
             onPressed: (m) => {
                 idleTimer.restart()
+                // 写笔记期间（手掌/手指贴屏）不得误关全屏全文
+                if (root.penBusy())
+                    return
                 armed = true
                 p0 = Qt.point(m.x, m.y)
             }
@@ -706,6 +735,8 @@ Window {
                 if (!armed)
                     return
                 armed = false
+                if (root.penBusy())
+                    return
                 const dx = m.x - p0.x
                 const dy = m.y - p0.y
                 if (Math.abs(dx) < 60 && Math.abs(dy) < 60) {

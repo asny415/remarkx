@@ -1,11 +1,10 @@
 #include "stylus.h"
 
 #include <QDebug>
+#include <QDateTime>
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QtGui/6.8.2/QtGui/qpa/qwindowsysteminterface.h>
-#include <QGuiApplication>
 #include <QElapsedTimer>
 #include <QTimer>
 #include <linux/input.h>
@@ -15,14 +14,12 @@
 static const int SCREEN_W = 1404;
 static const int SCREEN_H = 1872;
 
-static const qint64 TAP_MAX_MS = 400;
-static const qreal TAP_MAX_TRAVEL = 24.0;
-
 Stylus::Stylus(QObject *parent) : QObject(parent)
 {
+    m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
     // 笔/橡皮在有效范围内（悬停或按下）及刚离开后的一段时间内保持 penActive：
     // 手写时手掌可能碰到屏幕，这段时间内忽略手指手势。笔离开有效范围后再延时
-    // 1s 清除，避免刚停笔时手掌误触翻页。合成点击的鼠标事件也在此窗口内。
+    // 1s 清除，避免刚停笔时手掌误触翻页。
     m_tapTimer = new QTimer(this);
     m_tapTimer->setSingleShot(true);
     m_tapTimer->setInterval(1000);
@@ -101,22 +98,9 @@ QPointF Stylus::rawToScreen(qreal rx, qreal ry) const
     return QPointF(sx, sy);
 }
 
-void Stylus::synthesizeTap(int x, int y)
+qreal Stylus::penIdleMs() const
 {
-    QWindow *win = QGuiApplication::topLevelWindows().isEmpty()
-                        ? nullptr
-                        : QGuiApplication::topLevelWindows().first();
-    if (!win)
-        return;
-    const QPointF pos(x, y);
-    ulong ts = QDateTime::currentMSecsSinceEpoch() & 0xffffffffUL;
-    QWindowSystemInterface::handleMouseEvent(win, ts, pos, pos,
-                                             Qt::LeftButton, Qt::LeftButton,
-                                             QEvent::MouseButtonPress);
-    QWindowSystemInterface::handleMouseEvent(win, ts + 1, pos, pos,
-                                             Qt::NoButton, Qt::LeftButton,
-                                             QEvent::MouseButtonRelease);
-    qInfo() << "TAP synthesized" << x << y;
+    return qreal(QDateTime::currentMSecsSinceEpoch() - m_lastActivityMs);
 }
 
 // 笔/橡皮进入或离开有效范围。进入时立即保持 penActive（手带笔靠近屏幕、
@@ -124,6 +108,7 @@ void Stylus::synthesizeTap(int x, int y)
 // 留一小段保护窗口。
 void Stylus::onPenNear(bool near)
 {
+    m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
     qInfo() << (near ? "pen near" : "pen far");
     if (near) {
         m_tapTimer->stop();
@@ -144,9 +129,6 @@ void Stylus::setPenActive(bool active)
 void Stylus::touchPoint(bool eraser)
 {
     QPointF s = rawToScreen(m_lastX, m_lastY);
-    m_pressMs = QDateTime::currentMSecsSinceEpoch();
-    m_pressPt = s;
-    m_travel = 0;
     if (eraser)
         emit eraserDown(int(s.x()), int(s.y()), m_lastP);
     else
@@ -167,6 +149,7 @@ void Stylus::onData()
                 m_penNear = ev.value != 0;
                 onPenNear(m_penNear);
             } else if (ev.code == BTN_TOUCH) {
+                m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
                 if (ev.value) {
                     m_touching = true;
                     m_tapTimer->stop();
@@ -174,22 +157,8 @@ void Stylus::onData()
                 } else if (m_touching) {
                     m_touching = false;
                     m_started = false;
-                    const qint64 dur = QDateTime::currentMSecsSinceEpoch() - m_pressMs;
-                    qInfo() << "pen gesture: dur" << dur << "travel" << m_travel
-                            << "at" << m_pressPt;
-                    // 校准前禁用（防误触跳过按钮）；校准后短促笔点可点按钮
-                    if (!m_eraser && m_tapEnabled && m_calibrated
-                        && dur < TAP_MAX_MS && m_travel < TAP_MAX_TRAVEL) {
-                        synthesizeTap(int(m_pressPt.x()), int(m_pressPt.y()));
-                        // 笔抬起后若已离开有效范围，1s 窗口内忽略手指手势，
-                        // 覆盖合成鼠标事件的处理
-                        if (!m_penNear && !m_eraser)
-                            m_tapTimer->start();
-                        emit penUp();
-                        return;
-                    }
-                    // 笔抬起后仍保留 penActive（1s 窗口，或笔仍在有效范围则更久），
-                    // 忽略手掌误触
+                    // 笔/橡皮抬起后仍保留 penActive（1s 窗口，或笔仍在有效范围
+                    // 则更久），期间忽略手掌/手指误触
                     if (!m_penNear && !m_eraser)
                         m_tapTimer->start();
                     if (m_eraser)
@@ -206,13 +175,11 @@ void Stylus::onData()
             else if (ev.code == ABS_PRESSURE)
                 m_lastP = ev.value;
             if (m_touching && (ev.code == ABS_X || ev.code == ABS_Y)) {
+                m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
                 if (!m_started) {
                     touchPoint(m_eraser);
                 } else {
                     QPointF s = rawToScreen(m_lastX, m_lastY);
-                    m_travel += qSqrt(qPow(s.x() - m_pressPt.x(), 2)
-                                      + qPow(s.y() - m_pressPt.y(), 2));
-                    m_pressPt = s;
                     if (m_eraser)
                         emit eraserMove(int(s.x()), int(s.y()), m_lastP);
                     else

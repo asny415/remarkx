@@ -25,7 +25,9 @@ public:
     Q_INVOKABLE void loadCalib(const QString &file);
     Q_INVOKABLE void saveCalib(const QString &file) const;
     Q_INVOKABLE QPointF rawToScreen(qreal rx, qreal ry) const;
-    Q_PROPERTY(bool tapEnabled MEMBER m_tapEnabled CONSTANT)
+    // 距最后一次笔/橡皮活动（靠近/按下/移动/抬起）的毫秒数，用于 QML 判断
+    // "最近在写字"——手势只允许在笔完全空闲一段时间后才生效
+    Q_INVOKABLE qreal penIdleMs() const;
 
 signals:
     void calibChanged();
@@ -41,7 +43,6 @@ signals:
 private:
     void onData();
     void touchPoint(bool eraser);
-    void synthesizeTap(int x, int y);
     void onPenNear(bool near);
     void setPenActive(bool active);
 
@@ -57,8 +58,5 @@ private:
     qreal m_a = 0, m_b = 0.0893, m_c = 0;
     qreal m_d = 0.0893, m_e = 0, m_f = 0;
     bool m_calibrated = false;
-    bool m_tapEnabled = true;
-    qint64 m_pressMs = 0;
-    QPointF m_pressPt;
-    double m_travel = 0;
+    qint64 m_lastActivityMs = 0;
 };

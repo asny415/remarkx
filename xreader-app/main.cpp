@@ -136,9 +136,12 @@ int main(int argc, char *argv[])
     stylus.start();
     stylus.loadCalib(baseDir + "/calib.json");
 
-    // 手掌误触过滤：写笔记时把接触面积明显偏大的手掌触摸整段吞掉
+    // 手掌误触过滤：写笔记时把所有手指/手掌触摸整段吞掉；笔空闲时只吞接触
+    // 面积明显偏大的手掌。校准界面（未校准）期间不吞，保证"跳过"可点。
     TouchGuard *touchGuard =
-        new TouchGuard([&stylus]() { return stylus.penActive(); });
+        new TouchGuard([&stylus]() {
+            return stylus.penActive() && stylus.calibrated();
+        });
     app.installEventFilter(touchGuard);
 
     PowerKey powerKey;

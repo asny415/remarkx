@@ -5,7 +5,6 @@
 #include <QPainter>
 #include <QPen>
 #include <QTimer>
-#include <qmath.h>
 
 #include <dlfcn.h>
 
@@ -40,9 +39,6 @@ void *epaperLib()
 
 static const int SW = 1404;
 static const int SH = 1872;
-// 点状落笔判定阈值，与 stylus.cpp 的 TAP_MAX_TRAVEL 一致：累计位移小于它的
-// 落笔（笔点/搁笔）不算笔迹
-static const qreal TAP_MAX_TRAVEL = 24.0;
 
 InkItem::InkItem(QQuickItem *parent) : QQuickPaintedItem(parent)
 {
@@ -90,22 +86,6 @@ void InkItem::clear()
     emit hasInkChanged();
     clearPenBuffer();
     update();
-}
-
-void InkItem::eraseLastStroke()
-{
-    // 笔点打开全屏前抹掉 tap 墨点：只清该笔紧致包围盒，走框架 update 重绘
-    // （与橡皮擦同一条路径，不用 pen 快速通道），随后全屏 requestFullRefresh
-    // 会整体再刷一遍，无残影
-    const QRect r = m_lastStroke.intersected(m_img.rect());
-    m_lastStroke = QRect();
-    if (r.isNull())
-        return;
-    QPainter p(&m_img);
-    p.setCompositionMode(QPainter::CompositionMode_Clear);
-    p.fillRect(r, Qt::transparent);
-    p.end();
-    update(r);
 }
 
 void InkItem::loadBlank(int w, int h)
@@ -182,16 +162,9 @@ void InkItem::onPenMove(int x, int y, int pressure)
 void InkItem::onPenUp()
 {
     m_stroke = false;
-    if (m_travel < TAP_MAX_TRAVEL) {
-        // 点状落笔（笔点/搁笔，位移极小）不算笔迹：直接抹掉，否则误点或
-        // 搁笔留下的墨点会被 saveInkNow 判成"笔迹"而收藏帖子。走框架
-        // update 重绘（同橡皮擦路径）——pen 快速通道是叠加式，删不掉已
-        // 显示的墨点
-        m_pending = QRect();
-        eraseLastStroke();
-        return;
-    }
-    // 收尾：把节流期间累积的笔迹段立即提交，不丢尾段
+    // 收尾：把节流期间累积的笔迹段立即提交，不丢尾段。
+    // 点状落笔（顿笔/句号/误点）一律当墨迹保留——不再区分"点"与"笔迹"，
+    // 笔即书写，误点由 QML 侧的手势判定兜底
     flushInk();
 }
 
@@ -218,7 +191,6 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
 {
     m_erase = eraser;
     m_last = QPointF(x, y);
-    m_travel = 0;
     QPainter p(&m_img);
     if (eraser) {
         p.setCompositionMode(QPainter::CompositionMode_Clear);
@@ -235,7 +207,6 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
     p.drawPoint(m_last);
     p.end();
     m_stroke = true;
-    m_lastStroke = segmentRect(m_last, m_last);
     if (!m_hasInk) {
         m_hasInk = true;
         emit hasInkChanged();
@@ -268,8 +239,6 @@ void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
     m_pending = m_pending.isNull()
                     ? segmentRect(m_last, cur)
                     : m_pending.united(segmentRect(m_last, cur));
-    m_lastStroke = m_lastStroke.united(segmentRect(m_last, cur));
-    m_travel += qSqrt(qPow(cur.x() - m_last.x(), 2) + qPow(cur.y() - m_last.y(), 2));
     m_last = cur;
     // 节流合并：定时器到点把小区域一次性提交（小区域快 + 覆盖近段防虚线）
     if (!m_flushTimer->isActive())

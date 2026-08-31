@@ -115,7 +115,8 @@ Window {
         }
     }
 
-    // 全屏左右滑翻页（上下滑移交给顶部/底部边缘条，避免中间误触）
+    // 全屏左右滑翻页（上下滑移交给顶部/底部边缘条，避免中间误触）；
+    // 手指 tap（小位移+短按）进入 1 秒确认窗口，到期无后续操作才打开图片/全文
     // 防误触：按下与抬起都要确认笔完全空闲（penActive 为假且距最后一次笔活动
     // >=500ms），堵住"手掌先落屏、笔后开始写、手掌抬起时误触"的竞态；
     // 按压过长且位移仍很小判定为手掌托屏，不作 tap。
@@ -129,6 +130,8 @@ Window {
         property bool armed: false
         onPressed: (mouse) => {
             idleTimer.restart()
+            // 新的手指按下 = 后续操作：先取消待确认的 tap
+            root.cancelTap()
             // 手写笔在用/最近写过字：手指触摸一律不算手势
             if (root.penBusy())
                 return
@@ -148,18 +151,64 @@ Window {
             const dy = mouse.y - pressPt.y
             const adx = Math.abs(dx)
             const ady = Math.abs(dy)
-            // 手掌托屏：按压过长且位移未出 tap 区 → 忽略
-            if (Date.now() - pressMs > root.palmDwellMs && adx < 90 && ady < 90)
+            if (adx < 90 && ady < 90) {
+                // 小位移区：短按且位移 <=24px 才算干净 tap（arm 进确认窗口）；
+                // 按太久 = 手掌托屏，24<位移<90 = 不确定，都不算
+                if (Date.now() - pressMs <= root.palmDwellMs
+                        && Math.sqrt(dx * dx + dy * dy) <= 24)
+                    root.armTap(mouse.x, mouse.y)
                 return
-            // 手指短点不再点开任何内容（图片/全文都改由笔点按打开，见 penTap）
-            // 手指只负责滑动手势
-            if (adx < 90 && ady < 90)
-                return
+            }
             // 有效距离 + 主方向水平，移动一点点不算
             if (adx < 90 || adx <= ady)
                 return
             dx < 0 ? pageStore.next() : pageStore.prev()
         }
+    }
+
+    // 手指 tap 确认窗口：抬起时只"武装"（armTap），1 秒内无后续操作（新的
+    // 触摸/笔触碰，见各 onPressed 的 cancelTap 与 onRawPenDown）才真正执行。
+    // "点完立刻落掌/落笔"因此不会误开内容，干净单击照常生效
+    property int pendingTapX: -1
+    property int pendingTapY: -1
+    Timer {
+        id: tapConfirm
+        interval: 1000
+        repeat: false
+        onTriggered: {
+            const x = root.pendingTapX
+            const y = root.pendingTapY
+            root.pendingTapX = -1
+            if (x < 0)
+                return
+            root.doTap(x, y)
+        }
+    }
+    function armTap(x, y) {
+        root.pendingTapX = x
+        root.pendingTapY = y
+        tapConfirm.restart()
+    }
+    function cancelTap() {
+        root.pendingTapX = -1
+        tapConfirm.stop()
+    }
+    // 只有基础页接受 tap：校准/休眠/加载/错误/全屏层盖屏时点了没反应。
+    // 图片优先（槽位命中 → 全屏看图）；否则落在"有显示全文按钮的卡片"内
+    // → 全屏看全文（整张卡片都是热区，见 hitCardFullText）
+    function doTap(x, y) {
+        if (calib.visible || sleepOverlay.visible || fullscreen.visible
+                || textFs.visible || pageStore.loading
+                || pageStore.error.length > 0)
+            return
+        const idx = pageStore.hitSlot(x, y)
+        if (idx >= 0) {
+            fullscreen.open(idx)
+            return
+        }
+        const tid = pageStore.hitCardFullText(x, y)
+        if (tid.length > 0)
+            textFs.open(tid)
     }
 
     Text {
@@ -433,26 +482,9 @@ Window {
         function onPenMove(x, y, p) { idleTimer.restart() }
         function onEraserDown(x, y, p) { idleTimer.restart() }
         function onEraserMove(x, y, p) { idleTimer.restart() }
-        // 笔点（短按+微移）：命中图片槽位 → 全屏看图；命中"显示全文"按钮
-        // 热区 → 全屏看全文；没命中的笔点只抹墨点、不当笔迹（防误点被
-        // saveInkNow 判成笔迹而收藏帖子）。位移足够的笔划照旧只是笔迹。
-        // 图片优先（与原手指路径一致，槽位在卡片内先于按钮热区判定）
-        function onPenTap(x, y) {
-            idleTimer.restart()
-            // 校准/全屏看图/全屏全文期间笔点不触发
-            //（这些白层盖屏时 ink.inkEnabled=false，笔也不写墨，见 InkItem）
-            if (calib.visible || fullscreen.visible || textFs.visible)
-                return
-            ink.eraseLastStroke()   // 笔点不当笔迹：命中与否都抹掉墨点
-            var idx = pageStore.hitSlot(x, y)
-            if (idx >= 0) {
-                fullscreen.open(idx)
-                return
-            }
-            var tid = pageStore.hitFullText(x, y)
-            if (tid.length > 0)
-                textFs.open(tid)
-        }
+        // 笔/橡皮一触碰屏幕就是"后续操作"：取消待确认的手指 tap（笔只写字，
+        // 但它的出现说明这不是一个孤立的干净单击）
+        function onRawPenDown(rx, ry) { root.cancelTap() }
     }
     Connections {
         target: pageStore
@@ -479,7 +511,8 @@ Window {
     }
 
     // 置顶边缘手势：任何时候可用（含加载/错误/任意页面状态）
-    // 顶部从上往下滑 → 退出；底部从下往上滑 → 刷新
+    // 顶部从上往下滑 → 退出；底部从下往上滑 → 刷新；边缘区内小位移的
+    // 手指 tap 同样有效（页面顶部/底部的卡片）
     // 只认从边缘开始的、距离足够的、手指（非手写笔）的垂直滑动
     // 防误触：按下与抬起都要求笔完全空闲，手掌/手指贴屏写字时不会触发
     function penBusy() {
@@ -487,6 +520,7 @@ Window {
     }
     MouseArea {
         property point p0
+        property int pressMs: 0
         property bool armed: false
         x: 0
         y: 0
@@ -495,10 +529,12 @@ Window {
         enabled: stylusObj.calibrated
         onPressed: (m) => {
             idleTimer.restart()
+            root.cancelTap()
             if (root.penBusy())
                 return
             armed = true
             p0 = Qt.point(m.x, m.y)
+            pressMs = Date.now()
         }
         onReleased: (m) => {
             idleTimer.restart()
@@ -507,15 +543,26 @@ Window {
             armed = false
             if (root.penBusy())
                 return
-            const ady = m.y - p0.y
-            const adx = Math.abs(m.x - p0.x)
-            if (ady < 90 || ady <= adx)
+            const dx = m.x - p0.x
+            const dy = m.y - p0.y
+            const adx = Math.abs(dx)
+            const ady = Math.abs(dy)
+            if (adx < 90 && ady < 90) {
+                // 小位移：短按且位移 <=24px 才算干净 tap（本条贴顶，
+                // 局部坐标即全屏坐标）
+                if (Date.now() - pressMs <= root.palmDwellMs
+                        && Math.sqrt(dx * dx + dy * dy) <= 24)
+                    root.armTap(m.x, m.y)
+                return
+            }
+            if (dy < 90 || dy <= adx)
                 return
             pageStore.quit()
         }
     }
     MouseArea {
         property point p1
+        property int pressMs: 0
         property bool armed: false
         x: 0
         y: parent.height - 140
@@ -524,10 +571,12 @@ Window {
         enabled: stylusObj.calibrated
         onPressed: (m) => {
             idleTimer.restart()
+            root.cancelTap()
             if (root.penBusy())
                 return
             armed = true
             p1 = Qt.point(m.x, m.y)
+            pressMs = Date.now()
         }
         onReleased: (m) => {
             idleTimer.restart()
@@ -536,9 +585,21 @@ Window {
             armed = false
             if (root.penBusy())
                 return
-            const ady = p1.y - m.y
-            const adx = Math.abs(m.x - p1.x)
-            if (ady < 90 || ady <= adx)
+            const dx = m.x - p1.x
+            const dy = p1.y - m.y          // 手势方向（向上）为正
+            const adx = Math.abs(dx)
+            const ady = Math.abs(dy)
+            if (adx < 90 && ady < 90) {
+                // 小位移：短按且位移 <=24px 才算干净 tap（本条贴底，
+                // 需 mapToItem 换算成全屏坐标）
+                if (Date.now() - pressMs <= root.palmDwellMs
+                        && Math.sqrt(dx * dx + dy * dy) <= 24) {
+                    const p = mapToItem(root, Qt.point(m.x, m.y))
+                    root.armTap(p.x, p.y)
+                }
+                return
+            }
+            if (dy < 90 || dy <= adx)
                 return
             pageStore.refresh()
         }
@@ -667,7 +728,8 @@ Window {
         }
     }
 
-    // 全文全屏阅读：笔点按卡片上"显示全文"按钮打开；左右滑在长文页间切换
+    // 全文全屏阅读：手指 tap 有"显示全文"按钮的卡片打开（1 秒确认后）；
+    // 左右滑在长文页间切换
     Item {
         id: textFs
         visible: false

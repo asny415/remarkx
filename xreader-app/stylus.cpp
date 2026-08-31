@@ -7,18 +7,12 @@
 #include <QJsonObject>
 #include <QElapsedTimer>
 #include <QTimer>
-#include <qmath.h>
 #include <linux/input.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 static const int SCREEN_W = 1404;
 static const int SCREEN_H = 1872;
-
-// 笔点判定：短按 + 位移极小才算"点"（写字的顿笔/句号位移或时长都更大，
-// 不会误判）。阈值与历史值一致，可在实机上微调。
-static const qint64 TAP_MAX_MS = 400;
-static const qreal TAP_MAX_TRAVEL = 24.0;
 
 Stylus::Stylus(QObject *parent) : QObject(parent)
 {
@@ -135,11 +129,6 @@ void Stylus::setPenActive(bool active)
 void Stylus::touchPoint(bool eraser)
 {
     QPointF s = rawToScreen(m_lastX, m_lastY);
-    m_pressMs = QDateTime::currentMSecsSinceEpoch();
-    m_pressCalibrated = m_calibrated;
-    m_downPt = s;
-    m_prevPt = s;
-    m_travel = 0;
     if (eraser)
         emit eraserDown(int(s.x()), int(s.y()), m_lastP);
     else
@@ -167,7 +156,6 @@ void Stylus::onData()
                     setPenActive(true);
                 } else if (m_touching) {
                     m_touching = false;
-                    const bool hadStroke = m_started;
                     m_started = false;
                     // 笔/橡皮抬起后仍保留 penActive（1s 窗口，或笔仍在有效范围
                     // 则更久），期间忽略手掌/手指误触
@@ -177,14 +165,6 @@ void Stylus::onData()
                         emit eraserUp();
                     } else {
                         emit penUp();
-                        // 笔点：短按+微移，且落笔时已校准。只发信号，是否当
-                        // 点击由 QML 判定（精确命中"显示全文"按钮才算）
-                        if (hadStroke && m_pressCalibrated
-                                && QDateTime::currentMSecsSinceEpoch()
-                                       - m_pressMs < TAP_MAX_MS
-                                && m_travel < TAP_MAX_TRAVEL)
-                            emit penTap(int(m_downPt.x()),
-                                        int(m_downPt.y()));
                     }
                 }
             }
@@ -201,9 +181,6 @@ void Stylus::onData()
                     touchPoint(m_eraser);
                 } else {
                     QPointF s = rawToScreen(m_lastX, m_lastY);
-                    m_travel += qSqrt(qPow(s.x() - m_prevPt.x(), 2)
-                                      + qPow(s.y() - m_prevPt.y(), 2));
-                    m_prevPt = s;
                     if (m_eraser)
                         emit eraserMove(int(s.x()), int(s.y()), m_lastP);
                     else

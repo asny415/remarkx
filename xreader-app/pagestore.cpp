@@ -641,23 +641,32 @@ int PageStore::hitSlot(int x, int y)
     return -1;
 }
 
-QString PageStore::hitFullText(int x, int y)
+QString PageStore::hitCardFullText(int x, int y)
 {
-    remarkxSetCtx("hitFullText");
+    remarkxSetCtx("hitCardFullText");
     if (m_pages.isEmpty())
         return {};
     if (m_feedPage < 0 || m_feedPage >= m_pages.size())
         return {};
+    syncFeed();
     const RenderPage &pg = m_pages.at(m_feedPage);
-    // 精确命中"显示全文"按钮热区（renderer 已为每个按钮记录矩形）；
-    // 四周放宽 12px 照顾笔尖抖动。按钮很小，手指点不准，故只由笔点按触发
-    const int pad = 12;
-    for (const TextButton &b : pg.buttons) {
-        if (b.tweetIndex < 0 || b.tweetIndex >= m_feed.size())
+    // 点落在哪张卡片（chunk）内——同一卡片跨栏/跨页拆块时任一命中即可
+    int tweetIndex = -1;
+    for (const RenderChunk &c : pg.chunks) {
+        if (c.tweetIndex < 0 || c.tweetIndex >= m_feed.size())
             continue;
-        const QRect r = b.rect.adjusted(-pad, -pad, pad, pad);
-        if (r.contains(x, y))
-            return m_feed.at(b.tweetIndex).id;
+        if (c.rect.contains(x, y)) {
+            tweetIndex = c.tweetIndex;
+            break;
+        }
+    }
+    if (tweetIndex < 0)
+        return {};
+    // 只有挂了"显示全文"按钮（文本被截断）的卡片才有全文可看；
+    // 完整显示的卡片点了无反应
+    for (const TextButton &b : pg.buttons) {
+        if (b.tweetIndex == tweetIndex)
+            return m_feed.at(tweetIndex).id;
     }
     return {};
 }

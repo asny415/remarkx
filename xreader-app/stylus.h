@@ -35,10 +35,6 @@ signals:
     void penDown(int x, int y, int pressure);
     void penMove(int x, int y, int pressure);
     void penUp();
-    // 笔点（短按且位移极小，非橡皮；坐标为落笔首点，屏幕坐标）。
-    // 只发信号不做任何点击合成：由 QML 决定去留——精确命中"显示全文"
-    // 按钮才算点击，否则该墨点照旧是笔迹
-    void penTap(int x, int y);
     void eraserDown(int x, int y, int pressure);
     void eraserMove(int x, int y, int pressure);
     void eraserUp();
@@ -63,10 +59,4 @@ private:
     qreal m_d = 0.0893, m_e = 0, m_f = 0;
     bool m_calibrated = false;
     qint64 m_lastActivityMs = 0;
-    // 笔点检测：落笔时刻/首点/累计位移，抬起时判定 dur+travel 是否成"点"
-    qint64 m_pressMs = 0;
-    bool m_pressCalibrated = false;  // 落笔时是否已校准（校准中点的第 5 下不算）
-    QPointF m_downPt;
-    QPointF m_prevPt;
-    double m_travel = 0;
 };

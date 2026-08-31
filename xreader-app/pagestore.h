@@ -81,9 +81,10 @@ public slots:
     Q_INVOKABLE void requestFullRefresh();
     // 手指点按命中图片槽位 → 返回槽位索引（-1 = 未命中）
     Q_INVOKABLE int hitSlot(int x, int y);
-    // 笔点按精确命中"显示全文"按钮热区（四周放宽 12px 容差）→ 返回推文
-    // id（"" = 未命中）。全文只由笔点按打开，手指点按不走此路径
-    Q_INVOKABLE QString hitFullText(int x, int y);
+    // 手指点按落在"有显示全文按钮的卡片"范围内 → 返回推文 id（"" = 未命中）。
+    // 整张卡片（头部/文字/统计/边距）都是热区，图片槽位除外（QML 先查
+    // hitSlot，图片优先）。卡片未截断（无"显示全文"按钮）时点了没反应
+    Q_INVOKABLE QString hitCardFullText(int x, int y);
     // 全文全屏：总页数
     Q_INVOKABLE int fullTextPages(const QString &tweetId);
     // 槽位对应媒体的全部本地文件（全屏分页浏览；未下载完的条目为空）

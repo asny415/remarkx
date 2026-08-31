@@ -23,6 +23,8 @@ public:
     bool hasInkPixels() const;
 
     Q_INVOKABLE void clear();
+    // 擦除最后一笔的紧致包围盒（笔点打开全屏前抹掉 tap 墨点用）
+    Q_INVOKABLE void eraseLastStroke();
     Q_INVOKABLE bool saveDraw(const QString &path) const;
     Q_INVOKABLE bool loadDraw(const QString &path);
     Q_INVOKABLE void loadBlank(int w, int h);
@@ -61,4 +63,6 @@ private:
     bool m_hasInk = false;
     QTimer *m_flushTimer = nullptr;
     QRect m_pending;
+    // 当前/最后一笔的紧致包围盒（含笔宽余量），供 eraseLastStroke 精准擦除
+    QRect m_lastStroke;
 };

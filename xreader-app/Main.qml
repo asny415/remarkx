@@ -145,18 +145,11 @@ Window {
             // 手掌托屏：按压过长且位移未出 tap 区 → 忽略，不点开图片/全文
             if (Date.now() - pressMs > root.palmDwellMs && adx < 90 && ady < 90)
                 return
-            // 手指短点：命中图片则打开全屏看图；命中带"显示全文"按钮的帖子任意处则全屏看全文
+            // 手指短点只开全屏看图；"显示全文"只由笔点按打开（见下方 penTap）
             if (adx < 90 && ady < 90) {
                 var idx = pageStore.hitSlot(mouse.x, mouse.y)
-                if (idx >= 0) {
+                if (idx >= 0)
                     fullscreen.open(idx)
-                    return
-                }
-                var tid = pageStore.hitFullText(mouse.x, mouse.y)
-                if (tid.length > 0) {
-                    textFs.open(tid)
-                    return
-                }
                 return
             }
             // 有效距离 + 主方向水平，移动一点点不算
@@ -437,6 +430,18 @@ Window {
         function onPenMove(x, y, p) { idleTimer.restart() }
         function onEraserDown(x, y, p) { idleTimer.restart() }
         function onEraserMove(x, y, p) { idleTimer.restart() }
+        // 笔点（短按+微移）：精确命中"显示全文"按钮热区才打开全文；
+        // 没点到按钮的笔点/一切笔划照旧只是笔迹，不做任何点击
+        function onPenTap(x, y) {
+            idleTimer.restart()
+            if (calib.visible)
+                return
+            var tid = pageStore.hitFullText(x, y)
+            if (tid.length > 0) {
+                ink.eraseLastStroke()   // 抹掉笔点的墨点，按钮上不残留
+                textFs.open(tid)
+            }
+        }
     }
     Connections {
         target: pageStore

@@ -80,6 +80,22 @@ void InkItem::clear()
     update();
 }
 
+void InkItem::eraseLastStroke()
+{
+    // 笔点打开全屏前抹掉 tap 墨点：只清该笔紧致包围盒，走框架 update 重绘
+    // （与橡皮擦同一条路径，不用 pen 快速通道），随后全屏 requestFullRefresh
+    // 会整体再刷一遍，无残影
+    const QRect r = m_lastStroke.intersected(m_img.rect());
+    m_lastStroke = QRect();
+    if (r.isNull())
+        return;
+    QPainter p(&m_img);
+    p.setCompositionMode(QPainter::CompositionMode_Clear);
+    p.fillRect(r, Qt::transparent);
+    p.end();
+    update(r);
+}
+
 void InkItem::loadBlank(int w, int h)
 {
     m_img = QImage(qMax(w, 1), qMax(h, 1), QImage::Format_ARGB32_Premultiplied);
@@ -189,6 +205,7 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
     p.drawPoint(m_last);
     p.end();
     m_stroke = true;
+    m_lastStroke = segmentRect(m_last, m_last);
     if (!m_hasInk) {
         m_hasInk = true;
         emit hasInkChanged();
@@ -221,6 +238,7 @@ void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
     m_pending = m_pending.isNull()
                     ? segmentRect(m_last, cur)
                     : m_pending.united(segmentRect(m_last, cur));
+    m_lastStroke = m_lastStroke.united(segmentRect(m_last, cur));
     m_last = cur;
     // 节流合并：定时器到点把小区域一次性提交（小区域快 + 覆盖近段防虚线）
     if (!m_flushTimer->isActive())

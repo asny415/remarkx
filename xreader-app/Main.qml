@@ -103,6 +103,12 @@ Window {
     InkItem {
         id: ink
         anchors.fill: parent
+        // 只在基础页可见时收笔迹：校准/休眠/加载/错误/全屏看图/全屏全文
+        // 都是盖住整屏的不透明白层，那时笔迹看不见，若留在墨层里会被
+        // saveInkNow 当笔迹误收藏帖子
+        inkEnabled: !calib.visible && !sleepOverlay.visible
+                    && !pageStore.loading && pageStore.error.length === 0
+                    && !fullscreen.visible && !textFs.visible
         Component.onCompleted: {
             setStylus(stylusObj)
             pageStore.setInk(ink)
@@ -428,24 +434,24 @@ Window {
         function onEraserDown(x, y, p) { idleTimer.restart() }
         function onEraserMove(x, y, p) { idleTimer.restart() }
         // 笔点（短按+微移）：命中图片槽位 → 全屏看图；命中"显示全文"按钮
-        // 热区 → 全屏看全文；都没命中的笔点/一切笔划照旧只是笔迹。
+        // 热区 → 全屏看全文；没命中的笔点只抹墨点、不当笔迹（防误点被
+        // saveInkNow 判成笔迹而收藏帖子）。位移足够的笔划照旧只是笔迹。
         // 图片优先（与原手指路径一致，槽位在卡片内先于按钮热区判定）
         function onPenTap(x, y) {
             idleTimer.restart()
-            // 校准/全屏看图/全屏全文期间笔点不触发（全屏里笔只写笔迹）
+            // 校准/全屏看图/全屏全文期间笔点不触发
+            //（这些白层盖屏时 ink.inkEnabled=false，笔也不写墨，见 InkItem）
             if (calib.visible || fullscreen.visible || textFs.visible)
                 return
+            ink.eraseLastStroke()   // 笔点不当笔迹：命中与否都抹掉墨点
             var idx = pageStore.hitSlot(x, y)
             if (idx >= 0) {
-                ink.eraseLastStroke()   // 抹掉笔点的墨点，图上不残留
                 fullscreen.open(idx)
                 return
             }
             var tid = pageStore.hitFullText(x, y)
-            if (tid.length > 0) {
-                ink.eraseLastStroke()
+            if (tid.length > 0)
                 textFs.open(tid)
-            }
         }
     }
     Connections {

@@ -10,10 +10,17 @@ class Stylus;
 class InkItem : public QQuickPaintedItem {
     Q_OBJECT
     Q_PROPERTY(bool hasInk READ hasInk NOTIFY hasInkChanged)
+    Q_PROPERTY(bool inkEnabled READ inkEnabled WRITE setInkEnabled
+               NOTIFY inkEnabledChanged)
 public:
     explicit InkItem(QQuickItem *parent = nullptr);
 
     bool hasInk() const { return m_hasInk; }
+    // 是否接受笔迹：不透明白层（校准/加载/错误/全屏看图/全屏全文）盖住
+    // 基础页时置 false——那时画下的墨迹看不见，留在墨层里只会被
+    // saveInkNow 当笔迹误收藏帖子
+    bool inkEnabled() const { return m_inkEnabled; }
+    void setInkEnabled(bool enabled);
     void paint(QPainter *painter) override;
 
     const QImage &inkImage() const { return m_img; }
@@ -34,6 +41,7 @@ public slots:
 
 signals:
     void hasInkChanged();
+    void inkEnabledChanged();
 
 private slots:
     void onPenDown(int x, int y, int pressure);
@@ -61,6 +69,9 @@ private:
     bool m_erase = false;
     qreal m_width = 4.0;
     bool m_hasInk = false;
+    bool m_inkEnabled = true;
+    // 当前笔累计位移（屏幕坐标，同 Stylus::m_travel），点状落笔判定用
+    qreal m_travel = 0.0;
     QTimer *m_flushTimer = nullptr;
     QRect m_pending;
     // 当前/最后一笔的紧致包围盒（含笔宽余量），供 eraseLastStroke 精准擦除

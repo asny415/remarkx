@@ -81,7 +81,7 @@ public slots:
     Q_INVOKABLE void requestFullRefresh();
     // 手指点按命中图片槽位 → 返回槽位索引（-1 = 未命中）
     Q_INVOKABLE int hitSlot(int x, int y);
-    // 手指点按命中"显示全文"按钮 → 返回推文 id（"" = 未命中）
+    // 手指点按命中带"显示全文"按钮的帖子卡片任意位置 → 返回推文 id（"" = 未命中）
     Q_INVOKABLE QString hitFullText(int x, int y);
     // 全文全屏：总页数
     Q_INVOKABLE int fullTextPages(const QString &tweetId);

@@ -648,12 +648,23 @@ QString PageStore::hitFullText(int x, int y)
         return {};
     if (m_feedPage < 0 || m_feedPage >= m_pages.size())
         return {};
-    for (const TextButton &b : m_pages.at(m_feedPage).buttons) {
-        if (x >= b.rect.x() && x <= b.rect.x() + b.rect.width()
-                && y >= b.rect.y() && y <= b.rect.y() + b.rect.height()) {
-            if (b.tweetIndex >= 0 && b.tweetIndex < m_feed.size())
-                return m_feed.at(b.tweetIndex).id;
+    const RenderPage &pg = m_pages.at(m_feedPage);
+    // 手指点到帖子的卡片（chunk）任意位置都可触发全文，不再要求精确
+    // 命中"显示全文"小按钮（按钮区域难点）。图片由 hitSlot 先拦走。
+    int ti = -1;
+    for (const RenderChunk &c : pg.chunks) {
+        if (x >= c.rect.x() && x <= c.rect.x() + c.rect.width()
+                && y >= c.rect.y() && y <= c.rect.y() + c.rect.height()) {
+            ti = c.tweetIndex;
+            break;
         }
+    }
+    if (ti < 0 || ti >= m_feed.size())
+        return {};
+    // 该帖在本页确实展示了"显示全文"按钮才触发
+    for (const TextButton &b : pg.buttons) {
+        if (b.tweetIndex == ti)
+            return m_feed.at(ti).id;
     }
     return {};
 }

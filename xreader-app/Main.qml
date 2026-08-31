@@ -132,7 +132,7 @@ Window {
             const dy = mouse.y - pressPt.y
             const adx = Math.abs(dx)
             const ady = Math.abs(dy)
-            // 手指短点：命中图片则打开全屏看图；命中"显示全文"则全屏看全文
+            // 手指短点：命中图片则打开全屏看图；命中带"显示全文"按钮的帖子任意处则全屏看全文
             if (adx < 90 && ady < 90) {
                 var idx = pageStore.hitSlot(mouse.x, mouse.y)
                 if (idx >= 0) {

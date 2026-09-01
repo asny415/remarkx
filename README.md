@@ -310,8 +310,7 @@ cmake --build build
 进入阅读器会显示错误页并给出原因，点"重试"可重来。Cookie 失效时提示重新导入。
 
 **Q：Telegram 没收到收藏图片？**
-先确认部署时带了 `--telegram-bot/--telegram-chat`。发送与失败原因会记录在设备端
-`reqdebug.log` 的 `telegram:` 段（bot token 已打码）。发送是**后台队列**：失败会
+先确认部署时带了 `--telegram-bot/--telegram-chat`。发送是**后台队列**：失败会
 自动重试，重启设备也会补发，无需手动操作。
 
 **Q：推送成功后本地图片会被删吗？**
@@ -320,7 +319,7 @@ cmake --build build
 
 **Q：为什么收不到 Telegram 图片（HTTP 400）？**
 多半是 `--telegram-chat` 配置不对：个人数字 id 需为正数、群组需 `-100...`、
-频道需 `@频道名`。可查看 `reqdebug.log` 里的响应体定位原因。
+频道需 `@频道名`。
 
 **Q：如何在 PC 上调试渲染？**
 `Renderer::renderPage` 可直接用本机 Qt 渲染页面位图到 PNG（配合 fake feed 数据）。

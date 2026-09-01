@@ -109,7 +109,6 @@ qreal Stylus::penIdleMs() const
 void Stylus::onPenNear(bool near)
 {
     m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
-    qInfo() << (near ? "pen near" : "pen far");
     if (near) {
         m_tapTimer->stop();
         setPenActive(true);

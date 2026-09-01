@@ -42,10 +42,8 @@ void PowerKey::onData()
         } else if (ev.value == 0 && m_down) {
             m_down = false;
             const qint64 dur = QDateTime::currentMSecsSinceEpoch() - m_downMs;
-            if (dur < SHORT_PRESS_MS) {
-                qInfo() << "power short press" << dur << "ms";
+            if (dur < SHORT_PRESS_MS)
                 emit shortPress();
-            }
         }
     }
 }

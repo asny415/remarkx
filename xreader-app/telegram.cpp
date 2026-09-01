@@ -9,27 +9,8 @@
 #include <QNetworkProxy>
 #include <QNetworkReply>
 #include <QNetworkRequest>
-#include <QTextStream>
 #include <QTimer>
 #include <QUrl>
-
-// 与 XClient 的 logReq 共用 reqdebug.log；bot token 是密钥，URL 一律打码。
-static void logTelegram(const QString &baseDir, const QString &number,
-                        bool ok, int status, int attempts,
-                        const QByteArray &body)
-{
-    QFile f(baseDir + "/reqdebug.log");
-    if (!f.open(QIODevice::Append))
-        return;
-    QTextStream ts(&f);
-    ts << "\n[" << QDateTime::currentDateTime().toString("MM-dd HH:mm:ss")
-       << "] telegram:sendPhoto " << (ok ? "OK" : "FAIL")
-       << " status=" << status << " number=" << number
-       << " attempts=" << attempts
-       << "\n  url=https://api.telegram.org/bot<redacted>/sendPhoto"
-       << "\n  body=" << QString::fromUtf8(body).left(300) << "\n";
-    f.close();
-}
 
 Telegram::Telegram(QObject *parent) : QObject(parent)
 {
@@ -70,7 +51,6 @@ void Telegram::configure(const QString &baseDir)
                 qWarning() << "Telegram: invalid proxy" << proxy;
             } else {
                 m_nam.setProxy(p);
-                qInfo() << "Telegram: proxy" << scheme << pu.host() << pu.port();
             }
         }
     }
@@ -78,12 +58,10 @@ void Telegram::configure(const QString &baseDir)
     if (!enabled()) {
         // 未配置：清掉历史遗留队列，不发送
         m_pending.clear();
-        qInfo() << "Telegram: not configured";
         return;
     }
     loadQueue();
     scheduleNext();
-    qInfo() << "Telegram: enabled, pending" << m_pending.size();
 }
 
 // 失败重试间隔：10s → 20s → 40s → … 上限 1 小时
@@ -213,8 +191,6 @@ void Telegram::sendOne(const Pending &item)
     QFile f(full);
     if (!f.open(QIODevice::ReadOnly)) {
         qWarning() << "Telegram: image missing, will retry" << full;
-        logTelegram(m_baseDir, item.number, false, 0, item.attempts + 1,
-                    "image missing");
         m_sending = false;
         markFailed(item.number);
         pump();   // 继续处理队列里其他就绪项
@@ -224,8 +200,6 @@ void Telegram::sendOne(const Pending &item)
     f.close();
     if (data.isEmpty()) {
         qWarning() << "Telegram: empty image, will retry" << full;
-        logTelegram(m_baseDir, item.number, false, 0, item.attempts + 1,
-                    "empty image");
         m_sending = false;
         markFailed(item.number);
         pump();   // 继续处理队列里其他就绪项
@@ -270,19 +244,12 @@ void Telegram::sendOne(const Pending &item)
 
 void Telegram::onReplyFinished(QNetworkReply *reply, const QString &number)
 {
-    const QByteArray body = reply->readAll();
     reply->deleteLater();
     m_sending = false;
     const int status = reply->attribute(
         QNetworkRequest::HttpStatusCodeAttribute).toInt();
     const bool ok = reply->error() == QNetworkReply::NoError && status == 200;
-    int attempts = 0;
-    for (const Pending &it : m_pending)
-        if (it.number == number)
-            attempts = it.attempts + 1;
-    logTelegram(m_baseDir, number, ok, status, attempts, body);
     if (ok) {
-        qInfo() << "Telegram sendPhoto ok" << number;
         QString sentId;
         for (int i = m_pending.size() - 1; i >= 0; --i) {
             if (m_pending.at(i).number == number) {

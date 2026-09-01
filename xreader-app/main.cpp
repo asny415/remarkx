@@ -91,42 +91,12 @@ void installCrashHandler()
     sigaction(SIGBUS, &sa, nullptr);
     sigaction(SIGILL, &sa, nullptr);
 }
-class TouchSpy : public QObject
-{
-public:
-    using QObject::QObject;
-    bool eventFilter(QObject *obj, QEvent *ev) override
-    {
-        switch (ev->type()) {
-        case QEvent::TouchBegin:
-            qInfo() << "TOUCH begin" << static_cast<QTouchEvent *>(ev)->points().first().position();
-            break;
-        case QEvent::TouchUpdate:
-            qInfo() << "TOUCH update" << static_cast<QTouchEvent *>(ev)->points().first().position();
-            break;
-        case QEvent::TouchEnd:
-            qInfo() << "TOUCH end" << static_cast<QTouchEvent *>(ev)->points().first().position();
-            break;
-        case QEvent::MouseButtonPress:
-        case QEvent::MouseButtonRelease:
-        case QEvent::MouseMove:
-            if (QCoreApplication::instance()->property("touchLog") == 0)
-                qInfo() << "MOUSE" << ev->type();
-            break;
-        default:
-            break;
-        }
-        return QObject::eventFilter(obj, ev);
-    }
-};
 } // namespace
 
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
-    app.installEventFilter(new TouchSpy(&app));
     installCrashHandler();
-    qInfo() << "BUILD_INK=v9 standalone renderer";
 
     const QString baseDir = "/home/root/xreader";
 
@@ -160,8 +130,6 @@ int main(int argc, char *argv[])
 
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreated, &engine,
                      [&](QObject *obj, const QUrl &url) {
-                         Q_UNUSED(obj);
-                         qInfo() << "objectCreated:" << url;
                          if (url.toString().endsWith("Main.qml")) {
                              pageStore.setWindow(qobject_cast<QQuickWindow *>(obj));
                              pageStore.start();
@@ -172,7 +140,6 @@ int main(int argc, char *argv[])
                      Qt::QueuedConnection);
 
     const bool menuMode = app.arguments().contains("--menu");
-    qInfo() << "BUILD_INK=v8" << (menuMode ? "menu" : "reader") << "mode";
     engine.loadFromModule("xreader", menuMode ? "Menu" : "Main");
 
     return app.exec();

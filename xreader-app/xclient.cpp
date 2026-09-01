@@ -5,7 +5,6 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
-#include <QTextStream>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -126,10 +125,8 @@ void XClient::configure(const QString &baseDir)
         } else {
             m_nam.setProxy(proxy);
             m_mediaNam.setProxy(proxy);
-            qInfo() << "XClient: proxy" << scheme << pu.host() << pu.port();
         }
     }
-    qInfo() << "XClient: cookies" << m_cookiesFile;
 }
 
 bool XClient::hasSession() const
@@ -308,56 +305,12 @@ static QString replyErrorText(QNetworkReply *reply)
     }
 }
 
-// 请求/响应调试日志（定位 403 等：完整 URL + Cookie 状态 + 游标 + 响应体）
-static void logReq(const QString &baseDir, const QString &tag,
-                   const QString &which, QNetworkReply *reply,
-                   const QString &auth, const QString &ct0,
-                   const QString &cursor, const QByteArray &body)
-{
-    QFile f(baseDir + "/reqdebug.log");
-    if (!f.open(QIODevice::Append))
-        return;
-    const int status = reply->attribute(
-        QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    const QString ok = reply->error() == QNetworkReply::NoError
-                           ? "OK" : "FAIL";
-    QTextStream ts(&f);
-    ts << "\n[" << QDateTime::currentDateTime().toString("MM-dd HH:mm:ss")
-       << "] " << tag << ":" << which << " " << ok << " status=" << status
-       << "\n  url=" << reply->url().toString()
-       << "\n  request_headers:";
-    const QNetworkRequest req = reply->request();
-    const QList<QByteArray> rhd = req.rawHeaderList();
-    for (const QByteArray &h : rhd) {
-        // 打码敏感头（authorization/cookie 含会话凭据，reqdebug.log 会上传排查）
-        if (h.compare("authorization", Qt::CaseInsensitive) == 0
-                || h.compare("cookie", Qt::CaseInsensitive) == 0) {
-            ts << "\n    " << h << ": <redacted len="
-               << req.rawHeader(h).size() << ">";
-            continue;
-        }
-        ts << "\n    " << h << ": " << req.rawHeader(h);
-    }
-    ts << "\n  response_headers:";
-    const QList<QByteArray> phd = reply->rawHeaderList();
-    for (const QByteArray &h : phd)
-        ts << "\n    " << h << ": " << reply->rawHeader(h);
-    ts << "\n  cookie auth_token=" << (!auth.isEmpty() ? "Y" : "N")
-       << " ct0=" << (!ct0.isEmpty() ? "Y" : "N")
-       << " cursor=" << cursor.left(60)
-       << "\n  body=" << QString::fromUtf8(body).left(300) << "\n";
-    f.close();
-}
-
 void XClient::handleHomeReply(const QString &which, QNetworkReply *reply)
 {
     remarkxSetCtx("xclient:handleHomeReply");
     reply->deleteLater();
     --m_homeLeft;
     const QByteArray body = reply->readAll();
-    const QString cursorForLog = (which == "fy") ? m_cursor : m_cursorFollowing;
-    logReq(m_baseDir, "home", which, reply, m_authToken, m_ct0, cursorForLog,
-           body);
     if (reply->error() != QNetworkReply::NoError) {
         m_lastError = replyErrorText(reply);
         qWarning() << "XClient home error:" << which << m_lastError;
@@ -392,8 +345,6 @@ void XClient::maybeMergeHome()
     }
     QVector<XTweet> merged = mergeInterleave(m_fy, m_fl);
     ingest(merged, /*append=*/false);
-    qInfo() << "XClient home ready:" << merged.size() << "tweets,"
-            << m_tweets.size() << "in feed";
     emit homeReady();
 }
 
@@ -405,7 +356,6 @@ void XClient::fetchOlder()
     // 续抓失败冷却：短时间内不重复触发，避免疯狂重试被 X 风控持续 403
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (m_extendErrorAt && now - m_extendErrorAt < 10000) {
-        qInfo() << "XClient: extend cooling down, skip";
         emit olderReady();   // 空批：读者停留在末页，不弹错误
         return;
     }
@@ -419,7 +369,6 @@ void XClient::fetchOlder()
         // 无翻页游标（时间线已到尽头）：不刷新、不重建 feed——
         // 重建会让在途媒体下载的任务索引失效（saveMedia 越界）且跳回第 0 页。
         // 直接按"无更多内容"处理，读者停留在末页。
-        qInfo() << "XClient: no more older content (cursor empty)";
         emit olderReady();
         return;
     }
@@ -430,8 +379,6 @@ void XClient::fetchOlder()
     m_olderLeft = 0;
     m_oy.clear();
     m_ol.clear();
-    qInfo() << "XClient fetchOlder fy_cursor=" << m_cursor.left(50)
-            << "fl_cursor=" << m_cursorFollowing.left(50);
 
     if (!m_cursor.isEmpty()) {
         QJsonObject vars;
@@ -471,9 +418,6 @@ void XClient::handleOlderReply(const QString &which, QNetworkReply *reply)
     reply->deleteLater();
     --m_olderLeft;
     const QByteArray body = reply->readAll();
-    const QString cursorUsed = (which == "fy") ? m_cursor : m_cursorFollowing;
-    logReq(m_baseDir, "older", which, reply, m_authToken, m_ct0, cursorUsed,
-           body);
     if (reply->error() != QNetworkReply::NoError) {
         const int status = reply->attribute(
             QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -519,8 +463,6 @@ void XClient::maybeMergeOlder()
     }
     QVector<XTweet> merged = mergeInterleave(m_oy, m_ol);
     ingest(merged, /*append=*/true);
-    qInfo() << "XClient older ready:" << merged.size() << "tweets appended,"
-            << m_tweets.size() << "in feed";
     emit olderReady();
 }
 

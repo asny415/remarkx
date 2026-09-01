@@ -156,9 +156,7 @@ void Renderer::configure(const QString &baseDir)
             } else {
                 m_tz = QTimeZone(tzStr.toUtf8());
             }
-            if (m_tz.isValid())
-                qInfo() << "Renderer: timezone" << tzStr;
-            else
+            if (!m_tz.isValid())
                 qWarning() << "Renderer: invalid timezone" << tzStr;
         }
     }
@@ -183,7 +181,6 @@ void Renderer::configure(const QString &baseDir)
     const QStringList fams = QFontDatabase::applicationFontFamilies(fid);
     if (!fams.isEmpty())
         m_family = fams.first();
-    qInfo() << "Renderer: font" << m_fontPath << "family" << m_family;
 }
 
 QFont Renderer::font(int pixel, bool bold) const

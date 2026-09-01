@@ -3,7 +3,6 @@
 #include <QEvent>
 #include <QMouseEvent>
 #include <QTouchEvent>
-#include <QDebug>
 
 TouchGuard::TouchGuard(std::function<bool()> penActive, QObject *parent)
     : QObject(parent), m_penActive(std::move(penActive))
@@ -54,9 +53,6 @@ void TouchGuard::checkTouch(QTouchEvent *te)
         emit diameterChanged();
     }
     const bool palm = m_penActive() || maxD >= kPalmDiameter;
-    if (palm)
-        qInfo() << "PALM touch diameter" << maxD << "at"
-                << te->points().first().position() << "consumed";
     setPalm(palm);
 }
 

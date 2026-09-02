@@ -608,11 +608,14 @@ void XClient::handleDetailReply(const QString &tweetId, QNetworkReply *reply)
     emit detailReady(tweetId, fresh, !s->cursor.isEmpty());
 }
 
-void XClient::parseDetail(const QJsonObject &data, QVector<XTweet> *replies,
+void XClient::parseDetail(const QJsonObject &doc, QVector<XTweet> *replies,
                           QString *cursor)
 {
+    // 顶层文档还包一层 data（与 feed 解析同构，见 HomeTimeline 的
+    // doc["data"]["home"]）；漏了这层会拿到空对象 → 回复/游标全丢
     const QJsonObject thread =
-        data["threaded_conversation_with_injections_v2"].toObject();
+        doc["data"].toObject()
+             ["threaded_conversation_with_injections_v2"].toObject();
     const QJsonArray ins = thread["instructions"].toArray();
     for (const QJsonValue &iv : ins) {
         const QJsonObject i = iv.toObject();

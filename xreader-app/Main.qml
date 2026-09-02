@@ -242,6 +242,30 @@ Window {
         color: "#999"
     }
 
+    // 右上角常驻时钟：浅灰小字（与页底标签同色系），不抢版面；无 MouseArea，
+    // 不挡顶部边缘下滑退出等手势。z:300 盖过详情页(z:100)/全屏看图(z:200)，
+    // 所有页面状态都可见；仅校准界面隐藏（其右上角是"跳过"按钮，会重叠）。
+    // 文字落在页面 48px 顶部白边内，不压卡片。每 30 秒取一次当前时刻
+    //（时区与帖子时间一致，见 PageStore::clockText）
+    Text {
+        id: clockLabel
+        z: 300
+        visible: !calib.visible
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.topMargin: 26
+        anchors.rightMargin: 30
+        text: pageStore.clockText()
+        font.pixelSize: 22
+        color: "#999"
+        Timer {
+            interval: 30000
+            repeat: true
+            running: true
+            onTriggered: clockLabel.text = pageStore.clockText()
+        }
+    }
+
     Rectangle {
         visible: pageStore.loading
         anchors.fill: parent

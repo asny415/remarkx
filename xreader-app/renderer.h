@@ -70,6 +70,10 @@ public:
     // 加载字体（baseDir/fonts/remarkx-cjk.ttf）
     void configure(const QString &baseDir);
 
+    // 当前时刻字符串（"MM-dd HH:mm 星期X"），与帖子时间同一时区
+    //（config.json "timezone"，未配置则设备本地时区），供主界面常驻时钟
+    QString nowClock() const;
+
     // 全文流式双栏分页。fullText=true（详情页）时正文/引用不再按行数截断
     QVector<RenderPage> paginate(const QVector<XTweet> &feed,
                                  bool fullText = false);

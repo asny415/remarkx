@@ -96,6 +96,11 @@ void PageStore::configure(const QString &baseDir)
 void PageStore::setInk(InkItem *ink) { m_ink = ink; }
 void PageStore::setWindow(QQuickWindow *window) { m_window = window; }
 
+QString PageStore::clockText()
+{
+    return m_renderer ? m_renderer->nowClock() : QString();
+}
+
 void PageStore::setStatus(const QString &s)
 {
     if (m_status != s) {

@@ -97,6 +97,9 @@ public slots:
     Q_INVOKABLE void setCalib(const QString &file);
     // 页面展示后请求一次全屏强制刷新，清除墨水屏残影
     Q_INVOKABLE void requestFullRefresh();
+    // 右上角常驻时钟：配置时区的当前时刻（"MM-dd HH:mm 星期X"，
+    // 与帖子时间显示同一时区），QML 侧定时轮询
+    Q_INVOKABLE QString clockText();
     // 手指点按命中图片槽位 → 返回槽位索引（-1 = 未命中）
     Q_INVOKABLE int hitSlot(int x, int y);
     // 手指点按落在卡片内 → 返回推文 id（"" = 未命中）。整张卡片（头部/

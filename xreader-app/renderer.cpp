@@ -1350,6 +1350,18 @@ QString Renderer::absTime(const QString &createdAt) const
     return local.toString(QStringLiteral("yyyy-MM-dd HH:mm"));
 }
 
+QString Renderer::nowClock() const
+{
+    // 主界面右上角常驻时钟：时区与帖子时间一致（absTime 同一套逻辑）
+    const QDateTime local = m_tz.isValid()
+            ? QDateTime::currentDateTime().toTimeZone(m_tz)
+            : QDateTime::currentDateTime();
+    static const char *const wd[7] = {
+        "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"};
+    return local.toString(QStringLiteral("MM-dd HH:mm "))
+           + QString::fromUtf8(wd[local.date().dayOfWeek() % 7]);
+}
+
 QImage Renderer::avatar(const XTweet &t) const
 {
     if (t.avatar.isEmpty())

@@ -78,6 +78,13 @@ cmake --build build
 
 ## 部署与运行
 
+**部署纪律：未经用户明确指示，Agent 不得部署**——不运行
+`install-remarkable.sh`、不 SSH/SCP 连设备、不改动设备端任何文件。
+部署会停服务并覆盖正在运行的阅读器，且设备 IP 未记录在仓库中
+（需向用户确认）。构建、改码、本地验证、git 提交均不受此限。
+（2026-09 一次修完 bug 后 Agent 自行扫局域网找设备 IP 准备部署，
+被用户制止，故记入此条。）
+
 ```bash
 ./deploy/install-remarkable.sh <设备IP> \
     [--proxy http://PC:7890] \

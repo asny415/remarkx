@@ -320,6 +320,20 @@ void PageStore::onMediaReady(const QString &tweetId)
     remarkxSetCtx("onMediaReady");
     // 详情页：当前页槽位刷新 + 头像去抖重绘（feed 分支不受影响，继续执行）
     if (!m_detail.isEmpty()) {
+        // 媒体路径/头像写回发生在 XClient 的容器（feed 或详情会话回复缓存），
+        // lv.feed 里的副本是本地快照，必须在此刷回，否则 buildDetailSlotList
+        // 读不到路径（回复图片永远占位）。各层都刷：被盖住的层也有在途下载。
+        if (const XTweet *auth = m_client->findTweet(tweetId)) {
+            for (DetailLevel &l : m_detail) {
+                for (XTweet &t : l.feed) {
+                    if (t.id == tweetId) {
+                        t.media = auth->media;
+                        t.quoted.media = auth->quoted.media;
+                        t.avatar = auth->avatar;
+                    }
+                }
+            }
+        }
         DetailLevel &lv = m_detail.last();
         if (lv.page >= 0 && lv.page < lv.pages.size()) {
             bool onCurrent = false;
@@ -758,7 +772,6 @@ void PageStore::openDetailTweet(const XTweet &focal)
     renderDetailCurrent();
     updateDetailStatus();
     emit detailVisibleChanged();
-    requestDetailSlotMedia();
     // 回复第一页（热度序）；该帖回复已有缓存时 XClient 立即发出
     m_client->fetchDetail(lv.tweetId);
 }
@@ -817,6 +830,7 @@ void PageStore::renderDetailCurrent(bool force)
     }
     m_detailFile = QStringLiteral("image://pages/detail?r=%1").arg(++m_detailRev);
     buildDetailSlotList();
+    requestDetailSlotMedia();   // 同 renderCurrent：每次渲染都为当前页请求媒体
     emit detailFileChanged();
     emit detailSlotsChanged();
     // 换页计数（供 QML 每 N 页强制刷新）：含层号，换层同页也算换页
@@ -959,7 +973,6 @@ void PageStore::onDetailReady(const QString &tweetId,
             lv.page = qMin(lv.page + 1, qMax(0, lv.pages.size() - 1));
         }
         renderDetailCurrent();
-        requestDetailSlotMedia();
     } else {
         lv.dirty = true;   // 被更深层盖着：回到该层时补重排
     }
@@ -1058,7 +1071,6 @@ void PageStore::detailBack()
         return;
     }
     renderDetailCurrent();   // 新顶层可能 dirty（回复在背景里追加过）
-    requestDetailSlotMedia();
     updateDetailStatus();
 }
 

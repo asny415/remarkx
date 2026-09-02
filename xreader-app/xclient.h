@@ -103,6 +103,11 @@ public:
     bool fetchDetail(const QString &tweetId);
     bool fetchDetailNext(const QString &tweetId);
 
+    // 在已知容器（feed 或任一详情页会话的回复缓存）中按 id 找推文；
+    // 媒体下载/路径写回都经此定位——详情回复不在 feed 里，只查 m_tweets
+    // 会让回复的图片永远不下载。找不到返回 nullptr。
+    XTweet *findTweet(const QString &tweetId);
+
 public slots:
     void start();          // 抓取首页（重建 feed）
     void refresh();        // 同 start()，语义为"刷新"

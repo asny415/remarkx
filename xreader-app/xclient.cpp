@@ -981,45 +981,43 @@ static QString mediaKey(const QString &tweetId, int mediaIndex, bool quoted)
 bool XClient::cacheHit(const QString &tweetId, const Job &job)
 {
     remarkxSetCtx("xclient:cacheHit");
-    for (int idx = 0; idx < m_tweets.size(); ++idx) {
-        if (m_tweets[idx].id != tweetId)
-            continue;
-        QVector<XMedia> *list = job.quotedMediaIndex >= 0
-                                    ? &m_tweets[idx].quoted.media
-                                    : &m_tweets[idx].media;
-        if (job.isAvatar) {
-            const QString rel = job.base + ".jpg";
-            const QString full = m_mediaDir + "/" + rel;
-            if (QFile::exists(full) && QFileInfo(full).size() > 0) {
-                m_tweets[idx].avatar = rel;
-                ++m_feedRev;
-                return true;
-            }
-            return false;
-        }
-        if (list->isEmpty())
-            return false;
-        // 防越界：任务快照的索引可能因 feed 重建而失效
-        const int mi = job.mediaIndex >= 0 ? job.mediaIndex
-                                           : job.quotedMediaIndex;
-        if (mi < 0 || mi >= list->size())
-            return false;
-        XMedia &m = (*list)[mi];
-        for (const char *ext : {".jpg", ".png"}) {
-            const QString full = m_mediaDir + "/" + job.base + ext;
-            if (QFile::exists(full) && QFileInfo(full).size() > 0) {
-                m.path = job.base + ext;
-                // 纯转推：引用块媒体同步
-                if (job.quotedMediaIndex < 0
-                        && m_tweets[idx].isRetweet
-                        && job.mediaIndex < m_tweets[idx].quoted.media.size()) {
-                    m_tweets[idx].quoted.media[job.mediaIndex].path = m.path;
-                }
-                ++m_feedRev;
-                return true;
-            }
+    // 推文可能在 feed 或详情会话回复缓存（命中也要写回媒体管线看到的
+    // 那份，否则下次仍会重新下载）
+    XTweet *t = findTweet(tweetId);
+    if (!t)
+        return false;
+    QVector<XMedia> *list = job.quotedMediaIndex >= 0
+                                ? &t->quoted.media : &t->media;
+    if (job.isAvatar) {
+        const QString rel = job.base + ".jpg";
+        const QString full = m_mediaDir + "/" + rel;
+        if (QFile::exists(full) && QFileInfo(full).size() > 0) {
+            t->avatar = rel;
+            ++m_feedRev;
+            return true;
         }
         return false;
+    }
+    if (list->isEmpty())
+        return false;
+    // 防越界：任务快照的索引可能因 feed 重建而失效
+    const int mi = job.mediaIndex >= 0 ? job.mediaIndex
+                                       : job.quotedMediaIndex;
+    if (mi < 0 || mi >= list->size())
+        return false;
+    XMedia &m = (*list)[mi];
+    for (const char *ext : {".jpg", ".png"}) {
+        const QString full = m_mediaDir + "/" + job.base + ext;
+        if (QFile::exists(full) && QFileInfo(full).size() > 0) {
+            m.path = job.base + ext;
+            // 纯转推：引用块媒体同步
+            if (job.quotedMediaIndex < 0 && t->isRetweet
+                    && job.mediaIndex < t->quoted.media.size()) {
+                t->quoted.media[job.mediaIndex].path = m.path;
+            }
+            ++m_feedRev;
+            return true;
+        }
     }
     return false;
 }
@@ -1059,25 +1057,22 @@ void XClient::saveMedia(const QString &tweetId, const Job &job,
         qWarning() << "cannot write media" << full;
         return;
     }
-    // 把路径写回 feed 里的对应媒体
-    for (int idx = 0; idx < m_tweets.size(); ++idx) {
-        if (m_tweets[idx].id != tweetId)
-            continue;
+    // 把路径写回对应推文（feed 或详情会话回复缓存）里的媒体
+    if (XTweet *t = findTweet(tweetId)) {
         if (job.isAvatar) {
-            m_tweets[idx].avatar = base;
+            t->avatar = base;
         } else {
             QVector<XMedia> *list = job.quotedMediaIndex >= 0
-                                        ? &m_tweets[idx].quoted.media
-                                        : &m_tweets[idx].media;
+                                        ? &t->quoted.media : &t->media;
             // 防越界：任务快照的索引可能因 feed 重建而失效
             const int mi = job.mediaIndex >= 0 ? job.mediaIndex
                                                : job.quotedMediaIndex;
             if (mi >= 0 && mi < list->size())
                 (*list)[mi].path = base;
             // 纯转推：原帖媒体同时是引用块媒体，路径同步过去
-            if (job.quotedMediaIndex < 0 && m_tweets[idx].isRetweet
-                    && job.mediaIndex < m_tweets[idx].quoted.media.size()) {
-                m_tweets[idx].quoted.media[job.mediaIndex].path = base;
+            if (job.quotedMediaIndex < 0 && t->isRetweet
+                    && job.mediaIndex < t->quoted.media.size()) {
+                t->quoted.media[job.mediaIndex].path = base;
             }
         }
     }
@@ -1096,6 +1091,23 @@ void XClient::finishMedia(const QString &tweetId)
     emit mediaReady(tweetId);
 }
 
+XTweet *XClient::findTweet(const QString &tweetId)
+{
+    for (int i = 0; i < m_tweets.size(); ++i) {
+        if (m_tweets[i].id == tweetId)
+            return &m_tweets[i];
+    }
+    // 详情回复：不在 feed，存在详情页会话的回复缓存里（同一条回复可能
+    // 属于多个会话，需逐个找）
+    for (auto it = m_details.begin(); it != m_details.end(); ++it) {
+        for (int i = 0; i < it->replies.size(); ++i) {
+            if (it->replies[i].id == tweetId)
+                return &it->replies[i];
+        }
+    }
+    return nullptr;
+}
+
 void XClient::ensureMediaFor(QString tweetId)
 {
     remarkxSetCtx("xclient:ensureMediaFor");
@@ -1103,19 +1115,13 @@ void XClient::ensureMediaFor(QString tweetId)
         return;
     m_inflightMedia.insert(tweetId);
 
-    int idx = -1;
-    for (int i = 0; i < m_tweets.size(); ++i) {
-        if (m_tweets[i].id == tweetId) {
-            idx = i;
-            break;
-        }
-    }
-    if (idx < 0) {
+    XTweet *found = findTweet(tweetId);
+    if (!found) {
         m_inflightMedia.remove(tweetId);
         return;
     }
-    // 快照当前条目（异步期间 feed 可能被重建/追加，不能持有引用）
-    const XTweet t = m_tweets.at(idx);
+    // 快照当前条目（异步期间 feed/会话可能被重建/追加，不能持有引用）
+    const XTweet t = *found;
 
     QVector<Job> jobs;
     for (int i = 0; i < t.media.size(); ++i) {

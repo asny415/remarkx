@@ -48,7 +48,7 @@ static const int STATS_H = 30;
 static const int AVATAR_D = 56;
 static const int AVATAR_GAP = 14;
 
-// 卡片文本最大行数：超出截断并显示"显示全文"按钮（长文/长译文都适用）
+// 卡片文本最大行数（feed 视图）：超出截断；完整文本在详情页（fullText）展示
 static const int BODY_MAX_LINES = 6;
 static const int QUOTED_MAX_LINES = 4;
 
@@ -439,16 +439,6 @@ Renderer::Atom Renderer::makeFloatCard(const XTweet &t, const Atom &img)
         statsRight = st.mid(sep + 1);
     }
 
-    // 卡片内"显示全文"按钮：长文（is_expandable）时内联到最后一个文本行末尾
-    const QString btnLabel = t.isExpandable ? QStringLiteral("显示全文")
-                                            : QString();
-    if (!btnLabel.isEmpty()) {
-        if (!below.isEmpty())
-            attachInlineBtn(&below.last(), font(30), btnLabel, TEXT_W);
-        else if (!beside.isEmpty())
-            attachInlineBtn(&beside.last(), font(30), btnLabel, floatTextW);
-    }
-
     const int besideH = textBlockH(beside, TEXT_LH, PARA_GAP);
     const int belowH = textBlockH(below, TEXT_LH, PARA_GAP);
     const int statsH = st.isEmpty() ? 0 : (STATS_GAP_TOP + STATS_H);
@@ -468,7 +458,6 @@ Renderer::Atom Renderer::makeFloatCard(const XTweet &t, const Atom &img)
     fb.nMedia = img.nMedia;
     fb.floatLines = beside;
     fb.belowLines = below;
-    fb.btnLabel = btnLabel;
     fb.statsLeft = statsLeft;
     fb.statsRight = statsRight;
     return fb;
@@ -520,20 +509,6 @@ Renderer::Atom Renderer::makeQFloatCard(const XTweet &t, const Atom &img)
         statsRight = st.mid(sep + 1);
     }
 
-    // 卡片内"显示全文"按钮：优先挂到当前帖子自己的评论末尾（按钮只属于当前帖子）；
-    // 纯转推（无评论）时才挂到引用的原帖文本末尾
-    const QString btnLabel = (t.isExpandable || t.quoted.isExpandable)
-                                 ? QStringLiteral("显示全文")
-                                 : QString();
-    if (!btnLabel.isEmpty()) {
-        if (!comments.isEmpty())
-            attachInlineBtn(&comments.last(), font(30), btnLabel, TEXT_W);
-        else if (!below.isEmpty())
-            attachInlineBtn(&below.last(), font(26), btnLabel, qtw);
-        else if (!beside.isEmpty())
-            attachInlineBtn(&beside.last(), font(26), btnLabel, floatTextW);
-    }
-
     const int commentH = textBlockH(comments, TEXT_LH, PARA_GAP);
     const int floatH = qMax(dh, textBlockH(beside, TEXT_LH_Q, PARA_GAP_Q))
                        + textBlockH(below, TEXT_LH_Q, PARA_GAP_Q);
@@ -557,14 +532,13 @@ Renderer::Atom Renderer::makeQFloatCard(const XTweet &t, const Atom &img)
     qf.qhandle = t.quoted.authorHandle;
     qf.floatLines = beside;
     qf.belowLines = below;
-    qf.btnLabel = btnLabel;
     qf.statsLeft = statsLeft;
     qf.statsRight = statsRight;
     return qf;
 }
 
 QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
-                                             int ti)
+                                             int ti, bool fullText)
 {
     remarkxSetCtx("render:buildAtoms");
     const XTweet &t = feed[ti];
@@ -615,22 +589,18 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     head.tweetIndex = ti;
     atoms.append(head);
 
-    // 卡片显示 API 默认文本（译文或 full_text），一律限制行数
-    // （"不需要总是显示全文"：长文/长译文/异常超长文本都截断，
-    //  截断时挂"显示全文"按钮进全屏全文页，防止单条超长帖占满整本书）。
-    // "显示全文"触发：卡片被行数截断，或（非译文时）显示的是长推文预览
-    // （legacy.full_text）而完整文本在 note_tweet.text。
-    bool needFullText = false;
+    // 卡片显示 API 默认文本（译文或 full_text）；feed 一律限制行数
+    // （"不需要总是显示全文"：长文/长译文/异常超长文本都截断，防止单条
+    //  超长帖占满整本书）；fullText（详情页）不截断。
+    const int bodyMax = fullText ? 100000 : BODY_MAX_LINES;
+    const int quotedMax = fullText ? 100000 : QUOTED_MAX_LINES;
 
     if (hasQuoted) {
         if (!t.isRetweet) {
             const QString text = cleanText(t.text);
             if (!text.isEmpty()) {
-                const int maxLines = BODY_MAX_LINES;
-                bool truncated = false;
                 const QStringList lns = wrapText(font(30), text, TEXT_W,
-                                                 maxLines, &truncated);
-                needFullText = needFullText || truncated;
+                                                 bodyMax);
                 for (const QString &ln : lns) {
                     Atom a;
                     a.kind = Op::Line;
@@ -652,11 +622,8 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
         atoms.append(qh);
         const QString qtext = cleanText(t.quoted.text);
         if (!qtext.isEmpty()) {
-            const int qmax = QUOTED_MAX_LINES;
-            bool truncated = false;
             const QStringList lns = wrapText(font(26), qtext, TEXT_W - QIND,
-                                             qmax, &truncated);
-            needFullText = needFullText || truncated;
+                                             quotedMax);
             for (const QString &ln : lns) {
                 Atom a;
                 a.kind = Op::QLine;
@@ -671,11 +638,8 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     } else {
         const QString text = cleanText(t.text);
         if (!text.isEmpty()) {
-            const int maxLines = BODY_MAX_LINES;
-            bool truncated = false;
             const QStringList lns = wrapText(font(30), text, TEXT_W,
-                                             maxLines, &truncated);
-            needFullText = needFullText || truncated;
+                                             bodyMax);
             for (const QString &ln : lns) {
                 Atom a;
                 a.kind = Op::Line;
@@ -687,37 +651,6 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
         Atom a = imgAtom(feed, ti, false, 0);
         if (a.kind == Op::Img)
             atoms.append(a);
-    }
-
-    // API 标记的长文（note_tweet.is_expandable）：完整文本仍在 note_tweet 里
-    if (t.isExpandable)
-        needFullText = true;
-    if (hasQuoted && t.quoted.isExpandable)
-        needFullText = true;
-
-    // 有完整文本可看 → "显示全文"只内联到当前帖子自己的最后一个文本行末尾
-    // （不另占一行；转发/引用的原帖文本末尾不挂按钮——按钮只属于当前帖子）
-    if (needFullText) {
-        bool attached = false;
-        for (int i = atoms.size() - 1; i >= 0; --i) {
-            Atom &a = atoms[i];
-            if (a.kind == Op::Line) {
-                attachInlineBtn(&a.text, font(30), QStringLiteral("显示全文"),
-                                TEXT_W);
-                a.btnSuffix = QStringLiteral("显示全文");
-                attached = true;
-                break;
-            }
-        }
-        // 兜底：当前帖子没有自己的文本（纯转推等）时按钮独立成行放卡片末尾，
-        // 而不是挂到转发的原帖文本末尾
-        if (!attached) {
-            Atom a;
-            a.kind = Op::FullText;
-            a.h = TEXT_LH;
-            a.text = QStringLiteral("显示全文");
-            atoms.append(a);
-        }
     }
 
     const QString st = statsText(t);
@@ -733,7 +666,8 @@ QVector<Renderer::Atom> Renderer::buildAtoms(const QVector<XTweet> &feed,
     return atoms;
 }
 
-QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
+QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed,
+                                       bool fullText)
 {
     remarkxSetCtx("render:paginate");
     QVector<RenderPage> pages;
@@ -806,7 +740,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 && !hasMedia && !hasQuoted && !hasQMedia)
             continue;
 
-        QVector<Atom> atoms = buildAtoms(feed, ti);
+        QVector<Atom> atoms = buildAtoms(feed, ti, fullText);
         chunkIdx = -1;
         chunkWasSplit = false;
         int lastKind = Op::Head;
@@ -823,7 +757,6 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
             if (chunkIdx < 0) {
                 const bool cont = chunkWasSplit
                                   && (a.kind == Op::Line || a.kind == Op::QLine
-                                      || a.kind == Op::FullText
                                       || a.kind == Op::QHead);
                 openChunk(cont, pti);
             }
@@ -855,34 +788,8 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 op.imgH = a.dh;
                 op.floatLines = a.floatLines;
                 op.belowLines = a.belowLines;
-                op.btnLabel = a.btnLabel;
                 op.statsLeft = a.statsLeft;
                 op.statsRight = a.statsRight;
-                // 行尾内联"显示全文"按钮热区（挂在最后一个文本行）
-                if (!a.btnLabel.isEmpty()) {
-                    const int besideH = textBlockH(a.floatLines, TEXT_LH,
-                                                   PARA_GAP);
-                    const int belowH = textBlockH(a.belowLines, TEXT_LH,
-                                                  PARA_GAP);
-                    const QFont lf = font(30);
-                    int bx, btnY;
-                    if (!a.belowLines.isEmpty()) {
-                        btnY = op.y + HEAD_H + 8 + qMax(a.dh, besideH)
-                               + belowH - TEXT_LH;
-                        bx = colX(col) + PAD
-                             + int(textWidth(lf, a.belowLines.last())) + 10;
-                    } else {
-                        btnY = op.y + HEAD_H + 8 + besideH - TEXT_LH;
-                        bx = colX(col) + PAD
-                             + int(textWidth(lf, a.floatLines.last())) + 10;
-                    }
-                    TextButton btn;
-                    btn.rect = QRect(bx, btnY,
-                                     int(textWidth(font(26, true), a.btnLabel)),
-                                     TEXT_LH);
-                    btn.tweetIndex = pti;
-                    pages[p].buttons.append(btn);
-                }
                 break;
             }
             case Op::QFloatCard: {
@@ -911,83 +818,14 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 op.qhandle = a.qhandle;
                 op.floatLines = a.floatLines;
                 op.belowLines = a.belowLines;
-                op.btnLabel = a.btnLabel;
                 op.statsLeft = a.statsLeft;
                 op.statsRight = a.statsRight;
-                // 行尾内联"显示全文"按钮热区（评论行优先，其次引用文本行）
-                if (!a.btnLabel.isEmpty()) {
-                    if (!a.commentLines.isEmpty()) {
-                        const int btnY = op.y + HEAD_H + commentH - TEXT_LH;
-                        const int bx = colX(col) + PAD
-                                       + int(textWidth(font(30),
-                                                       a.commentLines.last()))
-                                       + 10;
-                        TextButton btn;
-                        btn.rect = QRect(bx, btnY,
-                                         int(textWidth(font(26, true),
-                                                       a.btnLabel)),
-                                         TEXT_LH);
-                        btn.tweetIndex = pti;
-                        pages[p].buttons.append(btn);
-                    } else {
-                        const int besideH = textBlockH(a.floatLines, TEXT_LH_Q,
-                                                       PARA_GAP_Q);
-                        const int belowH = textBlockH(a.belowLines, TEXT_LH_Q,
-                                                      PARA_GAP_Q);
-                        const QFont lf = font(26);
-                        int bx, btnY;
-                        if (!a.belowLines.isEmpty()) {
-                            btnY = imgY + qMax(a.dh, besideH) + belowH
-                                   - TEXT_LH_Q;
-                            bx = colX(col) + PAD + QIND
-                                 + int(textWidth(lf, a.belowLines.last())) + 10;
-                        } else {
-                            btnY = imgY + besideH - TEXT_LH_Q;
-                            bx = colX(col) + PAD + QIND
-                                 + int(textWidth(lf, a.floatLines.last())) + 10;
-                        }
-                        TextButton btn;
-                        btn.rect = QRect(bx, btnY,
-                                         int(textWidth(font(26, true),
-                                                       a.btnLabel)),
-                                         TEXT_LH_Q);
-                        btn.tweetIndex = pti;
-                        pages[p].buttons.append(btn);
-                    }
-                }
                 break;
             }
             case Op::Line:
             case Op::QLine:
                 op.y = grow(a.h);
                 op.text = a.text;
-                op.btnSuffix = a.btnSuffix;
-                // 行尾内联"显示全文"按钮热区
-                if (!a.btnSuffix.isEmpty()) {
-                    const bool isQ = (a.kind == Op::QLine);
-                    const QFont lf = isQ ? font(26) : font(30);
-                    const int tx = colX(col) + PAD + (isQ ? QIND : 0);
-                    const int bx = tx + int(textWidth(lf, a.text)) + 10;
-                    TextButton btn;
-                    btn.rect = QRect(bx, op.y,
-                                     int(textWidth(font(26, true), a.btnSuffix)),
-                                     a.h);
-                    btn.tweetIndex = pti;
-                    pages[p].buttons.append(btn);
-                }
-                break;
-            case Op::FullText:
-                op.y = grow(a.h);
-                op.text = a.text;
-                // 记录"显示全文"按钮热区（用于点按打开全文全屏）
-                {
-                    TextButton btn;
-                    btn.rect = QRect(colX(col) + PAD, op.y,
-                                     int(textWidth(font(26, true), a.text)),
-                                     a.h);
-                    btn.tweetIndex = pti;
-                    pages[p].buttons.append(btn);
-                }
                 break;
             case Op::QHead:
                 op.y = grow(a.h);
@@ -1054,7 +892,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
                 if (ft.text.trimmed().isEmpty() && ft.comment.trimmed().isEmpty()
                         && !hasMedia && !hasQuoted && !hasQMedia)
                     continue;
-                QVector<Atom> fats = buildAtoms(feed, fi);
+                QVector<Atom> fats = buildAtoms(feed, fi, fullText);
                 // 先文本后图片的卡也能补位：整卡放得下就整卡补；放不下但前面有
                 // 文字时，把文字截断续排进当前栏，图片（及剩余文字）整张不截断，
                 // 在下一栏续排（不打断图片，也不把别的帖插进该帖两段之间）。
@@ -1221,7 +1059,7 @@ QVector<RenderPage> Renderer::paginate(const QVector<XTweet> &feed)
 
 QImage Renderer::renderPage(const QVector<XTweet> &feed,
                             const QVector<RenderPage> &pages, int pageIndex,
-                            bool withPhotos)
+                            bool withPhotos, bool pageHint)
 {
     remarkxSetCtx("render:renderPage");
     QImage img(W, H, QImage::Format_RGB32);
@@ -1240,6 +1078,14 @@ QImage Renderer::renderPage(const QVector<XTweet> &feed,
     const RenderPage &page = pages.at(pageIndex);
     for (const RenderChunk &chunk : page.chunks)
         drawCard(p, feed, chunk, page, withPhotos);
+    // feed 第一页：页底边距画操作提示（点按帖子进详情页）
+    if (pageHint) {
+        p.setFont(font(24));
+        p.setPen(FG_FAINT);
+        p.drawText(QRectF(MARGIN, H - 42, CONTENT_W, 30),
+                   Qt::AlignHCenter | Qt::AlignTop,
+                   QStringLiteral("点按帖子查看全文与回复"));
+    }
     p.end();
     return img;
 }
@@ -1341,7 +1187,6 @@ QImage Renderer::renderFavorite(const QVector<XTweet> &feed,
             op.imgH = a.dh;
             op.floatLines = a.floatLines;
             op.belowLines = a.belowLines;
-            op.btnLabel = a.btnLabel;
             op.statsLeft = a.statsLeft;
             op.statsRight = a.statsRight;
             break;
@@ -1372,19 +1217,12 @@ QImage Renderer::renderFavorite(const QVector<XTweet> &feed,
             op.qhandle = a.qhandle;
             op.floatLines = a.floatLines;
             op.belowLines = a.belowLines;
-            op.btnLabel = a.btnLabel;
             op.statsLeft = a.statsLeft;
             op.statsRight = a.statsRight;
             break;
         }
         case Op::Line:
         case Op::QLine:
-            op.y = cy;
-            cy += a.h;
-            op.text = a.text;
-            op.btnSuffix = a.btnSuffix;
-            break;
-        case Op::FullText:
             op.y = cy;
             cy += a.h;
             op.text = a.text;
@@ -1648,29 +1486,6 @@ void Renderer::drawLine(QPainter &p, const QString &text, int x, int y,
     p.drawText(QRectF(x, y, TEXT_W, 4000), Qt::AlignLeft | Qt::AlignTop, text);
 }
 
-void Renderer::attachInlineBtn(QString *line, const QFont &lineFont,
-                               const QString &btn, qreal lineMaxWidth) const
-{
-    const QFont bf = font(26, true);
-    const int gap = 10;
-    const qreal avail = lineMaxWidth - textWidth(bf, btn) - gap;
-    if (avail <= 0)
-        return;
-    if (textWidth(lineFont, *line) > avail)
-        *line = ellipsize(lineFont, *line, avail);
-}
-
-void Renderer::drawInlineBtn(QPainter &p, int x, int y, const QString &btn,
-                             int lineH) const
-{
-    const QFont bf = font(26, true);
-    p.setFont(bf);
-    p.setPen(QColor("#1a6b9c"));
-    p.drawText(QRectF(x, y, TEXT_W, lineH), Qt::AlignLeft | Qt::AlignTop, btn);
-    const int tw = int(textWidth(bf, btn));
-    p.drawLine(x, y + lineH - 8, x + tw, y + lineH - 8);
-}
-
 void Renderer::drawQuotedBar(QPainter &p, int x, int y0, int y1) const
 {
     p.setPen(QPen(FG_FAINT, 2));
@@ -1789,20 +1604,12 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
         case Op::Head:
             drawHead(p, t, px, op.y);
             break;
-        case Op::Line: {
+        case Op::Line:
             drawLine(p, op.text, px, op.y, font(30), FG);
-            if (!op.btnSuffix.isEmpty())
-                drawInlineBtn(p, px + int(textWidth(font(30), op.text)) + 10,
-                              op.y, op.btnSuffix, TEXT_LH);
             break;
-        }
         case Op::QLine: {
             drawQuotedBar(p, r.x() + 10, op.y - 2, op.y + TEXT_LH_Q + 2);
             drawLine(p, op.text, px + QIND, op.y, font(26), FG_DIM);
-            if (!op.btnSuffix.isEmpty())
-                drawInlineBtn(p, px + QIND
-                                    + int(textWidth(font(26), op.text)) + 10,
-                              op.y, op.btnSuffix, TEXT_LH_Q);
             break;
         }
         case Op::Img:
@@ -1866,18 +1673,6 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
             for (const QString &ln : op.belowLines) {
                 drawLine(p, ln, px, by, font(30), FG);
                 by += ln.isEmpty() ? PARA_GAP : TEXT_LH;
-            }
-            // "显示全文"内联在最后一个文本行末尾（不另占一行）
-            if (!op.btnLabel.isEmpty()) {
-                const QFont lf = font(30);
-                if (!op.belowLines.isEmpty())
-                    drawInlineBtn(p, px + int(textWidth(lf, op.belowLines.last()))
-                                          + 10,
-                                  by - TEXT_LH, op.btnLabel, TEXT_LH);
-                else if (!op.floatLines.isEmpty())
-                    drawInlineBtn(p, px + int(textWidth(lf, op.floatLines.last()))
-                                          + 10,
-                                  ly - TEXT_LH, op.btnLabel, TEXT_LH);
             }
             // 统计行
             if (!op.statsLeft.isEmpty()) {
@@ -1963,31 +1758,6 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
                 drawLine(p, ln, qx, by, font(26), FG_DIM);
                 by += ln.isEmpty() ? PARA_GAP_Q : TEXT_LH_Q;
             }
-            // "显示全文"内联在最后一个文本行末尾（评论行优先，其次引用文本行；
-            // 不另占一行）
-            if (!op.btnLabel.isEmpty()) {
-                if (!op.commentLines.isEmpty())
-                    drawInlineBtn(p, px
-                                         + int(textWidth(font(30),
-                                                         op.commentLines.last()))
-                                         + 10,
-                                  commentEndY - TEXT_LH, op.btnLabel, TEXT_LH);
-                else {
-                    const QFont lf = font(26);
-                    if (!op.belowLines.isEmpty())
-                        drawInlineBtn(p, qx
-                                             + int(textWidth(lf,
-                                                             op.belowLines.last()))
-                                             + 10,
-                                      by - TEXT_LH_Q, op.btnLabel, TEXT_LH_Q);
-                    else if (!op.floatLines.isEmpty())
-                        drawInlineBtn(p, qx
-                                             + int(textWidth(lf,
-                                                             op.floatLines.last()))
-                                             + 10,
-                                      ly - TEXT_LH_Q, op.btnLabel, TEXT_LH_Q);
-                }
-            }
             // 统计行
             if (!op.statsLeft.isEmpty()) {
                 const int yy = by + STATS_GAP_TOP;
@@ -2013,169 +1783,6 @@ void Renderer::drawCard(QPainter &p, const QVector<XTweet> &feed,
             }
             break;
         }
-        case Op::FullText: {
-            const QFont fb = font(26, true);
-            p.setFont(fb);
-            p.setPen(QColor("#1a6b9c"));
-            p.drawText(QRectF(px, op.y, TEXT_W, TEXT_LH),
-                       Qt::AlignLeft | Qt::AlignTop, op.text);
-            // 下划线链接样式，提示可点
-            const int tw = int(textWidth(fb, op.text));
-            p.drawLine(px, op.y + TEXT_LH - 8, px + tw, op.y + TEXT_LH - 8);
-            break;
-        }
         }
     }
-}
-
-// ---- 全文全屏阅读（单栏，跨页排版） ----
-
-static bool tweetHasQuoted(const XTweet &t)
-{
-    return !t.quoted.authorName.isEmpty()
-           || !t.quoted.text.trimmed().isEmpty()
-           || !t.quoted.media.isEmpty();
-}
-
-QImage Renderer::renderTextPage(const XTweet &t, int pageIndex, int *totalPages)
-{
-    remarkxSetCtx("render:renderTextPage");
-    struct Ln {
-        int page = 0;
-        int y = 0;
-        QString text;
-        int pixel = 30;
-        bool bold = false;
-        QColor color;
-        bool divider = false;   // 画分隔横线
-        bool bar = false;       // 引用块左竖线
-    };
-    QVector<Ln> lns;
-    const int x = MARGIN;
-    const int w = W - 2 * MARGIN;
-    int page = 0, y = TOP_Y;
-    auto take = [&](int lh) {
-        if (y + lh > BOTTOM_Y) {
-            ++page;
-            y = TOP_Y;
-        }
-        const int r = y;
-        y += lh;
-        return r;
-    };
-    auto pushWrapped = [&](const QString &s, int pixel, bool bold,
-                           const QColor &c, int lh, bool bar = false) {
-        const int pg = (lh == TEXT_LH) ? PARA_GAP : PARA_GAP_Q;
-        const QStringList ls = wrapText(font(pixel, bold), s, w, 100000);
-        for (const QString &ln : ls)
-            lns.append({page, take(ln.isEmpty() ? pg : lh), ln, pixel, bold,
-                        c, false, bar});
-    };
-
-    const bool translated = t.translated && !t.sourceLang.isEmpty();
-
-    // 头部
-    {
-        const QString name = t.authorName.isEmpty() ? QStringLiteral("?")
-                                                    : t.authorName;
-        lns.append({page, take(TEXT_LH), name + QStringLiteral("  @")
-                                           + t.authorHandle, 30, true, FG,
-                    false, false});
-        if (t.isRetweet) {
-            lns.append({page, take(30), QStringLiteral("转发了"), 22, false,
-                        FG_DIM, false, false});
-        }
-        QStringList ms;
-        const QString at = absTime(t.createdAt);
-        if (!at.isEmpty())
-            ms << at;
-        if (translated) {
-            const QString zh = langName(t.sourceLang);
-            if (!zh.isEmpty())
-                ms << QStringLiteral("译自 %1").arg(zh);
-        }
-        if (!ms.isEmpty())
-            lns.append({page, take(30), ms.join(QStringLiteral(" · ")), 22,
-                        false, FG_FAINT, false, false});
-        lns.append({page, take(24), QString(), 22, false, CARD_BORDER, true,
-                    false});
-    }
-
-    if (!t.isRetweet) {
-        // 完整文本：译文已覆盖全文则显示译文，否则显示原文全文
-        // （长推文的 note_tweet.text / 普通推文的 full_text）
-        const QString full = t.translated ? cleanText(t.text)
-                                          : cleanText(t.originalText);
-        if (!full.isEmpty())
-            pushWrapped(full, 30, false, FG, TEXT_LH);
-    }
-
-    // 引用块
-    if (tweetHasQuoted(t)) {
-        lns.append({page, take(24), QString(), 22, false, CARD_BORDER, true,
-                    false});
-        const QString qn = t.quoted.authorName.isEmpty()
-                               ? QStringLiteral("?") : t.quoted.authorName;
-        lns.append({page, take(30), qn + QStringLiteral("  @")
-                                       + t.quoted.authorHandle, 26, true, FG,
-                    false, true});
-        if (t.quoted.translated && !t.quoted.sourceLang.isEmpty()) {
-            const QString zh = langName(t.quoted.sourceLang);
-            if (!zh.isEmpty())
-                lns.append({page, take(26),
-                            QStringLiteral("译自 %1").arg(zh), 22, false,
-                            FG_FAINT, false, true});
-        }
-        const QString qfull = t.quoted.translated
-                                  ? cleanText(t.quoted.text)
-                                  : cleanText(t.quoted.originalText);
-        pushWrapped(qfull, 26, false, FG_DIM, TEXT_LH_Q, true);
-    }
-
-    const int total = page + 1;
-    if (totalPages)
-        *totalPages = total;
-    if (pageIndex < 0 || pageIndex >= total)
-        return QImage();
-
-    QImage img(W, H, QImage::Format_RGB32);
-    img.fill(BG);
-    QPainter p(&img);
-    p.setRenderHint(QPainter::Antialiasing, true);
-    p.setRenderHint(QPainter::TextAntialiasing, true);
-    for (const Ln &l : lns) {
-        if (l.page != pageIndex)
-            continue;
-        if (l.divider) {
-            p.setPen(QPen(CARD_BORDER, 2));
-            p.drawLine(x, l.y, x + w, l.y);
-            continue;
-        }
-        int tx = x;
-        if (l.bar) {
-            p.setPen(QPen(FG_FAINT, 2));
-            p.drawLine(x, l.y - 2, x, l.y + TEXT_LH_Q + 2);
-            tx = x + 20;
-        }
-        p.setFont(font(l.pixel, l.bold));
-        p.setPen(l.color);
-        p.drawText(QRectF(tx, l.y, w - (tx - x), 4000),
-                   Qt::AlignLeft | Qt::AlignTop, l.text);
-    }
-    if (total > 1) {
-        p.setFont(font(22));
-        p.setPen(FG_FAINT);
-        p.drawText(QRectF(x, BOTTOM_Y - 8, w, 30),
-                   Qt::AlignHCenter | Qt::AlignTop,
-                   QStringLiteral("第 %1/%2 页").arg(pageIndex + 1).arg(total));
-    }
-    p.end();
-    return img;
-}
-
-int Renderer::textPageCount(const XTweet &t)
-{
-    int total = 0;
-    renderTextPage(t, 0, &total);
-    return total;
 }

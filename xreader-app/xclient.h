@@ -97,6 +97,12 @@ public:
     bool mediaFailed(const QString &tweetId, int mediaIndex,
                      bool quoted) const;
 
+    // 详情页（某帖子的回复，按热度排序）：返回 true=已开始抓取或已有缓存
+    //（detailReady 立即发出）；false=正在抓取中（忽略本次请求）。
+    // 回复在内存按帖子缓存（DetailSession），刷新 feed 时清空。
+    bool fetchDetail(const QString &tweetId);
+    bool fetchDetailNext(const QString &tweetId);
+
 public slots:
     void start();          // 抓取首页（重建 feed）
     void refresh();        // 同 start()，语义为"刷新"
@@ -115,16 +121,27 @@ signals:
     void mediaReady(const QString &tweetId);
     void errorOccurred(const QString &message);
     void fetchingChanged(bool fetching);
+    // 详情页回复到达：fresh=本页新增的回复（已按 rest_id 去重）；
+    // hasMore=true 还有下一页（fetchDetailNext 续抓）
+    void detailReady(const QString &tweetId, const QVector<XTweet> &fresh,
+                     bool hasMore);
+    // 详情页抓取失败（错误文本见 lastError()）
+    void detailFailed(const QString &tweetId);
 
 private:
     void fetchHome();
     void loadSession();
-    QNetworkRequest apiRequest(const QString &op, const QJsonObject &variables);
+    QNetworkRequest apiRequest(const QString &op, const QJsonObject &variables,
+                               const QString &fieldToggles = QString());
     void handleHomeReply(const QString &which, QNetworkReply *reply);
     void maybeMergeHome();
     void handleOlderReply(const QString &which, QNetworkReply *reply);
     void maybeMergeOlder();
     void ingest(const QVector<XTweet> &batch, bool append);
+    void startDetailFetch(const QString &tweetId, bool first);
+    void handleDetailReply(const QString &tweetId, QNetworkReply *reply);
+    static void parseDetail(const QJsonObject &data, QVector<XTweet> *replies,
+                            QString *cursor);
     static QJsonObject unwrapResult(const QJsonObject &result);
     static void parseTimeline(const QJsonObject &data, QVector<XTweet> *items,
                               QString *cursor);
@@ -139,6 +156,16 @@ private:
     static bool hasTranslation(const QJsonObject &r);
     static QVector<XTweet> mergeInterleave(const QVector<XTweet> &fy,
                                            const QVector<XTweet> &fl);
+
+    // 详情页会话：某帖子的回复（按热度排序），cursor 分页。
+    // 回复在内存按帖子缓存，同一帖子再次进入不重抓；refresh() 清空。
+    struct DetailSession {
+        QString cursor;               // 下一页游标（空=没有更多）
+        bool fetching = false;        // 详情页抓取进行中
+        bool firstLoaded = false;     // 第一页已回来（之后进入立即回放缓存）
+        QSet<QString> seen;           // 回复 rest_id 去重
+        QVector<XTweet> replies;      // 已累积回复（热度序，追加式分页）
+    };
 
     // 单个媒体下载任务（快照，跨异步安全）
     struct Job {
@@ -175,6 +202,7 @@ private:
     QString m_cursorFollowing;   // Following 向后翻页游标
 
     bool m_fetching = false;
+    QHash<QString, DetailSession> m_details;   // tweetId -> 详情页会话
     // 首页并发抓取状态
     bool m_homePending = false;
     int m_homeLeft = 0;

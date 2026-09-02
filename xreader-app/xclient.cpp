@@ -28,6 +28,12 @@ static const char *const kUA =
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 static const char *const kOpForYou = "wp06oo3fRGU4P1sK8rECqQ/HomeTimeline";
 static const char *const kOpFollowing = "BLQWpfVqtgBqAqwRRJcJjA/HomeLatestTimeline";
+static const char *const kOpTweetDetail = "XMOz5h24KAZ86qKffKTLdQ/TweetDetail";
+// TweetDetail 专用 fieldToggles（2026-09 抓包提取，与网页端请求一致）
+static const char *const kFieldToggles =
+    R"({"withArticleRichContentState":true,"withArticlePlainText":false,)"
+    R"("withArticleSummaryText":true,"withArticleVoiceOver":true,)"
+    R"("withGrokAnalyze":false,"withDisallowedReplyControls":false})";
 
 static const char *const kFeatures =
     R"({"rweb_video_screen_enabled":false,"rweb_cashtags_enabled":true,)"
@@ -164,7 +170,8 @@ void XClient::loadSession()
 }
 
 QNetworkRequest XClient::apiRequest(const QString &op,
-                                    const QJsonObject &variables)
+                                    const QJsonObject &variables,
+                                    const QString &fieldToggles)
 {
     QUrl url(QString("https://x.com/i/api/graphql/%1").arg(op));
     QUrlQuery q;
@@ -172,6 +179,8 @@ QNetworkRequest XClient::apiRequest(const QString &op,
                    QString::fromUtf8(
                        QJsonDocument(variables).toJson(QJsonDocument::Compact)));
     q.addQueryItem("features", QString::fromUtf8(kFeatures));
+    if (!fieldToggles.isEmpty())
+        q.addQueryItem("fieldToggles", fieldToggles);
     url.setQuery(q);
 
     QNetworkRequest req(url);
@@ -218,6 +227,7 @@ void XClient::refresh()
     m_lastError.clear();
     m_fetching = true;
     emit fetchingChanged(true);
+    m_details.clear();   // 刷新后回复按新 feed 重新抓取
     fetchHome();
 }
 
@@ -505,6 +515,143 @@ QVector<XTweet> XClient::mergeInterleave(const QVector<XTweet> &fy,
         }
     }
     return out;
+}
+
+// ---- 详情页（某帖子的回复，按热度排序） ----
+// 网页端帖子详情页同款接口：TweetDetail，rankingMode=Relevance 即"按热度"。
+// 响应里 conversationthread-* 模块按热度分组，组内 items 有序；cursor 分页
+// （下一页请求带上一次的 cursor-bottom，抓包确认 next==last）。
+
+bool XClient::fetchDetail(const QString &tweetId)
+{
+    remarkxSetCtx("xclient:fetchDetail");
+    if (tweetId.isEmpty())
+        return false;
+    DetailSession &s = m_details[tweetId];
+    if (s.fetching)
+        return false;   // 该帖正在抓取（深层翻页/首抓），本次忽略
+    if (s.firstLoaded) {
+        // 已有缓存：立即回放全部已加载回复（不重抓）
+        emit detailReady(tweetId, s.replies, !s.cursor.isEmpty());
+        return true;
+    }
+    startDetailFetch(tweetId, true);
+    return true;
+}
+
+bool XClient::fetchDetailNext(const QString &tweetId)
+{
+    remarkxSetCtx("xclient:fetchDetailNext");
+    auto it = m_details.find(tweetId);
+    if (it == m_details.end() || it->fetching || it->cursor.isEmpty())
+        return false;
+    startDetailFetch(tweetId, false);
+    return true;
+}
+
+void XClient::startDetailFetch(const QString &tweetId, bool first)
+{
+    remarkxSetCtx("xclient:startDetailFetch");
+    DetailSession &s = m_details[tweetId];
+    s.fetching = true;
+    QJsonObject vars;
+    vars["focalTweetId"] = tweetId;
+    vars["with_rux_injections"] = false;
+    vars["rankingMode"] = "Relevance";
+    vars["includePromotedContent"] = true;
+    vars["withCommunity"] = true;
+    vars["withQuickPromoteEligibilityTweetFields"] = true;
+    vars["withBirdwatchNotes"] = true;
+    vars["withVoice"] = true;
+    if (!first) {
+        vars["cursor"] = s.cursor;
+        vars["referrer"] = "tweet";
+    }
+    QNetworkRequest req = apiRequest(kOpTweetDetail, vars, kFieldToggles);
+    QNetworkReply *reply = m_nam.get(req);
+    connect(reply, &QNetworkReply::finished, this,
+            [this, tweetId, reply]() { handleDetailReply(tweetId, reply); });
+}
+
+void XClient::handleDetailReply(const QString &tweetId, QNetworkReply *reply)
+{
+    remarkxSetCtx("xclient:handleDetailReply");
+    reply->deleteLater();
+    auto it = m_details.find(tweetId);
+    if (it == m_details.end())
+        return;   // 会话已被刷新清空（抓取途中刷新了 feed），静默丢弃
+    DetailSession *s = &*it;
+    s->fetching = false;
+    if (reply->error() != QNetworkReply::NoError) {
+        // 详情页失败走专用信号（不复用 errorOccurred——那是 feed 级错误，
+        // 会弹全局错误页把正在读的 feed 也盖掉）
+        m_lastError = replyErrorText(reply);
+        qWarning() << "XClient detail error:" << tweetId << m_lastError;
+        emit detailFailed(tweetId);
+        return;
+    }
+    const QJsonObject data = QJsonDocument::fromJson(reply->readAll()).object();
+    QVector<XTweet> batch;
+    QString cursor;
+    parseDetail(data, &batch, &cursor);
+    QVector<XTweet> fresh;
+    for (const XTweet &t : batch) {
+        if (s->seen.contains(t.id))
+            continue;
+        s->seen.insert(t.id);
+        s->replies.append(t);
+        fresh.append(t);
+    }
+    // 本页没有新回复 = 到底了（即使 API 仍给出 cursor），避免死循环
+    s->cursor = fresh.isEmpty() ? QString() : cursor;
+    s->firstLoaded = true;
+    emit detailReady(tweetId, fresh, !s->cursor.isEmpty());
+}
+
+void XClient::parseDetail(const QJsonObject &data, QVector<XTweet> *replies,
+                          QString *cursor)
+{
+    const QJsonObject thread =
+        data["threaded_conversation_with_injections_v2"].toObject();
+    const QJsonArray ins = thread["instructions"].toArray();
+    for (const QJsonValue &iv : ins) {
+        const QJsonObject i = iv.toObject();
+        if (i["type"].toString() != "TimelineAddEntries")
+            continue;
+        const QJsonArray entries = i["entries"].toArray();
+        for (const QJsonValue &ev : entries) {
+            const QJsonObject e = ev.toObject();
+            const QJsonObject content = e["content"].toObject();
+            const QString et = content["entryType"].toString();
+            if (et == "TimelineTimelineCursor") {
+                // 续抓只需要底部游标（忽略 cursor-top）
+                if (!e["entryId"].toString().contains(QLatin1String("cursor-bottom")))
+                    continue;
+                *cursor = content["value"].toString();
+                continue;
+            }
+            if (et != "TimelineTimelineModule")
+                continue;   // TimelineTimelineItem 是主帖本身，复用 feed 里的副本
+            if (e["entryId"].toString().startsWith(
+                    QLatin1String("tweetdetailrelatedtweets")))
+                continue;   // 相关帖子推荐，跳过
+            const QJsonArray items = content["items"].toArray();
+            for (const QJsonValue &itv : items) {
+                const QJsonObject ic = itv.toObject()["item"].toObject()
+                                          ["itemContent"].toObject();
+                if (ic["__typename"].toString() != "TimelineTweet")
+                    continue;
+                if (ic.contains("promotedMetadata"))
+                    continue;   // 广告/推广帖，跳过
+                const QJsonObject result = ic["tweet_results"].toObject()
+                                               ["result"].toObject();
+                XTweet *t = normalize(result);
+                if (t)
+                    replies->append(*t);
+                delete t;
+            }
+        }
+    }
 }
 
 // ---- 响应解析 ----

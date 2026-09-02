@@ -31,84 +31,91 @@ Window {
         }
     }
 
+    // 图片槽位单元：占位框 / 贴图 / 视频播放钮 / 状态文案（基础页
+    // photoLayer 与详情页共用同一委托）
+    Component {
+        id: slotDelegate
+        Item {
+            x: modelData.x
+            y: modelData.y
+            width: modelData.w
+            height: modelData.h
+            Rectangle {
+                anchors.fill: parent
+                color: "#ececec"
+                border.color: "#d9d9d9"
+                border.width: 2
+            }
+            Image {
+                anchors.fill: parent
+                source: modelData.ready ? ("file://" + modelData.path) : ""
+                fillMode: Image.PreserveAspectFit
+                cache: false
+                visible: modelData.ready
+            }
+            // 视频封面：中心圆形播放按钮（仅用于辨识视频，实际不支持播放）
+            Canvas {
+                anchors.centerIn: parent
+                width: 76
+                height: 76
+                visible: modelData.video && modelData.ready
+                onPaint: {
+                    var ctx = getContext("2d")
+                    ctx.clearRect(0, 0, width, height)
+                    ctx.fillStyle = "rgba(0, 0, 0, 0.55)"
+                    ctx.beginPath()
+                    ctx.arc(width / 2, height / 2, width / 2 - 2, 0, Math.PI * 2)
+                    ctx.fill()
+                    ctx.fillStyle = "#ffffff"
+                    ctx.beginPath()
+                    ctx.moveTo(width / 2 - 13, height / 2 - 22)
+                    ctx.lineTo(width / 2 - 13, height / 2 + 22)
+                    ctx.lineTo(width / 2 + 25, height / 2)
+                    ctx.closePath()
+                    ctx.fill()
+                }
+            }
+            Text {
+                anchors.centerIn: parent
+                text: modelData.ready ? "" : (modelData.failed ? "加载失败" : "图片加载中")
+                font.pixelSize: 26
+                color: "#8a8a8a"
+                visible: !modelData.ready
+            }
+            Text {
+                anchors.top: parent.top
+                anchors.right: parent.right
+                anchors.margins: 8
+                text: modelData.nMedia > 1 ? ("共 " + modelData.nMedia + " 图") : ""
+                font.pixelSize: 20
+                font.bold: true
+                color: "white"
+                style: Text.Outline
+                styleColor: "#333333"
+                visible: modelData.nMedia > 1
+            }
+        }
+    }
+
     // 图片懒加载层：底层文字位图只画占位框，这里负责贴图/状态文案
     Item {
         id: photoLayer
         anchors.fill: parent
         Repeater {
             model: pageStore.imageSlots
-            delegate: Item {
-                x: modelData.x
-                y: modelData.y
-                width: modelData.w
-                height: modelData.h
-                Rectangle {
-                    anchors.fill: parent
-                    color: "#ececec"
-                    border.color: "#d9d9d9"
-                    border.width: 2
-                }
-                Image {
-                    anchors.fill: parent
-                    source: modelData.ready ? ("file://" + modelData.path) : ""
-                    fillMode: Image.PreserveAspectFit
-                    cache: false
-                    visible: modelData.ready
-                }
-                // 视频封面：中心圆形播放按钮（仅用于辨识视频，实际不支持播放）
-                Canvas {
-                    anchors.centerIn: parent
-                    width: 76
-                    height: 76
-                    visible: modelData.video && modelData.ready
-                    onPaint: {
-                        var ctx = getContext("2d")
-                        ctx.clearRect(0, 0, width, height)
-                        ctx.fillStyle = "rgba(0, 0, 0, 0.55)"
-                        ctx.beginPath()
-                        ctx.arc(width / 2, height / 2, width / 2 - 2, 0, Math.PI * 2)
-                        ctx.fill()
-                        ctx.fillStyle = "#ffffff"
-                        ctx.beginPath()
-                        ctx.moveTo(width / 2 - 13, height / 2 - 22)
-                        ctx.lineTo(width / 2 - 13, height / 2 + 22)
-                        ctx.lineTo(width / 2 + 25, height / 2)
-                        ctx.closePath()
-                        ctx.fill()
-                    }
-                }
-                Text {
-                    anchors.centerIn: parent
-                    text: modelData.ready ? "" : (modelData.failed ? "加载失败" : "图片加载中")
-                    font.pixelSize: 26
-                    color: "#8a8a8a"
-                    visible: !modelData.ready
-                }
-                Text {
-                    anchors.top: parent.top
-                    anchors.right: parent.right
-                    anchors.margins: 8
-                    text: modelData.nMedia > 1 ? ("共 " + modelData.nMedia + " 图") : ""
-                    font.pixelSize: 20
-                    font.bold: true
-                    color: "white"
-                    style: Text.Outline
-                    styleColor: "#333333"
-                    visible: modelData.nMedia > 1
-                }
-            }
+            delegate: slotDelegate
         }
     }
 
     InkItem {
         id: ink
         anchors.fill: parent
-        // 只在基础页可见时收笔迹：校准/休眠/加载/错误/全屏看图/全屏全文
+        // 只在基础页可见时收笔迹：校准/休眠/加载/错误/全屏看图/详情页
         // 都是盖住整屏的不透明白层，那时笔迹看不见，若留在墨层里会被
         // saveInkNow 当笔迹误收藏帖子
         inkEnabled: !calib.visible && !sleepOverlay.visible
                     && !pageStore.loading && pageStore.error.length === 0
-                    && !fullscreen.visible && !textFs.visible
+                    && !fullscreen.visible && !detail.visible
         Component.onCompleted: {
             setStylus(stylusObj)
             pageStore.setInk(ink)
@@ -116,7 +123,7 @@ Window {
     }
 
     // 全屏左右滑翻页（上下滑移交给顶部/底部边缘条，避免中间误触）；
-    // 手指 tap（小位移+短按）进入 1 秒确认窗口，到期无后续操作才打开图片/全文
+    // 手指 tap（小位移+短按）进入 1 秒确认窗口，到期无后续操作才打开图片/详情
     // 防误触：按下与抬起都要确认笔完全空闲（penActive 为假且距最后一次笔活动
     // >=500ms），堵住"手掌先落屏、笔后开始写、手掌抬起时误触"的竞态；
     // 按压过长且位移仍很小判定为手掌托屏，不作 tap。
@@ -196,22 +203,34 @@ Window {
         root.pendingTapX = -1
         tapConfirm.stop()
     }
-    // 只有基础页接受 tap：校准/休眠/加载/错误/全屏层盖屏时点了没反应。
-    // 图片优先（槽位命中 → 全屏看图）；否则落在"有显示全文按钮的卡片"内
-    // → 全屏看全文（整张卡片都是热区，见 hitCardFullText）
+    // 只有基础页/详情页接受 tap：校准/休眠/加载/错误/全屏看图盖屏时点了
+    // 没反应。图片优先（槽位命中 → 全屏看图）；否则落在卡片内 → 打开详情页
+    // （整张卡片都是热区，见 hitCard / detailHitCard）
     function doTap(x, y) {
         if (calib.visible || sleepOverlay.visible || fullscreen.visible
-                || textFs.visible || pageStore.loading
-                || pageStore.error.length > 0)
+                || pageStore.loading || pageStore.error.length > 0)
             return
-        const idx = pageStore.hitSlot(x, y)
-        if (idx >= 0) {
-            fullscreen.open(idx)
+        if (pageStore.detailVisible) {
+            // 详情页：图片槽位优先（全屏看图，ctx=detail）；否则回复卡片
+            // → 钻入该回复的详情页
+            const dIdx = pageStore.detailHitSlot(x, y)
+            if (dIdx >= 0) {
+                fullscreen.open(dIdx, 1)
+                return
+            }
+            const tid = pageStore.detailHitCard(x, y)
+            if (tid.length > 0)
+                pageStore.openDetail(tid)
             return
         }
-        const tid = pageStore.hitCardFullText(x, y)
+        const idx = pageStore.hitSlot(x, y)
+        if (idx >= 0) {
+            fullscreen.open(idx, 0)
+            return
+        }
+        const tid = pageStore.hitCard(x, y)
         if (tid.length > 0)
-            textFs.open(tid)
+            pageStore.openDetail(tid)
     }
 
     Text {
@@ -618,11 +637,16 @@ Window {
         z: 200
 
         property int slotIndex: -1
+        property int ctx: 0   // 0=基础页槽位 1=详情页槽位
         property var files: []
         property int currentIdx: 0
         property string currentPath: ""
         property string label: ""
 
+        function slotFilesOf(idx) {
+            return ctx === 1 ? pageStore.detailSlotFiles(idx)
+                             : pageStore.slotFiles(idx)
+        }
         function updateCurrent() {
             if (files.length === 0) {
                 currentPath = ""
@@ -634,9 +658,14 @@ Window {
                 label = "图片 " + (currentIdx + 1) + "/" + files.length
             }
         }
-        function open(idx) {
+        function refreshFiles() {
+            files = slotFilesOf(slotIndex)
+            updateCurrent()
+        }
+        function open(idx, ctx_) {
             slotIndex = idx
-            files = pageStore.slotFiles(idx)
+            ctx = ctx_ === undefined ? 0 : ctx_
+            files = slotFilesOf(idx)
             currentIdx = 0
             updateCurrent()
             visible = true
@@ -661,14 +690,16 @@ Window {
             }
         }
 
-        // 媒体懒加载就绪时自动刷新全屏内容
+        // 媒体懒加载就绪时自动刷新全屏内容（按所属上下文取槽位文件）
         Connections {
             target: pageStore
             function onImageSlotsChanged() {
-                if (fullscreen.visible) {
-                    fullscreen.files = pageStore.slotFiles(fullscreen.slotIndex)
-                    fullscreen.updateCurrent()
-                }
+                if (fullscreen.visible && fullscreen.ctx === 0)
+                    fullscreen.refreshFiles()
+            }
+            function onDetailSlotsChanged() {
+                if (fullscreen.visible && fullscreen.ctx === 1)
+                    fullscreen.refreshFiles()
             }
         }
 
@@ -733,46 +764,28 @@ Window {
         }
     }
 
-    // 全文全屏阅读：手指 tap 有"显示全文"按钮的卡片打开（1 秒确认后）；
-    // 左右滑在长文页间切换
+    // 详情页：点按基础页任意卡片打开（主帖全文 + 按热度排序的回复）。
+    // 盖在基础页之上的全屏叠加层（z:100）：基础页状态（页码/笔迹）完整
+    // 保留，返回（顶部边缘下滑）立即恢复。
+    // 手势：左右滑 = 翻页；顶部边缘下滑 = 返回；底部边缘上滑 = 加载更多
+    // 回复；tap = 1 秒确认窗口（图片槽位 → 全屏看图；回复卡片 → 该回复的
+    // 详情页）
     Item {
-        id: textFs
-        visible: false
+        id: detail
+        visible: pageStore.detailVisible
         anchors.fill: parent
-        z: 200
+        z: 100
 
-        property string tweetId: ""
-        property int page: 0
-        property int pages: 1
-        property string sourceUrl: ""
-
-        function open(tid) {
-            tweetId = tid
-            page = 0
-            pages = Math.max(1, pageStore.fullTextPages(tid))
-            sourceUrl = "image://pages/text/" + tweetId + "/" + page
-            visible = true
+        // 开/关都强制整屏刷新一次（清掉基础页/详情页的残影）
+        onVisibleChanged: {
+            if (visible)
+                idleTimer.restart()
             pageStore.requestFullRefresh()
         }
-        function close() {
-            visible = false
-            tweetId = ""
-            pageStore.requestFullRefresh()
-        }
-        function nextPage() {
-            if (page + 1 < pages) {
-                page += 1
-                sourceUrl = "image://pages/text/" + tweetId + "/" + page
-                pageStore.requestFullRefresh()
-            }
-        }
-        function prevPage() {
-            if (page > 0) {
-                page -= 1
-                sourceUrl = "image://pages/text/" + tweetId + "/" + page
-                pageStore.requestFullRefresh()
-            }
-        }
+
+        // 每翻满 5 页强制整屏刷新（与基础页同节奏，防残影累积）
+        property int refreshCount: 0
+        property int lastCountedKey: -1
 
         Rectangle {
             anchors.fill: parent
@@ -780,41 +793,111 @@ Window {
         }
         Image {
             anchors.fill: parent
-            source: textFs.sourceUrl
+            source: pageStore.detailFile
             cache: false
             fillMode: Image.PreserveAspectFit
+            onStatusChanged: {
+                if (status !== Image.Ready)
+                    return
+                if (pageStore.detailPageKey === detail.lastCountedKey)
+                    return
+                detail.lastCountedKey = pageStore.detailPageKey
+                detail.refreshCount += 1
+                if (detail.refreshCount % 5 === 0)
+                    pageStore.requestFullRefresh()
+            }
         }
-        Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: 20
-            text: textFs.pages > 1 ? ("第 " + (textFs.page + 1) + " 页 · 共 "
-                                      + textFs.pages + " 页") : ""
-            font.pixelSize: 26
-            color: "#888888"
+        // 图片懒加载层（与基础页 photoLayer 同一槽位机制/委托）
+        Item {
+            anchors.fill: parent
+            Repeater {
+                model: pageStore.detailSlots
+                delegate: slotDelegate
+            }
         }
         Text {
             anchors.top: parent.top
             anchors.left: parent.left
             anchors.margins: 30
-            text: "点按关闭 · 左右滑翻页"
+            text: "顶部下滑返回 · 左右滑翻页 · 点按帖子看其回复"
             font.pixelSize: 24
             color: "#aaaaaa"
         }
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 24
+            text: pageStore.detailStatus
+            font.pixelSize: 26
+            color: "#888888"
+        }
 
+        // 中间区：tap 确认 + 水平滑翻页（垂直方向交给上/下边缘条）
         MouseArea {
             anchors.fill: parent
-            property point p0
+            property point pressPt
+            property real pressMs: 0   // Date.now() 是 64 位毫秒，int(32 位)会截断
             property bool armed: false
+            onPressed: (mouse) => {
+                idleTimer.restart()
+                // 新的手指按下 = 后续操作：先取消待确认的 tap
+                root.cancelTap()
+                // 手写笔在用/最近写过字：手指触摸一律不算手势
+                if (root.penBusy())
+                    return
+                armed = true
+                pressPt = Qt.point(mouse.x, mouse.y)
+                pressMs = Date.now()
+            }
+            onReleased: (mouse) => {
+                idleTimer.restart()
+                if (!armed)
+                    return
+                armed = false
+                // 抬起时也要复查：手掌落屏后笔可能已开始写，此时抬手不得触发任何手势
+                if (root.penBusy())
+                    return
+                const dx = mouse.x - pressPt.x
+                const dy = mouse.y - pressPt.y
+                const adx = Math.abs(dx)
+                const ady = Math.abs(dy)
+                if (adx < 90 && ady < 90) {
+                    // 小位移区：短按且位移 <=24px 才算干净 tap（arm 进确认窗口）；
+                    // 按太久 = 手掌托屏，24<位移<90 = 不确定，都不算
+                    const dist = Math.sqrt(dx * dx + dy * dy)
+                    const dur = Date.now() - pressMs
+                    if (dur <= root.palmDwellMs && dist <= 24)
+                        root.armTap(mouse.x, mouse.y)
+                    return
+                }
+                // 有效距离 + 主方向水平：翻页（垂直手势由边缘条处理）
+                if (adx < 90 || adx <= ady)
+                    return
+                dx < 0 ? pageStore.detailNext() : pageStore.detailPrev()
+            }
+        }
+        // 顶部边缘：下滑 → 返回；边缘区内小位移的 tap 同样有效（页面
+        // 顶部的卡片）。只认从边缘开始的、距离足够的垂直滑动
+        MouseArea {
+            property point p0
+            property real pressMs: 0   // Date.now() 是 64 位毫秒，int(32 位)会截断
+            property bool armed: false
+            x: 0
+            y: 0
+            width: parent.width
+            height: 140
+            enabled: stylusObj.calibrated
             onPressed: (m) => {
                 idleTimer.restart()
-                // 写笔记期间（手掌/手指贴屏）不得误关全屏全文
+                root.cancelTap()
                 if (root.penBusy())
                     return
                 armed = true
                 p0 = Qt.point(m.x, m.y)
+                pressMs = Date.now()
             }
             onReleased: (m) => {
+                idleTimer.restart()
                 if (!armed)
                     return
                 armed = false
@@ -822,15 +905,66 @@ Window {
                     return
                 const dx = m.x - p0.x
                 const dy = m.y - p0.y
-                if (Math.abs(dx) < 60 && Math.abs(dy) < 60) {
-                    textFs.close()
+                const adx = Math.abs(dx)
+                const ady = Math.abs(dy)
+                if (adx < 90 && ady < 90) {
+                    // 小位移：短按且位移 <=24px 才算干净 tap（本条贴顶，
+                    // 局部坐标即全屏坐标）
+                    const dist = Math.sqrt(dx * dx + dy * dy)
+                    const dur = Date.now() - pressMs
+                    if (dur <= root.palmDwellMs && dist <= 24)
+                        root.armTap(m.x, m.y)
                     return
                 }
-                if (Math.abs(dx) > Math.abs(dy)) {
-                    dx < 0 ? textFs.nextPage() : textFs.prevPage()
-                } else if (dy > 90) {
-                    textFs.close()   // 顶部下滑关闭
+                if (dy < 90 || dy <= adx)
+                    return
+                pageStore.detailBack()
+            }
+        }
+        // 底部边缘：上滑 → 加载更多回复；边缘区内 tap 同样有效
+        MouseArea {
+            property point p1
+            property real pressMs: 0   // Date.now() 是 64 位毫秒，int(32 位)会截断
+            property bool armed: false
+            x: 0
+            y: parent.height - 140
+            width: parent.width
+            height: 140
+            enabled: stylusObj.calibrated
+            onPressed: (m) => {
+                idleTimer.restart()
+                root.cancelTap()
+                if (root.penBusy())
+                    return
+                armed = true
+                p1 = Qt.point(m.x, m.y)
+                pressMs = Date.now()
+            }
+            onReleased: (m) => {
+                idleTimer.restart()
+                if (!armed)
+                    return
+                armed = false
+                if (root.penBusy())
+                    return
+                const dx = m.x - p1.x
+                const dy = p1.y - m.y          // 手势方向（向上）为正
+                const adx = Math.abs(dx)
+                const ady = Math.abs(dy)
+                if (adx < 90 && ady < 90) {
+                    // 小位移：短按且位移 <=24px 才算干净 tap（本条贴底，
+                    // 需 mapToItem 换算成全屏坐标）
+                    const dist = Math.sqrt(dx * dx + dy * dy)
+                    const dur = Date.now() - pressMs
+                    if (dur <= root.palmDwellMs && dist <= 24) {
+                        const p = mapToItem(root, Qt.point(m.x, m.y))
+                        root.armTap(p.x, p.y)
+                    }
+                    return
                 }
+                if (dy < 90 || dy <= adx)
+                    return
+                pageStore.detailLoadMore()
             }
         }
     }

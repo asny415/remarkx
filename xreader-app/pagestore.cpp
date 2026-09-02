@@ -29,16 +29,12 @@ QImage PageImageProvider::requestImage(const QString &id, QSize *size,
                                        const QSize &requestedSize)
 {
     Q_UNUSED(requestedSize);
-    // image://pages/text/<tweetId>/<page>
-    if (id.startsWith(QLatin1String("text/"))) {
-        const QStringList parts = id.split(QLatin1Char('/'));
-        if (parts.size() >= 3) {
-            const QImage img = m_store->textPageImage(parts.at(1),
-                                                      parts.at(2).toInt());
-            if (size)
-                *size = img.size();
-            return img;
-        }
+    // image://pages/detail?r=N —— 详情页基础位图
+    if (id.startsWith(QLatin1String("detail"))) {
+        const QImage img = m_store->detailBaseImage();
+        if (size)
+            *size = img.size();
+        return img;
     }
     const QImage img = m_store->currentBaseImage();
     if (size)
@@ -73,12 +69,21 @@ void PageStore::configure(const QString &baseDir)
     connect(m_client, &XClient::errorOccurred, this,
             &PageStore::onFetchError);
     connect(m_client, &XClient::mediaReady, this, &PageStore::onMediaReady);
+    connect(m_client, &XClient::detailReady, this, &PageStore::onDetailReady);
+    connect(m_client, &XClient::detailFailed, this, &PageStore::onDetailFailed);
 
-    // 头像下载到位后的基础页重渲染去抖：一页多次头像到达合并成一次重绘
+    // 头像下载到位后的基础页重渲染去抖：一页多次头像到达合并成一次重绘。
+    // 详情页打开时各自去抖：feed 页在背景照常重绘（回看时头像已就位），
+    // 当前详情页重绘自己。
     m_avatarTimer = new QTimer(this);
     m_avatarTimer->setSingleShot(true);
     m_avatarTimer->setInterval(300);
     connect(m_avatarTimer, &QTimer::timeout, this, [this]() {
+        if (m_detailAvatarRefreshPending) {
+            m_detailAvatarRefreshPending = false;
+            if (!m_detail.isEmpty())
+                renderDetailCurrent(true);
+        }
         if (m_avatarRefreshPending) {
             m_avatarRefreshPending = false;
             renderCurrent(true);
@@ -265,6 +270,10 @@ void PageStore::rebuildPages(bool resetPageNumbers)
 void PageStore::onHomeReady()
 {
     remarkxSetCtx("onHomeReady");
+    // feed 重建（刷新/重试）：详情层级与回复会话已失效，整体关闭
+    clearDetail();
+    m_detailErrorId.clear();
+    m_detailErrorFocal = XTweet();
     rebuildPages(true);
     m_waitingOlder = false;
     m_prefetchOlder = false;
@@ -309,6 +318,35 @@ void PageStore::onFetchError(const QString &msg)
 void PageStore::onMediaReady(const QString &tweetId)
 {
     remarkxSetCtx("onMediaReady");
+    // 详情页：当前页槽位刷新 + 头像去抖重绘（feed 分支不受影响，继续执行）
+    if (!m_detail.isEmpty()) {
+        DetailLevel &lv = m_detail.last();
+        if (lv.page >= 0 && lv.page < lv.pages.size()) {
+            bool onCurrent = false;
+            for (const ImageSlot &s : lv.pages.at(lv.page).images) {
+                if (s.tweetIndex < 0 || s.tweetIndex >= lv.feed.size())
+                    continue;
+                if (lv.feed.at(s.tweetIndex).id == tweetId) {
+                    onCurrent = true;
+                    break;
+                }
+            }
+            if (onCurrent) {
+                buildDetailSlotList();
+                emit detailSlotsChanged();
+                if (m_detailAvatarWanted.contains(tweetId)) {
+                    m_detailAvatarWanted.remove(tweetId);
+                    for (const XTweet &t : lv.feed) {
+                        if (t.id == tweetId && t.avatar.startsWith("avatars/")) {
+                            m_detailAvatarRefreshPending = true;
+                            m_avatarTimer->start();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if (m_pages.isEmpty())
         return;
     syncFeed();   // 确保 m_feed 与 m_pages 索引一致
@@ -432,6 +470,14 @@ void PageStore::retry()
     m_error.clear();
     emit errorChanged();
     m_extendErrorWas = false;
+    if (!m_detailErrorId.isEmpty()) {
+        // 详情页首抓失败：重新进详情抓回复（不重抓 feed）
+        const XTweet focal = m_detailErrorFocal;
+        m_detailErrorId.clear();
+        m_detailErrorFocal = XTweet();
+        openDetailTweet(focal);
+        return;
+    }
     if (wasExtend) {
         // 续抓失败：重试续抓（保持当前页位置，不跳回首页）
         m_waitingOlder = true;
@@ -526,7 +572,9 @@ void PageStore::renderCurrent(bool force)
         m_currentBase = it.value();
         touch(cur);
     } else {
-        m_currentBase = m_renderer->renderPage(m_feed, m_pages, cur, false);
+        // feed 第一页页底画操作提示（点按帖子进详情页）
+        m_currentBase = m_renderer->renderPage(m_feed, m_pages, cur, false,
+                                               m_feedPage == 0);
         m_pageCache.insert(cur, m_currentBase);
         touch(cur);
         while (m_pageCache.size() > 6) {   // 6 页 ≈ 63MB，换翻页免重渲染
@@ -627,9 +675,9 @@ int PageStore::hitSlot(int x, int y)
     return -1;
 }
 
-QString PageStore::hitCardFullText(int x, int y)
+QString PageStore::hitCard(int x, int y)
 {
-    remarkxSetCtx("hitCardFullText");
+    remarkxSetCtx("hitCard");
     if (m_pages.isEmpty())
         return {};
     if (m_feedPage < 0 || m_feedPage >= m_pages.size())
@@ -637,53 +685,463 @@ QString PageStore::hitCardFullText(int x, int y)
     syncFeed();
     const RenderPage &pg = m_pages.at(m_feedPage);
     // 点落在哪张卡片（chunk）内——同一卡片跨栏/跨页拆块时任一命中即可
-    int tweetIndex = -1;
     for (const RenderChunk &c : pg.chunks) {
         if (c.tweetIndex < 0 || c.tweetIndex >= m_feed.size())
             continue;
-        if (c.rect.contains(x, y)) {
-            tweetIndex = c.tweetIndex;
-            break;
-        }
-    }
-    if (tweetIndex < 0)
-        return {};
-    // 只有挂了"显示全文"按钮（文本被截断）的卡片才有全文可看；
-    // 完整显示的卡片点了无反应
-    for (const TextButton &b : pg.buttons) {
-        if (b.tweetIndex == tweetIndex)
-            return m_feed.at(tweetIndex).id;
+        if (c.rect.contains(x, y))
+            return m_feed.at(c.tweetIndex).id;
     }
     return {};
 }
 
-int PageStore::fullTextPages(const QString &tweetId)
+// ---- 详情页（点按卡片打开：主帖全文 + 按热度排序的回复） ----
+// 详情页是盖在基础页之上的全屏叠加层：基础页状态（页码/笔迹）完整保留，
+// 返回（顶部下滑）立即恢复。主帖用全文副本（fullTextCopy），回复经
+// TweetDetail（rankingMode=Relevance 即按热度）cursor 分页追加；点按某条
+// 回复再入栈一层（该回复成为新主帖），层数上限 5。
+
+// 全文副本：feed 卡片正文是截断预览（长文/长译文/note 帖的 full_text
+// 只是开头摘录）；详情页展开完整文本——有译文用完整译文，否则完整原文
+// （note_tweet 全文 / full_text）。引用块同理。
+static XTweet fullTextCopy(const XTweet &t)
 {
-    remarkxSetCtx("fullTextPages");
-    syncFeed();
-    for (const XTweet &t : m_feed) {
-        if (t.id == tweetId)
-            return m_renderer->textPageCount(t);
-    }
-    return 1;
+    XTweet c = t;
+    c.text = c.translated ? c.text : c.originalText;
+    c.quoted.text = c.quoted.translated ? c.quoted.text
+                                        : c.quoted.originalText;
+    c.isExpandable = false;
+    c.quoted.isExpandable = false;
+    return c;
 }
 
-QImage PageStore::textPageImage(const QString &tweetId, int page)
+void PageStore::openDetail(const QString &tweetId)
 {
-    remarkxSetCtx("textPageImage");
-    syncFeed();
-    for (const XTweet &t : m_feed) {
-        if (t.id == tweetId) {
-            int total = 1;
-            QImage img = m_renderer->renderTextPage(t, page, &total);
-            if (!img.isNull())
-                return img;
+    remarkxSetCtx("openDetail");
+    if (tweetId.isEmpty() || m_detail.size() >= 5)
+        return;   // 层数上限（防无限下钻）
+    // 找主帖：先在当前详情页层内（详情里点回复），再在基础页 feed
+    XTweet focal;
+    bool found = false;
+    if (!m_detail.isEmpty()) {
+        for (const XTweet &t : m_detail.last().feed) {
+            if (t.id == tweetId) {
+                focal = t;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        for (const XTweet &t : m_feed) {
+            if (t.id == tweetId) {
+                focal = t;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found)
+        return;
+    openDetailTweet(focal);
+}
+
+void PageStore::openDetailTweet(const XTweet &focal)
+{
+    remarkxSetCtx("openDetailTweet");
+    DetailLevel lv;
+    lv.tweetId = focal.id;
+    lv.focal = fullTextCopy(focal);
+    lv.feed.append(lv.focal);
+    // 主帖先立即全文排版（回复稍后到达再重排追加页）
+    lv.pages = m_renderer->paginate(lv.feed, true);
+    m_detail.append(lv);
+    renderDetailCurrent();
+    updateDetailStatus();
+    emit detailVisibleChanged();
+    requestDetailSlotMedia();
+    // 回复第一页（热度序）；该帖回复已有缓存时 XClient 立即发出
+    m_client->fetchDetail(lv.tweetId);
+}
+
+void PageStore::clearDetail()
+{
+    remarkxSetCtx("clearDetail");
+    m_detail.clear();
+    m_detailBase = QImage();
+    m_detailFile.clear();
+    m_detailSlots.clear();
+    m_detailAvatarWanted.clear();
+    updateDetailStatus();
+    emit detailFileChanged();
+    emit detailSlotsChanged();
+    emit detailVisibleChanged();
+}
+
+void PageStore::renderDetailCurrent(bool force)
+{
+    remarkxSetCtx("renderDetailCurrent");
+    if (m_detail.isEmpty())
+        return;
+    DetailLevel &lv = m_detail.last();
+    if (lv.dirty) {
+        // 深层回复在背景里已追加：回到该层时补重排（整体重排最简单，
+        // 追加不影响前面页内容，但页边界可能变化）
+        lv.pages = m_renderer->paginate(lv.feed, true);
+        lv.dirty = false;
+        lv.cache.clear();
+        lv.cacheOrder.clear();
+        if (lv.page >= lv.pages.size())
+            lv.page = qMax(0, lv.pages.size() - 1);
+    }
+    const int cur = lv.page;
+    if (cur < 0 || cur >= lv.pages.size()) {
+        m_detailBase = QImage();
+        return;
+    }
+    auto touch = [&](int key) {
+        lv.cacheOrder.removeAll(key);
+        lv.cacheOrder.append(key);
+    };
+    auto it = lv.cache.constFind(cur);
+    if (!force && it != lv.cache.end()) {
+        m_detailBase = it.value();
+        touch(cur);
+    } else {
+        m_detailBase = m_renderer->renderPage(lv.feed, lv.pages, cur, false);
+        lv.cache.insert(cur, m_detailBase);
+        touch(cur);
+        while (lv.cache.size() > 4) {   // 4 页 ≈ 42MB，够来回翻看
+            const int oldest = lv.cacheOrder.takeFirst();
+            lv.cache.remove(oldest);
+        }
+    }
+    m_detailFile = QStringLiteral("image://pages/detail?r=%1").arg(++m_detailRev);
+    buildDetailSlotList();
+    emit detailFileChanged();
+    emit detailSlotsChanged();
+    // 换页计数（供 QML 每 N 页强制刷新）：含层号，换层同页也算换页
+    const QString key = QStringLiteral("d%1/%2").arg(m_detail.size() - 1)
+                                .arg(cur);
+    if (m_lastDetailDisplayKey != key) {
+        m_lastDetailDisplayKey = key;
+        ++m_detailPageKey;
+        emit detailPageKeyChanged();
+    }
+}
+
+void PageStore::buildDetailSlotList()
+{
+    remarkxSetCtx("buildDetailSlotList");
+    QVariantList list;
+    if (m_detail.isEmpty()) {
+        m_detailSlots = list;
+        return;
+    }
+    DetailLevel &lv = m_detail.last();
+    if (lv.page < 0 || lv.page >= lv.pages.size()) {
+        m_detailSlots = list;
+        return;
+    }
+    const RenderPage &pg = lv.pages.at(lv.page);
+    for (int i = 0; i < pg.images.size(); ++i) {
+        const ImageSlot &s = pg.images.at(i);
+        if (s.tweetIndex < 0 || s.tweetIndex >= lv.feed.size())
+            continue;
+        const XTweet &t = lv.feed.at(s.tweetIndex);
+        const QVector<XMedia> *ml = s.isQuoted ? &t.quoted.media : &t.media;
+        const XMedia *m = (s.mediaIndex < ml->size()) ? &(*ml).at(s.mediaIndex)
+                                                       : nullptr;
+        const bool ready = m && !m->path.isEmpty();
+        const bool failed = m && !ready
+                            && m_client->mediaFailed(t.id, s.mediaIndex,
+                                                     s.isQuoted);
+        QVariantMap o;
+        o["x"] = s.x;
+        o["y"] = s.y;
+        o["w"] = s.w;
+        o["h"] = s.h;
+        o["index"] = i;
+        o["tweetId"] = t.id;
+        o["quoted"] = s.isQuoted;
+        o["ready"] = ready;
+        o["failed"] = failed;
+        o["video"] = s.video;
+        o["nMedia"] = s.nMedia;
+        o["path"] = ready ? QVariant(m_client->mediaPath(m->path))
+                          : QVariant();
+        list.append(o);
+    }
+    m_detailSlots = list;
+}
+
+void PageStore::requestDetailSlotMedia()
+{
+    remarkxSetCtx("requestDetailSlotMedia");
+    if (m_detail.isEmpty())
+        return;
+    DetailLevel &lv = m_detail.last();
+    if (lv.page < 0 || lv.page >= lv.pages.size())
+        return;
+    QSet<QString> seen;
+    // 遍历当前页所有帖子块（含纯文本帖）请求媒体+头像（同 requestSlotMedia：
+    // 只走图片槽位会漏掉纯文本帖的头像）
+    for (const RenderChunk &c : lv.pages.at(lv.page).chunks) {
+        const int ti = c.tweetIndex;
+        if (ti < 0 || ti >= lv.feed.size())
+            continue;
+        // 只快照 id/avatar 两个字符串：ensureMediaFor 在媒体已缓存时会在
+        // 调用栈内同步触发 mediaReady→onMediaReady，不得跨调用持有 feed 引用
+        const XTweet &t = lv.feed.at(ti);
+        if (seen.contains(t.id))
+            continue;
+        const QString tid = t.id;
+        const QString avatar = t.avatar;
+        seen.insert(tid);
+        m_client->ensureMediaFor(tid);
+        if (!avatar.isEmpty() && !avatar.startsWith("avatars/"))
+            m_detailAvatarWanted.insert(tid);
+    }
+}
+
+void PageStore::updateDetailStatus()
+{
+    remarkxSetCtx("updateDetailStatus");
+    QString s;
+    if (!m_detail.isEmpty()) {
+        DetailLevel &lv = m_detail.last();
+        const int total = qMax(1, lv.pages.size());
+        if (!lv.initialDone)
+            s = QStringLiteral("第 %1 / %2 页 · 正在加载回复…")
+                    .arg(lv.page + 1).arg(total);
+        else if (lv.loadingMore)
+            s = QStringLiteral("第 %1 / %2 页 · 正在加载更多回复…")
+                    .arg(lv.page + 1).arg(total);
+        else if (lv.hasMore)
+            s = QStringLiteral("第 %1 / %2 页 · 底部上滑加载更多")
+                    .arg(lv.page + 1).arg(total);
+        else
+            s = QStringLiteral("第 %1 / %2 页 · 回复已全部加载")
+                    .arg(lv.page + 1).arg(total);
+    }
+    if (m_detailStatus != s) {
+        m_detailStatus = s;
+        emit detailStatusChanged();
+    }
+}
+
+void PageStore::onDetailReady(const QString &tweetId,
+                              const QVector<XTweet> &fresh, bool hasMore)
+{
+    remarkxSetCtx("onDetailReady");
+    int li = -1;
+    for (int i = m_detail.size() - 1; i >= 0; --i) {
+        if (m_detail.at(i).tweetId == tweetId) {
+            li = i;
             break;
         }
     }
-    QImage blank(1404, 1872, QImage::Format_RGB32);
-    blank.fill(Qt::white);
-    return blank;
+    if (li < 0)
+        return;   // 该层已离开（返回过）；回复缓存仍留在 XClient
+    DetailLevel &lv = m_detail[li];
+    lv.initialDone = true;
+    lv.loadingMore = false;
+    for (const XTweet &t : fresh)
+        lv.feed.append(fullTextCopy(t));
+    lv.hasMore = hasMore;
+    if (li == m_detail.size() - 1) {
+        // 顶层：立即重排（新回复追加在尾部）
+        lv.pages = m_renderer->paginate(lv.feed, true);
+        lv.cache.clear();
+        lv.cacheOrder.clear();
+        // 翻页触发的加载更多：新回复到达后自动进下一页
+        if (lv.pendingAdvance) {
+            lv.pendingAdvance = false;
+            lv.page = qMin(lv.page + 1, qMax(0, lv.pages.size() - 1));
+        }
+        renderDetailCurrent();
+        requestDetailSlotMedia();
+    } else {
+        lv.dirty = true;   // 被更深层盖着：回到该层时补重排
+    }
+    if (m_detailErrorId == tweetId) {
+        m_detailErrorId.clear();
+        m_detailErrorFocal = XTweet();
+    }
+    updateDetailStatus();
+    maybePrefetchDetail();
+}
+
+void PageStore::onDetailFailed(const QString &tweetId)
+{
+    remarkxSetCtx("onDetailFailed");
+    int li = -1;
+    for (int i = m_detail.size() - 1; i >= 0; --i) {
+        if (m_detail.at(i).tweetId == tweetId) {
+            li = i;
+            break;
+        }
+    }
+    if (li < 0)
+        return;
+    DetailLevel &lv = m_detail[li];
+    lv.loadingMore = false;
+    lv.pendingAdvance = false;
+    if (lv.initialDone) {
+        // 翻页失败：保留已加载的回复，静默停止继续加载
+        lv.hasMore = false;
+        updateDetailStatus();
+        return;
+    }
+    if (li == m_detail.size() - 1) {
+        // 首抓失败：弹全局错误页；"重试"重新进详情（见 retry），
+        // 不重抓 feed
+        m_detailErrorId = lv.tweetId;
+        m_detailErrorFocal = lv.focal;
+        clearDetail();
+        m_error = m_client->lastError();
+        emit errorChanged();
+        return;
+    }
+    // 非顶层层首抓失败（更深层已入栈）：静默弹掉失败层
+    m_detail.removeAt(li);
+    renderDetailCurrent();
+    updateDetailStatus();
+}
+
+void PageStore::detailNext()
+{
+    remarkxSetCtx("detailNext");
+    if (m_detail.isEmpty())
+        return;
+    DetailLevel &lv = m_detail.last();
+    if (lv.page + 1 < lv.pages.size()) {
+        lv.page += 1;
+        renderDetailCurrent();
+        updateDetailStatus();
+        maybePrefetchDetail();
+        return;
+    }
+    if (!lv.hasMore)
+        return;
+    // 末页但还有更多：触发加载更多，回复到达后自动进下一页
+    lv.pendingAdvance = true;
+    if (lv.loadingMore) {
+        updateDetailStatus();
+        return;   // 已在加载（预抓）：等回复到达即可
+    }
+    lv.loadingMore = true;
+    updateDetailStatus();
+    m_client->fetchDetailNext(lv.tweetId);
+}
+
+void PageStore::detailPrev()
+{
+    remarkxSetCtx("detailPrev");
+    if (m_detail.isEmpty())
+        return;
+    DetailLevel &lv = m_detail.last();
+    if (lv.page > 0) {
+        lv.page -= 1;
+        renderDetailCurrent();
+        updateDetailStatus();
+    }
+}
+
+void PageStore::detailBack()
+{
+    remarkxSetCtx("detailBack");
+    if (m_detail.isEmpty())
+        return;
+    m_detail.removeLast();
+    if (m_detail.isEmpty()) {
+        clearDetail();   // 回到基础页（页码/笔迹原样保留）
+        return;
+    }
+    renderDetailCurrent();   // 新顶层可能 dirty（回复在背景里追加过）
+    requestDetailSlotMedia();
+    updateDetailStatus();
+}
+
+void PageStore::detailLoadMore()
+{
+    remarkxSetCtx("detailLoadMore");
+    if (m_detail.isEmpty())
+        return;
+    DetailLevel &lv = m_detail.last();
+    if (!lv.initialDone || !lv.hasMore || lv.loadingMore)
+        return;
+    lv.loadingMore = true;
+    updateDetailStatus();
+    m_client->fetchDetailNext(lv.tweetId);
+}
+
+void PageStore::maybePrefetchDetail()
+{
+    remarkxSetCtx("maybePrefetchDetail");
+    if (m_detail.isEmpty())
+        return;
+    DetailLevel &lv = m_detail.last();
+    if (!lv.initialDone || !lv.hasMore || lv.loadingMore)
+        return;
+    if (lv.page + 2 < lv.pages.size())
+        return;   // 距尾部 ≥2 页：不预抓
+    lv.loadingMore = true;
+    updateDetailStatus();
+    m_client->fetchDetailNext(lv.tweetId);
+}
+
+int PageStore::detailHitSlot(int x, int y)
+{
+    for (int i = 0; i < m_detailSlots.size(); ++i) {
+        const QVariantMap o = m_detailSlots.at(i).toMap();
+        const int sx = o["x"].toInt(), sy = o["y"].toInt();
+        const int sw = o["w"].toInt(), sh = o["h"].toInt();
+        if (x >= sx && x <= sx + sw && y >= sy && y <= sy + sh)
+            return i;
+    }
+    return -1;
+}
+
+QString PageStore::detailHitCard(int x, int y)
+{
+    remarkxSetCtx("detailHitCard");
+    if (m_detail.isEmpty())
+        return {};
+    DetailLevel &lv = m_detail.last();
+    if (lv.page < 0 || lv.page >= lv.pages.size())
+        return {};
+    const RenderPage &pg = lv.pages.at(lv.page);
+    for (const RenderChunk &c : pg.chunks) {
+        if (c.tweetIndex < 0 || c.tweetIndex >= lv.feed.size())
+            continue;
+        if (c.tweetIndex == 0)
+            continue;   // 主帖自身正在看，点了无反应
+        if (c.rect.contains(x, y))
+            return lv.feed.at(c.tweetIndex).id;
+    }
+    return {};
+}
+
+QStringList PageStore::detailSlotFiles(int slotIndex)
+{
+    remarkxSetCtx("detailSlotFiles");
+    QStringList files;
+    if (m_detail.isEmpty() || slotIndex < 0
+            || slotIndex >= m_detailSlots.size())
+        return files;
+    const QVariantMap o = m_detailSlots.at(slotIndex).toMap();
+    const QString tweetId = o["tweetId"].toString();
+    const bool quoted = o["quoted"].toBool();
+    for (const XTweet &t : m_detail.last().feed) {
+        if (t.id != tweetId)
+            continue;
+        const QVector<XMedia> &ml = quoted ? t.quoted.media : t.media;
+        for (const XMedia &m : ml)
+            if (!m.path.isEmpty())
+                files << m_client->mediaPath(m.path);
+        break;
+    }
+    return files;
 }
 
 QStringList PageStore::slotFiles(int slotIndex)

@@ -48,6 +48,16 @@ class PageStore : public QObject {
     Q_PROPERTY(QString status READ status NOTIFY stateChanged)
     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
     Q_PROPERTY(QString bookLabel READ bookLabel NOTIFY stateChanged)
+    // 详情页（点按卡片打开）：盖在基础页之上的全屏叠加层
+    Q_PROPERTY(bool detailVisible READ detailVisible
+               NOTIFY detailVisibleChanged)
+    Q_PROPERTY(QString detailFile READ detailFile NOTIFY detailFileChanged)
+    Q_PROPERTY(QVariantList detailSlots READ detailSlots
+               NOTIFY detailSlotsChanged)
+    Q_PROPERTY(QString detailStatus READ detailStatus
+               NOTIFY detailStatusChanged)
+    Q_PROPERTY(int detailPageKey READ detailPageKey
+               NOTIFY detailPageKeyChanged)
 public:
     explicit PageStore(QObject *parent = nullptr);
 
@@ -66,6 +76,14 @@ public:
     QString error() const { return m_error; }
     QString bookLabel() const { return m_bookLabel; }
     QImage currentBaseImage() const { return m_currentBase; }
+    // 详情页
+    bool detailVisible() const { return !m_detail.isEmpty(); }
+    QString detailFile() const { return m_detailFile; }
+    QVariantList detailSlots() const { return m_detailSlots; }
+    QString detailStatus() const { return m_detailStatus; }
+    int detailPageKey() const { return m_detailPageKey; }
+    // 供 image://pages/detail provider 取当前详情页位图
+    QImage detailBaseImage() const { return m_detailBase; }
 
 public slots:
     void start();
@@ -81,24 +99,51 @@ public slots:
     Q_INVOKABLE void requestFullRefresh();
     // 手指点按命中图片槽位 → 返回槽位索引（-1 = 未命中）
     Q_INVOKABLE int hitSlot(int x, int y);
-    // 手指点按落在"有显示全文按钮的卡片"范围内 → 返回推文 id（"" = 未命中）。
-    // 整张卡片（头部/文字/统计/边距）都是热区，图片槽位除外（QML 先查
-    // hitSlot，图片优先）。卡片未截断（无"显示全文"按钮）时点了没反应
-    Q_INVOKABLE QString hitCardFullText(int x, int y);
-    // 全文全屏：总页数
-    Q_INVOKABLE int fullTextPages(const QString &tweetId);
+    // 手指点按落在卡片内 → 返回推文 id（"" = 未命中）。整张卡片（头部/
+    // 文字/图片占位/统计/边距）都是热区，图片槽位除外（QML 先查 hitSlot，
+    // 图片优先）
+    Q_INVOKABLE QString hitCard(int x, int y);
     // 槽位对应媒体的全部本地文件（全屏分页浏览；未下载完的条目为空）
     Q_INVOKABLE QStringList slotFiles(int slotIndex);
-    // 供 image://pages/text/... provider 渲染全文页（公开给 Provider 调用）
-    QImage textPageImage(const QString &tweetId, int page);
+    // ---- 详情页（点按卡片打开：主帖全文 + 按热度排序的回复） ----
+    Q_INVOKABLE void openDetail(const QString &tweetId);
+    Q_INVOKABLE void detailNext();
+    Q_INVOKABLE void detailPrev();
+    Q_INVOKABLE void detailBack();        // 顶部边缘下滑 → 返回
+    Q_INVOKABLE void detailLoadMore();    // 底部边缘上滑 → 加载更多回复
+    Q_INVOKABLE int detailHitSlot(int x, int y);
+    // 详情页内点按回复卡片 → 返回推文 id（"" = 未命中；主帖自身除外）
+    Q_INVOKABLE QString detailHitCard(int x, int y);
+    Q_INVOKABLE QStringList detailSlotFiles(int slotIndex);
 
 signals:
     void currentFileChanged();
     void stateChanged();
     void errorChanged();
     void imageSlotsChanged();
+    void detailVisibleChanged();
+    void detailFileChanged();
+    void detailSlotsChanged();
+    void detailStatusChanged();
+    void detailPageKeyChanged();
 
 private:
+    // 详情页层级（可叠栈：详情页内点按某条回复再进一层，该回复成为新主帖）
+    struct DetailLevel {
+        QString tweetId;        // 所看主帖 id
+        XTweet focal;           // 主帖（全文副本，见 fullTextCopy）
+        QVector<XTweet> feed;   // [主帖] + 回复（热度序，分页追加）
+        QVector<RenderPage> pages;
+        int page = 0;
+        bool hasMore = false;       // 回复还有下一页（cursor 未耗尽）
+        bool loadingMore = false;   // "加载更多回复"请求进行中
+        bool initialDone = false;   // 第一页回复已回来（或已失败）
+        bool pendingAdvance = false; // 翻页触发的加载更多：回复到达后自动进下一页
+        bool dirty = false;         // feed 变化后未重排（回到该层时补排）
+        QHash<int, QImage> cache;   // 本层已渲染页位图（上限 4 页）
+        QVector<int> cacheOrder;    // 缓存访问顺序（末尾=最近）
+    };
+
     void goPage(int n);
     void maybePrefetchOlder();
     void rebuildPages(bool resetPageNumbers);
@@ -106,6 +151,17 @@ private:
     void renderCurrent(bool force = false);
     void buildSlotList();
     void requestSlotMedia();
+    // 详情页状态机
+    void openDetailTweet(const XTweet &focal);
+    void clearDetail();
+    void renderDetailCurrent(bool force = false);
+    void buildDetailSlotList();
+    void requestDetailSlotMedia();
+    void updateDetailStatus();
+    void onDetailReady(const QString &tweetId, const QVector<XTweet> &fresh,
+                       bool hasMore);
+    void onDetailFailed(const QString &tweetId);
+    void maybePrefetchDetail();
     void onHomeReady();
     void onOlderReady();
     void onFetchError(const QString &msg);
@@ -144,6 +200,21 @@ private:
     QHash<int, QImage> m_pageCache;
     QVector<int> m_pageCacheOrder;    // 访问顺序（末尾=最近）
     quint64 m_feedRev = ~0ull;        // 上次同步的 feed 版本（~0 强制首次拷贝）
+
+    // 详情页
+    QVector<DetailLevel> m_detail;    // 详情栈（末尾 = 当前层）
+    QImage m_detailBase;              // 当前详情页基础位图
+    QString m_detailFile;             // image://pages/detail?r=N
+    QVariantList m_detailSlots;
+    QString m_detailStatus;
+    int m_detailPageKey = 0;
+    int m_detailRev = 0;
+    QSet<QString> m_detailAvatarWanted;   // 详情页正在等头像下载的推文
+    bool m_detailAvatarRefreshPending = false;
+    QString m_lastDetailDisplayKey;
+    // 详情页首抓失败：记住失败层级，全局错误页"重试"重新进详情
+    QString m_detailErrorId;
+    XTweet m_detailErrorFocal;
 
     QString m_baseDir;
     QString m_bookDir;

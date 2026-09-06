@@ -110,12 +110,13 @@ Window {
     InkItem {
         id: ink
         anchors.fill: parent
-        // 只在基础页可见时收笔迹：校准/休眠/加载/错误/全屏看图/详情页
-        // 都是盖住整屏的不透明白层，那时笔迹看不见，若留在墨层里会被
-        // saveInkNow 当笔迹误收藏帖子
+        // 只在基础页可见时收笔迹：校准/休眠/加载/错误/标签选择/全屏看图/
+        // 详情页都是盖住整屏的不透明白层，那时笔迹看不见，若留在墨层里
+        // 会被 saveInkNow 当笔迹误收藏帖子
         inkEnabled: !calib.visible && !sleepOverlay.visible
                     && !pageStore.loading && pageStore.error.length === 0
-                    && !fullscreen.visible && !detail.visible
+                    && !pageStore.pickingTab && !fullscreen.visible
+                    && !detail.visible
         Component.onCompleted: {
             setStylus(stylusObj)
             pageStore.setInk(ink)
@@ -208,7 +209,8 @@ Window {
     // （整张卡片都是热区，见 hitCard / detailHitCard）
     function doTap(x, y) {
         if (calib.visible || sleepOverlay.visible || fullscreen.visible
-                || pageStore.loading || pageStore.error.length > 0)
+                || pageStore.loading || pageStore.error.length > 0
+                || pageStore.pickingTab)
             return
         if (pageStore.detailVisible) {
             // 详情页：图片槽位优先（全屏看图，ctx=detail）；否则回复卡片
@@ -303,6 +305,72 @@ Window {
                 MouseArea {
                     anchors.fill: parent
                     onClicked: pageStore.retry()
+                }
+            }
+        }
+    }
+
+    // 启动标签选择层：z:150 盖过边缘手势条（选择期间顶滑退出/底滑刷新不
+    // 生效，避免选标签时误触换源），整屏吞掉点击，只有标签行可点
+    Rectangle {
+        id: tabPicker
+        visible: pageStore.pickingTab
+        anchors.fill: parent
+        z: 150
+        color: "white"
+
+        // 吞掉行外点击（否则事件穿透到下层手势条/卡片）
+        MouseArea { anchors.fill: parent }
+
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            y: 140
+            text: "选择要阅读的标签"
+            font.pixelSize: 46
+            font.bold: true
+            color: "#111"
+        }
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            y: 224
+            text: "点按标签开始抓取该标签的时间线"
+            font.pixelSize: 26
+            color: "#888"
+        }
+
+        Column {
+            x: 240
+            y: 380
+            width: parent.width - 480
+            spacing: 16
+            Repeater {
+                model: pageStore.tabs
+                delegate: Rectangle {
+                    width: parent.width
+                    height: 100
+                    color: modelData.selected ? "#e4e4e4" : "#f5f5f5"
+                    border.color: "#c4c4c4"
+                    border.width: 2
+                    radius: 10
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        x: 40
+                        text: modelData.name
+                        font.pixelSize: 40
+                        color: "#222"
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.right: parent.right
+                        rightMargin: 40
+                        text: modelData.selected ? "上次使用" : ""
+                        font.pixelSize: 24
+                        color: "#999"
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: pageStore.selectTab(modelData.index)
+                    }
                 }
             }
         }

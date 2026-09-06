@@ -48,6 +48,10 @@ class PageStore : public QObject {
     Q_PROPERTY(QString status READ status NOTIFY stateChanged)
     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
     Q_PROPERTY(QString bookLabel READ bookLabel NOTIFY stateChanged)
+    // 启动标签选择：pickingTab=true 时 QML 显示标签列表层，selectTab 点选后
+    // 开始抓取该标签的时间线（一次只抓一个标签，替代原 For You+Following 双路合并）
+    Q_PROPERTY(bool pickingTab READ pickingTab NOTIFY stateChanged)
+    Q_PROPERTY(QVariantList tabs READ tabs NOTIFY stateChanged)
     // 详情页（点按卡片打开）：盖在基础页之上的全屏叠加层
     Q_PROPERTY(bool detailVisible READ detailVisible
                NOTIFY detailVisibleChanged)
@@ -75,6 +79,8 @@ public:
     QString status() const { return m_status; }
     QString error() const { return m_error; }
     QString bookLabel() const { return m_bookLabel; }
+    bool pickingTab() const { return m_pickingTab; }
+    QVariantList tabs() const { return m_tabsView; }
     QImage currentBaseImage() const { return m_currentBase; }
     // 详情页
     bool detailVisible() const { return !m_detail.isEmpty(); }
@@ -92,6 +98,8 @@ public slots:
     void prev();
     void quit();
     Q_INVOKABLE void retry();
+    // 启动标签选择：选第 index 个标签（tabs 列表下标）并开始抓取其时间线
+    Q_INVOKABLE void selectTab(int index);
     Q_INVOKABLE void suspendNow();
     Q_INVOKABLE void menuExit(int code);
     Q_INVOKABLE void setCalib(const QString &file);
@@ -165,6 +173,9 @@ private:
                        bool hasMore);
     void onDetailFailed(const QString &tweetId);
     void maybePrefetchDetail();
+    void onFoldersReady();   // 标签列表抓取完成 → 进选择态
+    // 构建 QML 标签列表视图（{index,id,name,selected}，selected=上次用过的标签）
+    void buildTabsView(const QVector<XTab> &tabs);
     void onHomeReady();
     void onOlderReady();
     void onFetchError(const QString &msg);
@@ -243,6 +254,13 @@ private:
     QString m_status;
     QString m_error;
     QString m_bookLabel;
+    // 启动标签选择：m_stateTab 记上次用过的标签（state.json "tab"，选择层里
+    // 标"上次使用"）；m_awaitingFolders=true 时标签列表抓取在途，失败回退
+    // 只显示两个固定标签（不阻塞启动）
+    QString m_stateTab;
+    bool m_awaitingFolders = false;
+    bool m_pickingTab = false;
+    QVariantList m_tabsView;
     bool m_waitingOlder = false;
     bool m_prefetchOlder = false;      // 后台预抓更早内容（不阻塞翻页）
     bool m_lastPrefetchEmpty = false;  // 上次预抓无新内容（时间线已到头）

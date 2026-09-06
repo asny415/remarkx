@@ -72,9 +72,18 @@ struct XTweet {
     int views = 0;
 };
 
+// 首页标签（官方网页版首页标签栏同款）：前两个固定"为你推荐/正在关注"，
+// 后面是用户置顶的文件夹（X 列表 List，PinnedTimelines 接口，顺序即网页顺序）
+struct XTab {
+    QString id;      // "fy" / "fl" / 列表 id_str
+    QString name;    // 显示文本
+    bool fixed = false;  // 前两个固定标签（文件夹抓取失败时仍可用）
+};
+
 // X (Twitter) 直连客户端：带 Cookie 的 GraphQL 抓取 + 媒体懒加载下载。
 // 内存保留当前阅读内容（feed），刷新整体重建、续抓往尾部追加。
 // 不做任何后台定时抓取：App 打开实时抓取，翻到书尾才续抓。
+// 一次只抓一个标签的时间线（setTab 选择），与网页版点标签页的行为一致。
 class XClient : public QObject {
     Q_OBJECT
 public:
@@ -85,6 +94,12 @@ public:
 
     const QVector<XTweet> &feed() const { return m_tweets; }
     int count() const { return m_tweets.size(); }
+    // 标签列表（fetchFolders 成功后填充：两个固定标签 + 置顶文件夹）
+    const QVector<XTab> &tabs() const { return m_tabs; }
+    QString currentTabId() const { return m_tabId; }
+    QString currentTabName() const;
+    // 选择要抓取的时间线（"fy"/"fl"/列表 id_str），start/refresh 之前调用
+    void setTab(const QString &tabId);
     // feed 内容每变更一次（追加/重建/媒体路径写回）自增，供 PageStore
     // 判断是否需要重新同步其快照，避免每次翻页都深拷贝整个 feed
     quint64 feedRevision() const { return m_feedRev; }
@@ -109,7 +124,8 @@ public:
     XTweet *findTweet(const QString &tweetId);
 
 public slots:
-    void start();          // 抓取首页（重建 feed）
+    void fetchFolders();   // 启动时抓取标签列表（PinnedTimelines → foldersReady）
+    void start();          // 抓取当前标签的时间线（重建 feed）
     void refresh();        // 同 start()，语义为"刷新"
     void fetchOlder();     // 用 cursor 续抓更早内容（追加到尾部）
     // 汇报"已读"进度：网页端在翻页/刷新时会把已渲染过的推文 id 以
@@ -121,6 +137,7 @@ public slots:
                                             // 同步触发的 mediaReady→syncFeed 释放）
 
 signals:
+    void foldersReady();                 // 标签列表抓取完成（tabs() 可取）
     void homeReady();                    // 首页/刷新完成，feed 已重建
     void olderReady();                   // 续抓完成，feed 已追加
     void mediaReady(const QString &tweetId);
@@ -138,18 +155,19 @@ private:
     void loadSession();
     QNetworkRequest apiRequest(const QString &op, const QJsonObject &variables,
                                const QString &fieldToggles = QString());
-    void handleHomeReply(const QString &which, QNetworkReply *reply);
-    void maybeMergeHome();
-    void handleOlderReply(const QString &which, QNetworkReply *reply);
-    void maybeMergeOlder();
+    void handleFoldersReply(QNetworkReply *reply);
+    void handleHomeReply(QNetworkReply *reply);
+    void handleOlderReply(QNetworkReply *reply);
     void ingest(const QVector<XTweet> &batch, bool append);
     void startDetailFetch(const QString &tweetId, bool first);
     void handleDetailReply(const QString &tweetId, QNetworkReply *reply);
     static void parseDetail(const QJsonObject &data, QVector<XTweet> *replies,
                             QString *cursor);
     static QJsonObject unwrapResult(const QJsonObject &result);
-    static void parseTimeline(const QJsonObject &data, QVector<XTweet> *items,
-                              QString *cursor);
+    // kind: "home" = HomeTimeline/HomeLatestTimeline（data.home.home_timeline_urt）；
+    //       "list" = ListLatestTweetsTimeline（data.list.tweets_timeline.timeline）
+    static void parseTimeline(const QJsonObject &data, const QString &kind,
+                              QVector<XTweet> *items, QString *cursor);
     static XTweet *normalize(const QJsonObject &result);
     static void authorInfo(const QJsonObject &r, QString *name,
                            QString *handle, QString *avatar);
@@ -159,8 +177,6 @@ private:
     static QString rawText(const QJsonObject &r);
     static QString textOf(const QJsonObject &r);
     static bool hasTranslation(const QJsonObject &r);
-    static QVector<XTweet> mergeInterleave(const QVector<XTweet> &fy,
-                                           const QVector<XTweet> &fl);
 
     // 详情页会话：某帖子的回复（按热度排序），cursor 分页。
     // 回复在内存按帖子缓存，同一帖子再次进入不重抓；refresh() 清空。
@@ -200,22 +216,20 @@ private:
     QStringList m_seenTweetIds;
     QJsonArray seenArray() const;
 
+    // 当前标签：一次只抓一个时间线（"fy"/"fl"/列表 id_str），换标签时
+    // setTab() 清游标。m_tabKind 与 m_tabId 同步（"home" 或 "list"），
+    // 供 parseTimeline 选数据路径
+    QString m_tabId = "fy";
+    QString m_tabKind = "home";
+    QVector<XTab> m_tabs;        // 标签列表（fetchFolders 后填充）
+
     QVector<XTweet> m_tweets;
     quint64 m_feedRev = 0;
     QSet<QString> m_seen;
-    QString m_cursor;            // For You 向后翻页游标
-    QString m_cursorFollowing;   // Following 向后翻页游标
+    QString m_cursor;            // 当前标签向后翻页游标
 
     bool m_fetching = false;
     QHash<QString, DetailSession> m_details;   // tweetId -> 详情页会话
-    // 首页并发抓取状态
-    bool m_homePending = false;
-    int m_homeLeft = 0;
-    QVector<XTweet> m_fy, m_fl;
-    // 续抓并发状态
-    bool m_olderPending = false;
-    int m_olderLeft = 0;
-    QVector<XTweet> m_oy, m_ol;
 
     QString m_lastError;
     qint64 m_extendErrorAt = 0;   // 续抓失败时间（冷却，防风控持续 403）

@@ -64,6 +64,8 @@ void PageStore::configure(const QString &baseDir)
     // 推送成功后删除本地帖图（笔迹层保留，供翻页恢复）
     connect(m_telegram, &Telegram::sent, this, &PageStore::onFavSent);
 
+    connect(m_client, &XClient::foldersReady, this,
+            &PageStore::onFoldersReady);
     connect(m_client, &XClient::homeReady, this, &PageStore::onHomeReady);
     connect(m_client, &XClient::olderReady, this, &PageStore::onOlderReady);
     connect(m_client, &XClient::errorOccurred, this,
@@ -177,12 +179,13 @@ void PageStore::forceEpdFullRefresh()
 void PageStore::start()
 {
     remarkxSetCtx("start");
-    // 读取 state.json（日期 + 当日序号）
+    // 读取 state.json（日期 + 当日序号 + 上次使用的标签）
     QFile sf(m_stateFile);
     if (sf.open(QIODevice::ReadOnly)) {
         const QJsonObject o = QJsonDocument::fromJson(sf.readAll()).object();
         m_date = o["date"].toString();
         m_seq = o["seq"].toInt();
+        m_stateTab = o["tab"].toString();
         sf.close();
     }
     // 读取 favs.json 收藏索引（帖图 + 原始链接）+ 已推送的 mid 集合
@@ -218,8 +221,35 @@ void PageStore::start()
         return;
     }
     m_loading = true;
-    setStatus("正在从 X 抓取最新内容…");
-    m_client->start();
+    setStatus("正在加载标签列表…");
+    m_awaitingFolders = true;
+    m_client->fetchFolders();
+}
+
+// 标签列表抓取完成：进入选择态，QML 显示标签层（前两个固定标签 + 置顶
+// 文件夹，顺序同网页版首页标签栏），用户点选后才抓对应时间线
+void PageStore::onFoldersReady()
+{
+    remarkxSetCtx("onFoldersReady");
+    m_awaitingFolders = false;
+    m_loading = false;
+    setStatus("");
+    buildTabsView(m_client->tabs());
+    m_pickingTab = true;
+    emit stateChanged();
+}
+
+void PageStore::buildTabsView(const QVector<XTab> &tabs)
+{
+    m_tabsView.clear();
+    for (int i = 0; i < tabs.size(); ++i) {
+        QVariantMap m;
+        m["index"] = i;
+        m["id"] = tabs[i].id;
+        m["name"] = tabs[i].name;
+        m["selected"] = (tabs[i].id == m_stateTab);
+        m_tabsView.append(m);
+    }
 }
 
 // 启动清理：收藏帖图（.png）与笔迹层（.draw.png）保留，其余 PNG
@@ -305,6 +335,21 @@ void PageStore::onOlderReady()
 void PageStore::onFetchError(const QString &msg)
 {
     remarkxSetCtx("onFetchError");
+    if (m_awaitingFolders) {
+        // 文件夹（标签列表）抓取失败：不阻塞启动，回退只显示两个固定标签，
+        // 用户仍可阅读主时间线
+        m_awaitingFolders = false;
+        m_loading = false;
+        setStatus("");
+        qWarning() << "fetch folders failed, fallback to fixed tabs:" << msg;
+        QVector<XTab> fixed;
+        fixed.append({"fy", QStringLiteral("为你推荐"), true});
+        fixed.append({"fl", QStringLiteral("正在关注"), true});
+        buildTabsView(fixed);
+        m_pickingTab = true;
+        emit stateChanged();
+        return;
+    }
     // 续抓失败也必须解锁翻页，否则 next/prev 永远被 m_waitingOlder 卡住
     m_extendErrorWas = m_waitingOlder;
     m_waitingOlder = false;
@@ -408,7 +453,8 @@ void PageStore::onMediaReady(const QString &tweetId)
 
 void PageStore::updateLabel()
 {
-    m_bookLabel = QString("第 %1 页 · 共 %2 页")
+    m_bookLabel = QString("%1 · 第 %2 页 · 共 %3 页")
+                      .arg(m_client->currentTabName())
                       .arg(m_feedPage + 1)
                       .arg(m_totalPages);
 }
@@ -419,7 +465,7 @@ void PageStore::refresh()
         return;
     saveInkNow();
     m_loading = true;
-    setStatus("正在刷新…");
+    setStatus(QString("正在刷新 %1…").arg(m_client->currentTabName()));
     m_client->refresh();
 }
 
@@ -506,7 +552,28 @@ void PageStore::retry()
         return;
     }
     m_loading = true;
-    setStatus("正在从 X 抓取最新内容…");
+    setStatus(QString("正在抓取 %1 最新内容…")
+                  .arg(m_client->currentTabName()));
+    m_client->start();
+}
+
+void PageStore::selectTab(int index)
+{
+    remarkxSetCtx("selectTab");
+    if (!m_pickingTab)
+        return;
+    if (index < 0 || index >= m_tabsView.size())
+        return;
+    const QString id = m_tabsView.at(index).toMap()["id"].toString();
+    if (id.isEmpty())
+        return;
+    m_client->setTab(id);
+    m_stateTab = id;
+    persistState();   // 记住本次选择，下次启动选择层标"上次使用"
+    m_pickingTab = false;
+    m_loading = true;
+    setStatus(QString("正在抓取 %1 最新内容…")
+                  .arg(m_client->currentTabName()));
     m_client->start();
 }
 
@@ -1254,6 +1321,7 @@ void PageStore::persistState()
         QJsonObject o;
         o["date"] = m_date;
         o["seq"] = m_seq;
+        o["tab"] = m_stateTab;   // 上次使用的标签（启动选择层预标记用）
         f.write(QJsonDocument(o).toJson(QJsonDocument::Compact));
         f.close();
     }

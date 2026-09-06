@@ -29,6 +29,15 @@ static const char *const kUA =
 static const char *const kOpForYou = "wp06oo3fRGU4P1sK8rECqQ/HomeTimeline";
 static const char *const kOpFollowing = "BLQWpfVqtgBqAqwRRJcJjA/HomeLatestTimeline";
 static const char *const kOpTweetDetail = "XMOz5h24KAZ86qKffKTLdQ/TweetDetail";
+// 首页标签栏：置顶文件夹（X 列表）列表。响应 data.pinned_timelines
+// .pinned_timelines[]，每项 {__typename:"ListPinnedTimeline", list:{id,id_str,name,…}}，
+// 顺序即网页版首页标签顺序（"为你推荐/正在关注"之后的部分）
+static const char *const kOpPinned = "-cgbxu1bOQbapAA31bo1mA/PinnedTimelines";
+// 文件夹（列表）时间线：variables {listId(数字 id_str), count, cursor?}，
+// 响应 data.list.tweets_timeline.timeline.instructions（条目结构与
+// HomeTimeline 一致：TimelineTimelineItem 直接 itemContent +
+// list-conversation-* 模块内 items + cursor-top/bottom）
+static const char *const kOpList = "1LE3u14FJjPZUHKFGzos2g/ListLatestTweetsTimeline";
 // TweetDetail 专用 fieldToggles（2026-09 抓包提取，与网页端请求一致）
 static const char *const kFieldToggles =
     R"({"withArticleRichContentState":true,"withArticlePlainText":false,)"
@@ -208,6 +217,124 @@ QNetworkRequest XClient::apiRequest(const QString &op,
     return req;
 }
 
+// 把 QNetworkReply 错误转成可读中文（设备端错误页直接展示）
+static QString replyErrorText(QNetworkReply *reply)
+{
+    const int status = reply->attribute(
+        QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    if (status == 401 || status == 403)
+        return "登录态失效 (HTTP " + QString::number(status)
+               + ")，请重新导入 Cookie";
+    if (status == 429)
+        return "被限流 (429)，请稍后再试";
+    switch (reply->error()) {
+    case QNetworkReply::ConnectionRefusedError:
+        return "无法连接（连接被拒绝）——请检查代理地址与端口";
+    case QNetworkReply::RemoteHostClosedError:
+        return "远端关闭连接——代理可能拒绝本设备访问";
+    case QNetworkReply::HostNotFoundError:
+        return "无法解析主机——检查代理地址/DNS";
+    case QNetworkReply::TimeoutError:
+        return "连接超时——检查代理是否可达";
+    case QNetworkReply::OperationCanceledError:
+        return "请求超时，请重试";
+    case QNetworkReply::SslHandshakeFailedError:
+        return "TLS 握手失败——代理或网络拦截了连接";
+    case QNetworkReply::ProxyConnectionClosedError:
+    case QNetworkReply::ProxyConnectionRefusedError:
+        return "代理连接失败——检查代理地址与端口";
+    case QNetworkReply::ProxyNotFoundError:
+        return "找不到代理主机";
+    case QNetworkReply::ProxyTimeoutError:
+        return "代理连接超时";
+    default:
+        return "网络错误：" + reply->errorString() + " (HTTP "
+               + QString::number(status) + ")";
+    }
+}
+
+// ---- 首页标签（文件夹）列表 ----
+
+void XClient::setTab(const QString &tabId)
+{
+    if (tabId.isEmpty())
+        return;
+    m_tabId = tabId;
+    m_tabKind = (tabId == QLatin1String("fy")
+                    || tabId == QLatin1String("fl"))
+                    ? QStringLiteral("home") : QStringLiteral("list");
+    m_cursor.clear();   // 换标签：旧游标作废
+}
+
+QString XClient::currentTabName() const
+{
+    for (const XTab &t : m_tabs)
+        if (t.id == m_tabId)
+            return t.name;
+    // 列表里找不到（如文件夹已被网页端删除）：固定标签兜底，其余回退 id
+    if (m_tabId == QLatin1String("fy"))
+        return QStringLiteral("为你推荐");
+    if (m_tabId == QLatin1String("fl"))
+        return QStringLiteral("正在关注");
+    return m_tabId;
+}
+
+void XClient::fetchFolders()
+{
+    remarkxSetCtx("xclient:fetchFolders");
+    if (m_fetching)
+        return;
+    loadSession();
+    if (!m_sessionError.isEmpty()) {
+        m_lastError = m_sessionError;
+        emit errorOccurred(m_lastError);
+        return;
+    }
+    m_lastError.clear();
+    m_fetching = true;
+    emit fetchingChanged(true);
+    QNetworkReply *reply = m_nam.get(apiRequest(kOpPinned, QJsonObject()));
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply]() { handleFoldersReply(reply); });
+}
+
+void XClient::handleFoldersReply(QNetworkReply *reply)
+{
+    remarkxSetCtx("xclient:handleFoldersReply");
+    reply->deleteLater();
+    m_fetching = false;
+    emit fetchingChanged(false);
+    if (reply->error() != QNetworkReply::NoError) {
+        m_lastError = replyErrorText(reply);
+        qWarning() << "XClient folders error:" << m_lastError;
+        emit errorOccurred(m_lastError);
+        return;
+    }
+    const QJsonObject data = QJsonDocument::fromJson(reply->readAll()).object();
+    const QJsonArray arr = data["data"].toObject()["pinned_timelines"]
+                                .toObject()["pinned_timelines"].toArray();
+    QVector<XTab> tabs;
+    // 前两个固定（与网页版一致）；文件夹抓取失败时调用方仍可用它们
+    tabs.append({"fy", QStringLiteral("为你推荐"), true});
+    tabs.append({"fl", QStringLiteral("正在关注"), true});
+    QSet<QString> seen;
+    for (const QJsonValue &v : arr) {
+        const QJsonObject pt = v.toObject();
+        // 防御：只认列表类型的置顶时间线（未来若有其他类型直接跳过）
+        if (pt["__typename"].toString() != QLatin1String("ListPinnedTimeline"))
+            continue;
+        const QJsonObject list = pt["list"].toObject();
+        const QString id = list["id_str"].toString();
+        const QString name = list["name"].toString().trimmed();
+        if (id.isEmpty() || name.isEmpty() || seen.contains(id))
+            continue;
+        seen.insert(id);
+        tabs.append({id, name, false});
+    }
+    m_tabs = tabs;
+    emit foldersReady();
+}
+
 void XClient::start()
 {
     refresh();
@@ -251,110 +378,69 @@ QJsonArray XClient::seenArray() const
     return a;
 }
 
+// 构造当前标签的首屏/翻页请求参数。网页端标签页各用各的接口：
+// 为你推荐=HomeTimeline、正在关注=HomeLatestTimeline（均带 requestContext 与
+// seenTweetIds 阅读进度）、文件夹=ListLatestTweetsTimeline（count 只是建议值，
+// 实测单页返回 80+ 条，对整页报纸排版无碍）
+static const char *opForTab(const QString &tabId, bool isList)
+{
+    if (isList)
+        return kOpList;
+    return (tabId == QLatin1String("fl")) ? kOpFollowing : kOpForYou;
+}
+
+static QJsonObject timelineVars(const QString &tabId, bool isList,
+                                const QString &cursor)
+{
+    QJsonObject vars;
+    if (isList) {
+        vars["listId"] = tabId;
+        vars["count"] = 20;
+    } else {
+        vars["count"] = 30;
+        vars["includePromotedContent"] = (tabId == QLatin1String("fy"));
+        vars["requestContext"] = "launch";
+        vars["withCommunity"] = true;
+    }
+    if (!cursor.isEmpty())
+        vars["cursor"] = cursor;
+    return vars;
+}
+
 void XClient::fetchHome()
 {
     remarkxSetCtx("xclient:fetchHome");
-    m_homePending = true;
-    m_homeLeft = 2;
-    m_fy.clear();
-    m_fl.clear();
-
-    QJsonObject vars;
-    vars["count"] = 30;
-    vars["includePromotedContent"] = true;
-    vars["requestContext"] = "launch";
-    vars["withCommunity"] = true;
-    // 模拟阅读进度：把本次会话已展示过的推文 id 一并上送（同网页端刷新行为）
-    if (!m_seenTweetIds.isEmpty())
-        vars["seenTweetIds"] = seenArray();
-
-    QNetworkReply *fy = m_nam.get(apiRequest(kOpForYou, vars));
-    connect(fy, &QNetworkReply::finished, this,
-            [this, fy]() { handleHomeReply("fy", fy); });
-
-    QJsonObject varsFl = vars;
-    varsFl["includePromotedContent"] = false;
-    QNetworkReply *fl = m_nam.get(apiRequest(kOpFollowing, varsFl));
-    connect(fl, &QNetworkReply::finished, this,
-            [this, fl]() { handleHomeReply("fl", fl); });
-}
-
-// 把 QNetworkReply 错误转成可读中文（设备端错误页直接展示）
-static QString replyErrorText(QNetworkReply *reply)
-{
-    const int status = reply->attribute(
-        QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    if (status == 401 || status == 403)
-        return "登录态失效 (HTTP " + QString::number(status)
-               + ")，请重新导入 Cookie";
-    if (status == 429)
-        return "被限流 (429)，请稍后再试";
-    switch (reply->error()) {
-    case QNetworkReply::ConnectionRefusedError:
-        return "无法连接（连接被拒绝）——请检查代理地址与端口";
-    case QNetworkReply::RemoteHostClosedError:
-        return "远端关闭连接——代理可能拒绝本设备访问";
-    case QNetworkReply::HostNotFoundError:
-        return "无法解析主机——检查代理地址/DNS";
-    case QNetworkReply::TimeoutError:
-        return "连接超时——检查代理是否可达";
-    case QNetworkReply::OperationCanceledError:
-        return "请求超时，请重试";
-    case QNetworkReply::SslHandshakeFailedError:
-        return "TLS 握手失败——代理或网络拦截了连接";
-    case QNetworkReply::ProxyConnectionClosedError:
-    case QNetworkReply::ProxyConnectionRefusedError:
-        return "代理连接失败——检查代理地址与端口";
-    case QNetworkReply::ProxyNotFoundError:
-        return "找不到代理主机";
-    case QNetworkReply::ProxyTimeoutError:
-        return "代理连接超时";
-    default:
-        return "网络错误：" + reply->errorString() + " (HTTP "
-               + QString::number(status) + ")";
+    const bool isList = (m_tabKind == QLatin1String("list"));
+    QJsonObject vars = timelineVars(m_tabId, isList, QString());
+    if (!isList) {
+        // 模拟阅读进度：把本次会话已展示过的推文 id 一并上送（同网页端刷新行为）
+        if (!m_seenTweetIds.isEmpty())
+            vars["seenTweetIds"] = seenArray();
     }
+    QNetworkReply *reply =
+        m_nam.get(apiRequest(opForTab(m_tabId, isList), vars));
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply]() { handleHomeReply(reply); });
 }
 
-void XClient::handleHomeReply(const QString &which, QNetworkReply *reply)
+void XClient::handleHomeReply(QNetworkReply *reply)
 {
     remarkxSetCtx("xclient:handleHomeReply");
     reply->deleteLater();
-    --m_homeLeft;
-    const QByteArray body = reply->readAll();
-    if (reply->error() != QNetworkReply::NoError) {
-        m_lastError = replyErrorText(reply);
-        qWarning() << "XClient home error:" << which << m_lastError;
-    } else {
-        const QJsonObject data = QJsonDocument::fromJson(body).object();
-        QVector<XTweet> items;
-        QString cursor;
-        parseTimeline(data, &items, &cursor);
-        if (which == "fy") {
-            m_fy = items;
-            m_cursor = cursor;
-        } else {
-            m_fl = items;
-            m_cursorFollowing = cursor;
-        }
-    }
-    maybeMergeHome();
-}
-
-void XClient::maybeMergeHome()
-{
-    remarkxSetCtx("xclient:maybeMergeHome");
-    if (!m_homePending || m_homeLeft > 0)
-        return;
-    m_homePending = false;
     m_fetching = false;
     emit fetchingChanged(false);
-    if (!m_lastError.isEmpty()) {
-        qWarning() << "XClient fetch home failed:" << m_lastError;
+    if (reply->error() != QNetworkReply::NoError) {
+        m_lastError = replyErrorText(reply);
+        qWarning() << "XClient home error:" << m_tabId << m_lastError;
         emit errorOccurred(m_lastError);
         return;
     }
-    QVector<XTweet> merged = mergeInterleave(m_fy, m_fl);
-    ingest(merged, /*append=*/false);
+    const QJsonObject data = QJsonDocument::fromJson(reply->readAll()).object();
+    QVector<XTweet> items;
+    QString cursor;
+    parseTimeline(data, m_tabKind, &items, &cursor);
+    m_cursor = cursor;   // 空时间线（如空文件夹）也会走这里，cursor 为空即到底
+    ingest(items, /*append=*/false);
     emit homeReady();
 }
 
@@ -375,7 +461,7 @@ void XClient::fetchOlder()
         emit errorOccurred(m_lastError);
         return;
     }
-    if (m_cursor.isEmpty() && m_cursorFollowing.isEmpty()) {
+    if (m_cursor.isEmpty()) {
         // 无翻页游标（时间线已到尽头）：不刷新、不重建 feed——
         // 重建会让在途媒体下载的任务索引失效（saveMedia 越界）且跳回第 0 页。
         // 直接按"无更多内容"处理，读者停留在末页。
@@ -385,49 +471,22 @@ void XClient::fetchOlder()
     m_lastError.clear();
     m_fetching = true;
     emit fetchingChanged(true);
-    m_olderPending = true;
-    m_olderLeft = 0;
-    m_oy.clear();
-    m_ol.clear();
-
-    if (!m_cursor.isEmpty()) {
-        QJsonObject vars;
-        vars["count"] = 30;
-        vars["includePromotedContent"] = true;
-        vars["requestContext"] = "launch";
-        vars["withCommunity"] = true;
-        vars["cursor"] = m_cursor;
-        if (!m_seenTweetIds.isEmpty())
-            vars["seenTweetIds"] = seenArray();
-        ++m_olderLeft;
-        QNetworkReply *fy = m_nam.get(apiRequest(kOpForYou, vars));
-        connect(fy, &QNetworkReply::finished, this,
-                [this, fy]() { handleOlderReply("fy", fy); });
-    }
-    if (!m_cursorFollowing.isEmpty()) {
-        QJsonObject vars;
-        vars["count"] = 30;
-        vars["includePromotedContent"] = false;
-        vars["requestContext"] = "launch";
-        vars["withCommunity"] = true;
-        vars["cursor"] = m_cursorFollowing;
-        if (!m_seenTweetIds.isEmpty())
-            vars["seenTweetIds"] = seenArray();
-        ++m_olderLeft;
-        QNetworkReply *fl = m_nam.get(apiRequest(kOpFollowing, vars));
-        connect(fl, &QNetworkReply::finished, this,
-                [this, fl]() { handleOlderReply("fl", fl); });
-    }
-    if (m_olderLeft == 0)
-        maybeMergeOlder();
+    const bool isList = (m_tabKind == QLatin1String("list"));
+    QJsonObject vars = timelineVars(m_tabId, isList, m_cursor);
+    if (!isList && !m_seenTweetIds.isEmpty())
+        vars["seenTweetIds"] = seenArray();
+    QNetworkReply *reply =
+        m_nam.get(apiRequest(opForTab(m_tabId, isList), vars));
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply]() { handleOlderReply(reply); });
 }
 
-void XClient::handleOlderReply(const QString &which, QNetworkReply *reply)
+void XClient::handleOlderReply(QNetworkReply *reply)
 {
     remarkxSetCtx("xclient:handleOlderReply");
     reply->deleteLater();
-    --m_olderLeft;
-    const QByteArray body = reply->readAll();
+    m_fetching = false;
+    emit fetchingChanged(false);
     if (reply->error() != QNetworkReply::NoError) {
         const int status = reply->attribute(
             QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -442,37 +501,15 @@ void XClient::handleOlderReply(const QString &which, QNetworkReply *reply)
         }
         m_extendErrorAt = QDateTime::currentMSecsSinceEpoch();
         qWarning() << "XClient older error:" << m_lastError;
-    } else {
-        const QJsonObject data = QJsonDocument::fromJson(body).object();
-        QVector<XTweet> items;
-        QString cursor;
-        parseTimeline(data, &items, &cursor);
-        if (which == "fy") {
-            m_oy = items;
-            m_cursor = cursor;
-        } else {
-            m_ol = items;
-            m_cursorFollowing = cursor;
-        }
-    }
-    maybeMergeOlder();
-}
-
-void XClient::maybeMergeOlder()
-{
-    remarkxSetCtx("xclient:maybeMergeOlder");
-    if (!m_olderPending || m_olderLeft > 0)
-        return;
-    m_olderPending = false;
-    m_fetching = false;
-    emit fetchingChanged(false);
-    if (!m_lastError.isEmpty()) {
-        qWarning() << "XClient fetch older failed:" << m_lastError;
         emit errorOccurred(m_lastError);
         return;
     }
-    QVector<XTweet> merged = mergeInterleave(m_oy, m_ol);
-    ingest(merged, /*append=*/true);
+    const QJsonObject data = QJsonDocument::fromJson(reply->readAll()).object();
+    QVector<XTweet> items;
+    QString cursor;
+    parseTimeline(data, m_tabKind, &items, &cursor);
+    m_cursor = cursor;   // 空 cursor = 到底，fetchOlder 会按"无更多内容"处理
+    ingest(items, /*append=*/true);
     emit olderReady();
 }
 
@@ -489,32 +526,6 @@ void XClient::ingest(const QVector<XTweet> &batch, bool append)
         m_tweets.append(t);
     }
     ++m_feedRev;
-}
-
-// 两个时间线按推文 id 去重后 1:1 交错合并，同一条只出现一次。
-QVector<XTweet> XClient::mergeInterleave(const QVector<XTweet> &fy,
-                                         const QVector<XTweet> &fl)
-{
-    QVector<XTweet> out;
-    QSet<QString> seen;
-    int i = 0, j = 0;
-    while (i < fy.size() || j < fl.size()) {
-        if (i < fy.size()) {
-            if (!seen.contains(fy[i].id)) {
-                seen.insert(fy[i].id);
-                out.append(fy[i]);
-            }
-            ++i;
-        }
-        if (j < fl.size()) {
-            if (!seen.contains(fl[j].id)) {
-                seen.insert(fl[j].id);
-                out.append(fl[j]);
-            }
-            ++j;
-        }
-    }
-    return out;
 }
 
 // ---- 详情页（某帖子的回复，按热度排序） ----
@@ -907,13 +918,18 @@ XTweet *XClient::normalize(const QJsonObject &result)
     return t.release();
 }
 
-void XClient::parseTimeline(const QJsonObject &data, QVector<XTweet> *items,
-                            QString *cursor)
+void XClient::parseTimeline(const QJsonObject &data, const QString &kind,
+                            QVector<XTweet> *items, QString *cursor)
 {
     remarkxSetCtx("xclient:parseTimeline");
-    const QJsonArray instructions = data["data"].toObject()["home"]
-                                        .toObject()["home_timeline_urt"]
-                                        .toObject()["instructions"].toArray();
+    // 两种时间线的 instructions 位置不同（条目结构相同，见头文件注释）
+    const QJsonObject root =
+        (kind == QLatin1String("list"))
+            ? data["data"].toObject()["list"].toObject()
+                  ["tweets_timeline"].toObject()["timeline"].toObject()
+            : data["data"].toObject()["home"].toObject()
+                  ["home_timeline_urt"].toObject();
+    const QJsonArray instructions = root["instructions"].toArray();
     for (const QJsonValue &insv : instructions) {
         const QJsonObject ins = insv.toObject();
         if (ins["type"].toString() != "TimelineAddEntries")

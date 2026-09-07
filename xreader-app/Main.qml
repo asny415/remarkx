@@ -362,7 +362,7 @@ Window {
                     Text {
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.right: parent.right
-                        rightMargin: 40
+                        anchors.rightMargin: 40
                         text: modelData.selected ? "上次使用" : ""
                         font.pixelSize: 24
                         color: "#999"

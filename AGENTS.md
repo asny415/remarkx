@@ -232,6 +232,18 @@ pending.json           Telegram 待发队列
   `run-reader.sh` 不带该参数）——若要删除，需同步改 `CMakeLists.txt` 的
   `QML_FILES` 与 `main.cpp`。
 - **不要加 qInfo 调试日志、不要提交任何凭据/运行数据**（见代码规范）。
+- **QML 属性写错不报构建错误、也不留 crash.log**：QML 以 qmlcachegen
+  字节码内嵌（不做类型检查），属性误写（如把 `anchors.rightMargin` 写成
+  `rightMargin` 直接挂在 Text 上）构建全绿，但运行时 QML 引擎加载组件即报
+  "Cannot assign to non-existent property"，整个 Main.qml 加载失败，
+  `main.cpp` 的 `objectCreationFailed` 处理器直接 `exit(-1)` 退进程——设备
+  端表现为"无法启动、启动即崩溃"，但属正常退出：崩溃处理器不触发、
+  无 crash.log（2026-09 真实案例：标签选择层提交，一行 QML 写错导致）。
+  遇到此类"启动即退"先查 QML 的 stderr；本地可用 SDK 自带 qemu-arm
+  （`sysroots/aarch64-codexsdk-linux/usr/bin/qemu-arm`，`-L <目标 sysroot>`）
+  + `-platform offscreen` + `QML_IMPORT_PATH=<sysroot>/usr/lib/qml` 跑
+  ARM 二进制复现（baseDir 硬编码 `/home/root/xreader`，临时改路径重编
+  即可，用完还原）。
 - **换字体**：同名覆盖 `xreader-app/fonts/remarkx-cjk.ttf` 后重新部署即可，
   文件名是渲染端约定，不要改。
 - **改笔迹渲染（inkitem/stylus）先读"关键技术决策"第 16 条**：不要开

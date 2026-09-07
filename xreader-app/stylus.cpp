@@ -10,6 +10,7 @@
 #include <linux/input.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cstring>
 
 static const int SCREEN_W = 1404;
 static const int SCREEN_H = 1872;
@@ -138,53 +139,80 @@ void Stylus::touchPoint(bool eraser)
 
 void Stylus::onData()
 {
-    struct input_event ev;
-    while (::read(m_fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
-        if (ev.type == EV_KEY) {
-            if (ev.code == BTN_TOOL_RUBBER) {
-                m_eraser = ev.value != 0;
-                onPenNear(m_eraser);
-            } else if (ev.code == BTN_TOOL_PEN) {
-                m_penNear = ev.value != 0;
-                onPenNear(m_penNear);
-            } else if (ev.code == BTN_TOUCH) {
-                m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
-                if (ev.value) {
-                    m_touching = true;
-                    m_tapTimer->stop();
-                    setPenActive(true);
-                } else if (m_touching) {
-                    m_touching = false;
-                    m_started = false;
-                    // 笔/橡皮抬起后仍保留 penActive（1s 窗口，或笔仍在有效范围
-                    // 则更久），期间忽略手掌/手指误触
-                    if (!m_penNear && !m_eraser)
-                        m_tapTimer->start();
-                    if (m_eraser) {
-                        emit eraserUp();
-                    } else {
-                        emit penUp();
-                    }
+    // 一次 read 吞掉所有待发事件（一份采样报告 = 3~4 个 16 字节事件），
+    // 减少逐事件 syscall，批量内的笔迹段在同一次事件循环迭代里画完
+    static const size_t kBufSize = 4096;
+    char buf[kBufSize];
+    while (true) {
+        const ssize_t n = ::read(m_fd, buf, sizeof(buf));
+        if (n < (ssize_t)sizeof(struct input_event))
+            break;   // EAGAIN（非阻塞）或读错：本批处理完
+        const char *p = buf;
+        for (ssize_t off = 0; off + (ssize_t)sizeof(struct input_event) <= n;
+             off += (ssize_t)sizeof(struct input_event)) {
+            struct input_event ev;
+            memcpy(&ev, p + off, sizeof(ev));
+            handleEvent(ev);
+        }
+    }
+}
+
+void Stylus::handleEvent(const struct input_event &ev)
+{
+    if (ev.type == EV_KEY) {
+        if (ev.code == BTN_TOOL_RUBBER) {
+            m_eraser = ev.value != 0;
+            onPenNear(m_eraser);
+        } else if (ev.code == BTN_TOOL_PEN) {
+            m_penNear = ev.value != 0;
+            onPenNear(m_penNear);
+        } else if (ev.code == BTN_TOUCH) {
+            m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+            if (ev.value) {
+                m_touching = true;
+                m_tapTimer->stop();
+                setPenActive(true);
+            } else if (m_touching) {
+                m_touching = false;
+                m_started = false;
+                m_coords = false;
+                // 笔/橡皮抬起后仍保留 penActive（1s 窗口，或笔仍在有效范围
+                // 则更久），期间忽略手掌/手指误触
+                if (!m_penNear && !m_eraser)
+                    m_tapTimer->start();
+                if (m_eraser) {
+                    emit eraserUp();
+                } else {
+                    emit penUp();
                 }
             }
-        } else if (ev.type == EV_ABS) {
-            if (ev.code == ABS_X)
-                m_lastX = ev.value;
-            else if (ev.code == ABS_Y)
-                m_lastY = ev.value;
-            else if (ev.code == ABS_PRESSURE)
-                m_lastP = ev.value;
-            if (m_touching && (ev.code == ABS_X || ev.code == ABS_Y)) {
-                m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
-                if (!m_started) {
-                    touchPoint(m_eraser);
-                } else {
-                    QPointF s = rawToScreen(m_lastX, m_lastY);
-                    if (m_eraser)
-                        emit eraserMove(int(s.x()), int(s.y()), m_lastP);
-                    else
-                        emit penMove(int(s.x()), int(s.y()), m_lastP);
-                }
+        }
+    } else if (ev.type == EV_ABS) {
+        // 只缓存，不发射：X、Y、压力在同一份采样报告里是三个独立事件，
+        // 若收到哪个就发哪个，斜向移动会被拆成"X 事件(新x,旧y)→Y 事件
+        // (新x,新y)"两段轴平行微线段，整条笔迹变成阶梯状折线，又毛又
+        // 不跟手。攒到报告结束（SYN_REPORT）一次性发完整的 (x,y,p)
+        if (ev.code == ABS_X)
+            m_lastX = ev.value;
+        else if (ev.code == ABS_Y)
+            m_lastY = ev.value;
+        else if (ev.code == ABS_PRESSURE)
+            m_lastP = ev.value;
+        if (m_touching && (ev.code == ABS_X || ev.code == ABS_Y
+                           || ev.code == ABS_PRESSURE))
+            m_coords = true;
+    } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+        if (m_touching && m_coords) {
+            m_lastActivityMs = QDateTime::currentMSecsSinceEpoch();
+            m_coords = false;
+            if (!m_started) {
+                touchPoint(m_eraser);
+            } else {
+                QPointF s = rawToScreen(m_lastX, m_lastY);
+                if (m_eraser)
+                    emit eraserMove(int(s.x()), int(s.y()), m_lastP);
+                else
+                    emit penMove(int(s.x()), int(s.y()), m_lastP);
             }
         }
     }

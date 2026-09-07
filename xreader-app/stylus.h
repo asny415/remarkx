@@ -42,6 +42,8 @@ signals:
 
 private:
     void onData();
+    // 处理单个 input_event（onData 一次性读出整块缓冲后逐个解析）
+    void handleEvent(const struct input_event &ev);
     void touchPoint(bool eraser);
     void onPenNear(bool near);
     void setPenActive(bool active);
@@ -54,6 +56,10 @@ private:
     bool m_eraser = false;
     bool m_penNear = false;    // 笔尖在有效范围内（悬停/按下），未离开屏幕上方
     bool m_started = false;
+    // 自上次按 SYN_REPORT 发射以来是否收到新的坐标/压力事件。Linux input 子
+    // 系统里一次采样报告 = 若干 EV_ABS（X/Y/压力各自独立成事件）+ SYN_REPORT
+    // 收尾；必须攒到 SYN 才发一次 penMove，见 onData
+    bool m_coords = false;
     int m_lastX = 0, m_lastY = 0, m_lastP = 0;
     qreal m_a = 0, m_b = 0.0893, m_c = 0;
     qreal m_d = 0.0893, m_e = 0, m_f = 0;

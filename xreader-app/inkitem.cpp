@@ -40,16 +40,30 @@ void *epaperLib()
 static const int SW = 1404;
 static const int SH = 1872;
 
+// 目标笔宽（压感 0~4095 → 2.2~5.7px）。下限 2.2px 不是审美选择：DU 快速
+// 通道是 1 位显示，45° 斜线最窄也要 ≥√2 px 才能让线经过的每个像素都满墨
+// （覆盖 <50% 的像素被二值栅格化跳过=断点=虚线）；上限与旧版 4.7px 接近，
+// 整体仍偏细
+static inline qreal inkTargetWidth(int pressure)
+{
+    return 2.2 + qreal(pressure) / 4095.0 * 3.5;
+}
+
 InkItem::InkItem(QQuickItem *parent) : QQuickPaintedItem(parent)
 {
     setAcceptedMouseButtons(Qt::NoButton);
     m_img = QImage(SW, SH, QImage::Format_ARGB32_Premultiplied);
     m_img.fill(Qt::transparent);
-    // 逐段提交会被 swtcon 掉帧导致虚线；大区域提交又慢(~300ms)。
-    // 用 ~20ms 节流把近段笔迹合并成"小区域"提交：小区域处理快、
-    // 覆盖近段保证实线、不掉帧。之前节流不跟手是因为用了 ±24 大矩形。
+    // 提交节奏的平衡（swtcon 生成器线程限速消化更新，超出会排队/掉帧）：
+    // - 1ms 逐段提交：生成器追不上（"generator thread has fallen behind"），
+    //   排队延迟越滚越大=笔迹拖后，挤掉的帧=线里断点（虚线）
+    // - 20ms 以上：合并区域变大，笔尖可见"拖后"
+    // - 10ms：覆盖 2~4 个采样点（笔 220Hz），正常书写每次区域仅几~几十像素，
+    //   延迟与刷新面积平衡最好（10ms 是此前实测的 swtcon 安全区）
+    // 区域取紧致段包围盒（见 segmentRect），小区域 DU 刷新快、无大面积闪烁
     m_flushTimer = new QTimer(this);
-    m_flushTimer->setInterval(1);
+    m_flushTimer->setTimerType(Qt::PreciseTimer);
+    m_flushTimer->setInterval(10);
     connect(m_flushTimer, &QTimer::timeout, this, &InkItem::flushInk);
 }
 
@@ -198,13 +212,25 @@ void InkItem::strokeDown(int x, int y, int pressure, bool eraser)
                       Qt::RoundCap, Qt::RoundJoin));
     } else {
         p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        // 抗锯齿：细斜线在覆盖不足处不再出现断点（断点会被 DU 显示成 dash）
-        p.setRenderHint(QPainter::Antialiasing, true);
-        m_width = 1.2 + qreal(pressure) / 4095.0 * 3.5;
+        // 不开抗锯齿：pen 快速通道走 DU 波形，DU 是纯 1 位黑白（WBF mode 1，
+        // 见 swtcon：1-bit black/white only）。抗锯齿在 16 位画布上产生的灰边
+        // 是中间灰值，DU 不驱动这类 (src,tgt) 组合，显示后就是线里的白斑
+        // =dash。改为整像素实心黑，且最窄 2.2px（45° 斜线下每个被线经过的
+        // 像素覆盖都 >50%，二值栅格化后仍是连续黑链；1.2px 时斜线只在对角
+        // 像素上有墨，显示为断续点线），斜线/任意角度都是连续实线
+        m_width = inkTargetWidth(pressure);
         p.setPen(QPen(QColor(0, 0, 0), m_width, Qt::SolidLine,
                       Qt::RoundCap, Qt::RoundJoin));
     }
-    p.drawPoint(m_last);
+    // 落笔点（顿笔/句号）：直径=当前笔画宽的实心圆。
+    // 不依赖 drawPoint / 零长 drawLine：Qt 6.8 光栅引擎把它们当"单个 1px
+    // 像素"（QCosmeticStroker::drawLine 里 start==end 直接转 drawPoints 画单
+    // 点），细宽时只剩几乎不可见的 1px 点。显式椭圆稳定，且对橡皮同样适用
+    //（Clear 合成模式下按覆盖清空圆形区域，颜色无关）
+    const qreal d = eraser ? 26.0 : m_width;
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(0, 0, 0));
+    p.drawEllipse(m_last, d / 2.0, d / 2.0);
     p.end();
     m_stroke = true;
     if (!m_hasInk) {
@@ -229,8 +255,10 @@ void InkItem::strokeMove(int x, int y, int pressure, bool eraser)
                       Qt::RoundCap, Qt::RoundJoin));
     } else {
         p.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        p.setRenderHint(QPainter::Antialiasing, true);
-        m_width = 1.2 + qreal(pressure) / 4095.0 * 3.5;
+        // 同 strokeDown：不开抗锯齿（DU 1 位只吃纯黑/白），实心黑保实线
+        // 压感平滑：目标宽按指数滑动平均逼近，避免逐采样跳宽造成的粗细
+        // 顿挫，落笔首宽直接取目标值（strokeDown 已设）
+        m_width += (inkTargetWidth(pressure) - m_width) * 0.35;
         p.setPen(QPen(QColor(0, 0, 0), m_width, Qt::SolidLine,
                       Qt::RoundCap, Qt::RoundJoin));
     }
@@ -255,11 +283,14 @@ void InkItem::flushInk()
     m_flushTimer->stop();
 }
 
-// 笔迹段的紧致脏区：线段包围盒 + 笔宽半径（含圆帽与抗锯齿余量）。
+// 笔迹段的紧致脏区：线段包围盒 + 当前笔画宽度半径（覆盖圆帽外溢）。
 // 官方笔迹只刷新笔尖经过的细条区域，整块大矩形会闪得很厉害。
+// 宽度按当前工具取：橡皮直径固定 26，若误用笔宽（2~6px）脏区太小，
+// 橡皮边缘外的墨迹不在刷新范围内，擦不干净
 QRect InkItem::segmentRect(const QPointF &a, const QPointF &b) const
 {
-    const int r = qMax(2, int(m_width / 2) + 1);
+    const qreal w = m_erase ? 26.0 : m_width;
+    const int r = qMax(2, int(w / 2) + 1);
     return QRect(a.toPoint(), b.toPoint()).normalized().adjusted(-r, -r, r, r);
 }
 
@@ -269,6 +300,9 @@ QRect InkItem::segmentRect(const QPointF &a, const QPointF &b) const
 // 的值驱动显示，0 的像素被 gate 跳过。所以 FB112 必须填掩码（有墨=255，
 // 无墨=0），而不是页面拷贝；否则页面(255)被无谓重刷→闪烁，笔迹线(0)反而
 // 被 gate 掉→显示成 dash。
+// 另一个硬约束：DU 波形是纯 1 位黑白，掩码内像素的画布值必须是纯黑(0)
+// 或白(0xFFFF)——中间灰值（抗锯齿灰边）不在 DU 的驱动范围，显示即断点。
+// 故 m_img 里的墨迹一律无抗锯齿实心黑（见 strokeDown/strokeMove）。
 // 失败（插件不可用/缓冲不对）返回 false，由调用方回退到框架 update()。
 bool InkItem::fastSubmit(const QRect &region)
 {

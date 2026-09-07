@@ -196,6 +196,21 @@ pending.json           Telegram 待发队列
     解密，故部署优先使用项目 `.venv` 的 python。
 15. **时区可配置**：设备默认 UTC 导致帖子时间慢 8 小时，故 config.json 加
     `timezone` 字段而非改设备时区。
+16. **笔迹走 DU 1 位快速通道，墨迹必须无抗锯齿纯黑 + 提交节流 ~10ms**：
+    pen 快速路径（`swapBuffers(region, Pen, mode 1, flags 0)`）用 DU 波形，
+    DU 是纯 1 位黑白（swtcon WBF mode 1："1-bit black/white only"；xochitl
+    同一路径）。三条硬约束，违反即出"虚线/不跟手"（git 历史里 dash 反复
+    出现，根因即此）：
+    a) 墨迹**不开抗锯齿**——AA 灰边是 16 位画布上的中间灰值，DU 不驱动
+       这类 (src,tgt)，显示即线里白斑=dash；
+    b) 最窄笔宽 **≥2.2px**（45° 斜线下 <√2px 只在对角像素有墨，1 位显示
+       成断续点线）；压感宽度 EMA 平滑（`inkTargetWidth`）；
+    c) 提交节流 **10ms**（PreciseTimer）——swtcon 生成器线程限速消化更新，
+       1ms 逐段提交会排队（延迟滚大=拖后）/掉帧（=断点），20ms+ 又拖后。
+    输入侧同理：`Stylus` 按 **SYN_REPORT** 攒完整 (x,y,p) 才发一次
+    `penMove`（逐 EV_ABS 事件发会把斜向移动拆成"先横后竖"阶梯折线）。
+    参考：swtcon 开源 TCON（github.com/yobert/swtcon，libqsgepaper 的
+    软件 TCON 同源）。
 
 ## 修改代码时特别注意
 
@@ -219,6 +234,10 @@ pending.json           Telegram 待发队列
 - **不要加 qInfo 调试日志、不要提交任何凭据/运行数据**（见代码规范）。
 - **换字体**：同名覆盖 `xreader-app/fonts/remarkx-cjk.ttf` 后重新部署即可，
   文件名是渲染端约定，不要改。
+- **改笔迹渲染（inkitem/stylus）先读"关键技术决策"第 16 条**：不要开
+  抗锯齿、不要把最窄笔宽降到 ~2px 以下、不要把提交节流降到 ~10ms 以下、
+  不要改回逐 EV_ABS 事件发 penMove——任何一条都会让笔迹变虚线/不跟手
+  （DU 1 位快速通道的约束，详见该条与 inkitem.cpp 内注释）。
 
 ## 未知信息（勿猜测，需先核实）
 

@@ -321,6 +321,7 @@ void PageStore::onHomeReady()
     m_loading = false;
     setStatus("");
     goPage(0);
+    maybeRunPendingRefresh();
 }
 
 void PageStore::onOlderReady()
@@ -335,6 +336,7 @@ void PageStore::onOlderReady()
     m_loading = false;
     setStatus("");
     goPage(m_feedPage);
+    maybeRunPendingRefresh();
 }
 
 void PageStore::onFetchError(const QString &msg)
@@ -361,11 +363,15 @@ void PageStore::onFetchError(const QString &msg)
     m_loading = false;
     setStatus("");
     if (m_prefetchOlder) {
-        // 后台预抓失败：静默放弃（不打扰阅读），翻到旧书尾时前台续抓兜底
+        // 后台预抓失败：静默放弃（不打扰阅读），翻到旧书尾时前台续抓兜底；
+        // 若预抓在途期间用户请求过刷新（m_pendingRefresh），现在补做，
+        // 否则那次底滑刷新被静默丢弃
         m_prefetchOlder = false;
         qWarning() << "prefetch older failed, ignored:" << msg;
+        maybeRunPendingRefresh();
         return;
     }
+    m_pendingRefresh = false;   // 弹错误页：排队刷新作废，由"重试"兜底
     m_error = msg;
     emit errorChanged();
 }
@@ -466,12 +472,26 @@ void PageStore::updateLabel()
 
 void PageStore::refresh()
 {
-    if (m_client->fetching())
+    if (m_client->fetching()) {
+        // 有抓取在途（通常是靠近书尾触发的背景预抓）：排队而不是丢弃——
+        // 直接丢弃时用户底滑刷新毫无反应，体感"刷新不起作用"
+        m_pendingRefresh = true;
+        setStatus(QStringLiteral("正在加载，完成后自动刷新…"));
         return;
+    }
+    m_pendingRefresh = false;
     saveInkNow();
     m_loading = true;
     setStatus(QString("正在刷新 %1…").arg(m_client->currentTabName()));
     m_client->refresh();
+}
+
+void PageStore::maybeRunPendingRefresh()
+{
+    if (!m_pendingRefresh || m_client->fetching())
+        return;
+    m_pendingRefresh = false;
+    refresh();
 }
 
 void PageStore::next()

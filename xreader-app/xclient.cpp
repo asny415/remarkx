@@ -29,6 +29,73 @@
 static const QNetworkRequest::Attribute kSentAtAttr =
         static_cast<QNetworkRequest::Attribute>(QNetworkRequest::User + 1);
 
+// ---- xdiag 请求/响应诊断日志（排查"整页 %22 数字"问题，2026-09 用户要求） ----
+// 每个 API 请求写一行 REQ 摘要（op/URL 长度/seen 数/cursor 长度），每个响应
+// 写一行 RES 摘要（状态码/错误/正文长度）；出现异常（非 200、JSON 解析失败、
+// 顶层 errors 数组、正文被判定为编码数据的"帖子"）追加 ANOM 行带正文片段。
+// 日志写到 <baseDir>/xdiag.log（configure() 设置路径），超过 2MB 删档重开
+// （设备 flash 有限）。只记请求参数与响应摘要/片段，不含 Cookie/token。
+static QString s_diagPath;
+
+// 正文片段：截前 n 字节并压平换行（日志单行）
+static QString diagHead(const QByteArray &body, int n)
+{
+    return QString::fromUtf8(body.left(n))
+            .replace(QLatin1Char('\n'), QLatin1Char(' '))
+            .replace(QLatin1Char('\r'), QLatin1Char(' '));
+}
+
+static void diagWrite(const QString &line)
+{
+    if (s_diagPath.isEmpty())
+        return;
+    QFileInfo fi(s_diagPath);
+    if (fi.exists() && fi.size() > 2 * 1024 * 1024)
+        QFile::remove(s_diagPath);
+    QFile f(s_diagPath);
+    if (!f.open(QIODevice::Append | QIODevice::Text))
+        return;
+    f.write((QDateTime::currentDateTime().toString(Qt::ISODateWithMs)
+             + QLatin1Char(' ') + line + QLatin1Char('\n')).toUtf8());
+    f.close();
+}
+
+static void diagRequest(const QString &op, const QNetworkRequest &req,
+                        int seen, const QString &cursor)
+{
+    diagWrite(QString("REQ op=%1 urlLen=%2 seen=%3 cursorLen=%4")
+                .arg(op).arg(req.url().toString().size())
+                .arg(seen).arg(cursor.size()));
+}
+
+static void diagReply(const QString &op, QNetworkReply *reply,
+                      const QByteArray &body)
+{
+    const int status = reply->attribute(
+        QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    diagWrite(QString("RES op=%1 status=%2 err=%3 len=%4")
+                .arg(op).arg(status).arg(reply->errorString())
+                .arg(body.size()));
+    if (status != 200 || reply->error() != QNetworkReply::NoError)
+        diagWrite(QString("ANOM op=%1 kind=http status=%2 err=%3 head=%4")
+                    .arg(op).arg(status).arg(reply->errorString())
+                    .arg(diagHead(body, 512)));
+}
+
+// 响应 JSON 顶层 errors 数组（X 风控/参数校验失败时 HTTP 200 也带）：
+// 返回第一个错误的 message（空数组/无 errors 返回空串）
+static QString topLevelError(const QJsonObject &data)
+{
+    const QJsonArray errs = data["errors"].toArray();
+    if (errs.isEmpty())
+        return {};
+    return errs.first().toObject()["message"].toString();
+}
+
+// "数据帖"识别与过滤（定义在文件后部响应解析区，此处前置声明）
+static bool isDataGarbage(const QString &s);
+static void filterDataGarbage(const QString &diagTag, QVector<XTweet> *items);
+
 // ---- X 网页端公开常量（2026-08；queryId / Bearer 轮换时从浏览器 DevTools 重新抓包） ----
 static const char *const kBearer =
     "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
@@ -116,6 +183,7 @@ void XClient::configure(const QString &baseDir)
     m_baseDir = baseDir;
     m_mediaDir = baseDir + "/media";
     m_cookiesFile = baseDir + "/cookies.json";
+    s_diagPath = baseDir + "/xdiag.log";   // 请求/响应诊断日志（见文件头部说明）
     QDir().mkpath(m_mediaDir);
     QDir().mkpath(m_mediaDir + "/avatars");
 
@@ -389,7 +457,9 @@ void XClient::fetchFolders()
     m_lastError.clear();
     m_fetching = true;
     emit fetchingChanged(true);
-    QNetworkReply *reply = m_nam.get(apiRequest(kOpPinned, QJsonObject()));
+    QNetworkRequest req = apiRequest(kOpPinned, QJsonObject());
+    diagRequest(QStringLiteral("folders"), req, 0, QString());
+    QNetworkReply *reply = m_nam.get(req);
     connect(reply, &QNetworkReply::finished, this,
             [this, reply]() { handleFoldersReply(reply); });
 }
@@ -407,7 +477,13 @@ void XClient::handleFoldersReply(QNetworkReply *reply)
         emit errorOccurred(m_lastError);
         return;
     }
-    const QJsonObject data = QJsonDocument::fromJson(reply->readAll()).object();
+    const QByteArray body = reply->readAll();
+    diagReply(QStringLiteral("folders"), reply, body);
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    if (doc.isNull())
+        diagWrite(QStringLiteral("ANOM op=folders kind=badjson head=")
+                  + diagHead(body, 512));
+    const QJsonObject data = doc.object();
     const QJsonArray arr = data["data"].toObject()["pinned_timelines"]
                                 .toObject()["pinned_timelines"].toArray();
     QVector<XTab> tabs;
@@ -461,8 +537,13 @@ void XClient::reportSeen(const QString &tweetId)
         return;
     // 网页端同款：不查重、按展示顺序追加（抓包确认 seenTweetIds 里会有重复 id）
     m_seenTweetIds.append(tweetId);
-    // 限长防请求过大（整场阅读会话足够用）
-    const int kMaxSeen = 1000;
+    // 限长：请求是 GET 且 variables 整个放在 URL query 里，每个 id 编码后
+    // ~28 字节。上限 1000 时请求行可涨到 ~30KB，超出部分代理/边缘节点的
+    // 请求行限制（如 nginx 默认 8KB 的 large_client_header_buffers、
+    // Cloudflare 的 URL 上限）会被直接拒绝——这是翻页/续抓"有一定概率"
+    // 失败的诱因之一。网页端也只上送最近一批已读 id，保留最近 100 个
+    // （请求行 ~6KB，同时减弱"我一直在读这些"的推荐信号）
+    const int kMaxSeen = 100;
     if (m_seenTweetIds.size() > kMaxSeen)
         m_seenTweetIds = m_seenTweetIds.mid(m_seenTweetIds.size() - kMaxSeen);
 }
@@ -514,8 +595,10 @@ void XClient::fetchHome()
         if (!m_seenTweetIds.isEmpty())
             vars["seenTweetIds"] = seenArray();
     }
-    QNetworkReply *reply =
-        m_nam.get(apiRequest(opForTab(m_tabId, isList), vars));
+    QNetworkRequest req = apiRequest(opForTab(m_tabId, isList), vars);
+    diagRequest(QStringLiteral("home"), req,
+                isList ? 0 : m_seenTweetIds.size(), QString());
+    QNetworkReply *reply = m_nam.get(req);
     connect(reply, &QNetworkReply::finished, this,
             [this, reply]() { handleHomeReply(reply); });
 }
@@ -533,10 +616,46 @@ void XClient::handleHomeReply(QNetworkReply *reply)
         emit errorOccurred(m_lastError);
         return;
     }
-    const QJsonObject data = QJsonDocument::fromJson(reply->readAll()).object();
+    const QByteArray body = reply->readAll();
+    diagReply(QStringLiteral("home"), reply, body);
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    if (doc.isNull()) {
+        diagWrite(QStringLiteral("ANOM op=home kind=badjson head=")
+                  + diagHead(body, 512));
+        m_lastError = QStringLiteral("X 响应解析失败，请稍后重试");
+        qWarning() << "XClient home bad json, len" << body.size();
+        emit errorOccurred(m_lastError);
+        return;
+    }
+    const QJsonObject data = doc.object();
+    // HTTP 200 但顶层带 errors 数组（X 风控/参数校验失败）：按抓取失败处理，
+    // 不重建 feed——重建会清掉已读内容跳回第 0 页，且 cursor 被清空后
+    // 后续翻页/续抓永久失效（读者卡死在一本空书上）
+    if (data.contains("errors") && !data["errors"].toArray().isEmpty()) {
+        const QString emsg = topLevelError(data);
+        m_lastError = emsg.isEmpty()
+                          ? QStringLiteral("X 返回错误，请稍后重试") : emsg;
+        diagWrite(QStringLiteral("ANOM op=home kind=errors head=")
+                  + diagHead(body, 1024));
+        qWarning() << "XClient home errors:" << m_lastError;
+        emit errorOccurred(m_lastError);
+        return;
+    }
     QVector<XTweet> items;
     QString cursor;
     parseTimeline(data, m_tabKind, &items, &cursor);
+    filterDataGarbage(QStringLiteral("home"), &items);
+    if (items.isEmpty() && m_tabKind == QLatin1String("home")) {
+        // 主时间线空（空文件夹是正常情况，主时间线空是异常）：不当空书
+        // 重建，按错误处理让用户重试
+        m_lastError = QStringLiteral("X 返回了空时间线，请稍后重试");
+        diagWrite(QStringLiteral("ANOM op=home kind=empty len=")
+                  + QByteArray::number(body.size())
+                  + QStringLiteral(" head=") + diagHead(body, 512));
+        qWarning() << "XClient home empty timeline";
+        emit errorOccurred(m_lastError);
+        return;
+    }
     m_cursor = cursor;   // 空时间线（如空文件夹）也会走这里，cursor 为空即到底
     ingest(items, /*append=*/false);
     emit homeReady();
@@ -573,8 +692,10 @@ void XClient::fetchOlder()
     QJsonObject vars = timelineVars(m_tabId, isList, m_cursor);
     if (!isList && !m_seenTweetIds.isEmpty())
         vars["seenTweetIds"] = seenArray();
-    QNetworkReply *reply =
-        m_nam.get(apiRequest(opForTab(m_tabId, isList), vars));
+    QNetworkRequest req = apiRequest(opForTab(m_tabId, isList), vars);
+    diagRequest(QStringLiteral("older"), req,
+                isList ? 0 : m_seenTweetIds.size(), m_cursor);
+    QNetworkReply *reply = m_nam.get(req);
     connect(reply, &QNetworkReply::finished, this,
             [this, reply]() { handleOlderReply(reply); });
 }
@@ -603,10 +724,34 @@ void XClient::handleOlderReply(QNetworkReply *reply)
         emit errorOccurred(m_lastError);
         return;
     }
-    const QJsonObject data = QJsonDocument::fromJson(reply->readAll()).object();
+    const QByteArray body = reply->readAll();
+    diagReply(QStringLiteral("older"), reply, body);
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    if (doc.isNull()) {
+        diagWrite(QStringLiteral("ANOM op=older kind=badjson head=")
+                  + diagHead(body, 512));
+        m_lastError = QStringLiteral("X 响应解析失败，请稍后重试");
+        m_extendErrorAt = QDateTime::currentMSecsSinceEpoch();
+        qWarning() << "XClient older bad json, len" << body.size();
+        emit errorOccurred(m_lastError);
+        return;
+    }
+    const QJsonObject data = doc.object();
+    if (data.contains("errors") && !data["errors"].toArray().isEmpty()) {
+        const QString emsg = topLevelError(data);
+        m_lastError = emsg.isEmpty()
+                          ? QStringLiteral("X 返回错误，请稍后重试") : emsg;
+        m_extendErrorAt = QDateTime::currentMSecsSinceEpoch();
+        diagWrite(QStringLiteral("ANOM op=older kind=errors head=")
+                  + diagHead(body, 1024));
+        qWarning() << "XClient older errors:" << m_lastError;
+        emit errorOccurred(m_lastError);
+        return;
+    }
     QVector<XTweet> items;
     QString cursor;
     parseTimeline(data, m_tabKind, &items, &cursor);
+    filterDataGarbage(QStringLiteral("older"), &items);
     m_cursor = cursor;   // 空 cursor = 到底，fetchOlder 会按"无更多内容"处理
     ingest(items, /*append=*/true);
     emit olderReady();
@@ -678,6 +823,7 @@ void XClient::startDetailFetch(const QString &tweetId, bool first)
         vars["referrer"] = "tweet";
     }
     QNetworkRequest req = apiRequest(kOpTweetDetail, vars, kFieldToggles);
+    diagRequest(QStringLiteral("detail"), req, 0, s.cursor);
     QNetworkReply *reply = m_nam.get(req);
     connect(reply, &QNetworkReply::finished, this,
             [this, tweetId, reply]() { handleDetailReply(tweetId, reply); });
@@ -701,10 +847,32 @@ void XClient::handleDetailReply(const QString &tweetId, QNetworkReply *reply)
         emit detailFailed(tweetId);
         return;
     }
-    const QJsonObject data = QJsonDocument::fromJson(reply->readAll()).object();
+    const QByteArray body = reply->readAll();
+    diagReply(QStringLiteral("detail"), reply, body);
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    if (doc.isNull()) {
+        diagWrite(QStringLiteral("ANOM op=detail kind=badjson id=")
+                  + tweetId + QStringLiteral(" head=") + diagHead(body, 512));
+        m_lastError = QStringLiteral("X 响应解析失败，请稍后重试");
+        qWarning() << "XClient detail bad json:" << tweetId;
+        emit detailFailed(tweetId);
+        return;
+    }
+    const QJsonObject data = doc.object();
+    if (data.contains("errors") && !data["errors"].toArray().isEmpty()) {
+        const QString emsg = topLevelError(data);
+        m_lastError = emsg.isEmpty()
+                          ? QStringLiteral("X 返回错误，请稍后重试") : emsg;
+        diagWrite(QStringLiteral("ANOM op=detail kind=errors id=")
+                  + tweetId + QStringLiteral(" head=") + diagHead(body, 1024));
+        qWarning() << "XClient detail errors:" << tweetId << m_lastError;
+        emit detailFailed(tweetId);
+        return;
+    }
     QVector<XTweet> batch;
     QString cursor;
     parseDetail(data, &batch, &cursor);
+    filterDataGarbage(QStringLiteral("detail"), &batch);
     QVector<XTweet> fresh;
     for (const XTweet &t : batch) {
         if (s->seen.contains(t.id))
@@ -1016,6 +1184,83 @@ XTweet *XClient::normalize(const QJsonObject &result)
         t->quoted.views = qStats.views;
     }
     return t.release();
+}
+
+// ---- "数据帖"过滤（"整页 %22 数字"问题的直接修复） ----
+// 此类帖子的正文是一段 URL 编码的纯数字推文 id 数组（%22 是双引号的百分号
+// 编码，解码后形如 ["2093…","2093…",…]）。首次出现时经当时保留的请求/响应
+// 日志确认为时间线里的真实推文正文（提交 eb4a359，"非错误页"），多为
+// 数据/采集类账号所发。危害链：
+//   1) 单条最长 25000 字符，一屏批量出现时双栏版面几乎全是这种卡片
+//      （卡片截 6 行也整页是数字墙）；点卡片进详情页（全文不截断）则是
+//      几十页纯数字，翻页翻不出去；
+//   2) 这些 id 被 reportSeen 上送后强化 X 对此类帖子的推送，刷新仍见；
+//   3) 若来源是异常响应回显（而非真实垃圾账号），同样被本规则拦下。
+// 两条规则都要求长文本，正常帖子（含代码/数据示例帖）无法同时命中：
+//   1) ≥10 个 %XX 百分号编码序列，且数字占非空白字符 ≥50% → 编码数据；
+//   2) （解码形态）长度 ≥4000、数字占非空白 ≥85%、含数组分隔符 ","
+//      → 解码后的纯数字 id 数组。
+static bool isDataGarbage(const QString &s)
+{
+    const QString c = s.trimmed();
+    if (c.size() < 200)
+        return false;
+    auto ishex = [](QChar ch) {
+        return (ch >= QLatin1Char('0') && ch <= QLatin1Char('9'))
+               || (ch >= QLatin1Char('a') && ch <= QLatin1Char('f'))
+               || (ch >= QLatin1Char('A') && ch <= QLatin1Char('F'));
+    };
+    int digit = 0, nonws = 0, esc = 0;
+    for (int i = 0; i < c.size(); ++i) {
+        const QChar ch = c.at(i);
+        if (ch.isSpace())
+            continue;
+        ++nonws;
+        if (ch.isDigit()) {
+            ++digit;
+        } else if (ch == QLatin1Char('%') && i + 2 < c.size()
+                   && ishex(c.at(i + 1)) && ishex(c.at(i + 2))) {
+            ++esc;
+        }
+    }
+    if (nonws == 0)
+        return false;
+    if (esc >= 10 && digit * 2 >= nonws)
+        return true;
+    if (c.size() >= 4000 && digit * 20 >= nonws * 17
+            && c.contains(QStringLiteral("\",\"")))
+        return true;
+    return false;
+}
+
+// 从解析结果中剔除数据帖（不排版、不可收藏、不进 seen），并写 ANOM 日志
+// （作者/id/正文片段）——问题再次出现时据此锁定是哪个账号所发，可去网页版
+// 屏蔽该账号
+static void filterDataGarbage(const QString &diagTag, QVector<XTweet> *items)
+{
+    for (int i = items->size() - 1; i >= 0; --i) {
+        const XTweet &t = items->at(i);
+        const QString *bad = nullptr;
+        const QString *fields[5] = {&t.text, &t.originalText, &t.comment,
+                                    &t.quoted.text, &t.quoted.originalText};
+        for (const QString *s : fields)
+            if (isDataGarbage(*s)) {
+                bad = s;
+                break;
+            }
+        if (!bad)
+            continue;
+        diagWrite(QString("ANOM op=%1 kind=data-garbage id=%2 author=%3 len=%4 "
+                          "head=%5")
+                    .arg(diagTag).arg(t.id)
+                    .arg(t.authorHandle.isEmpty() ? t.authorName
+                                                  : t.authorHandle)
+                    .arg(bad->size())
+                    .arg(bad->left(256)
+                           .replace(QLatin1Char('\n'), QLatin1Char(' '))
+                           .replace(QLatin1Char('\r'), QLatin1Char(' '))));
+        items->removeAt(i);
+    }
 }
 
 void XClient::parseTimeline(const QJsonObject &data, const QString &kind,

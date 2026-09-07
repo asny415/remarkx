@@ -227,6 +227,7 @@ cookies.json              X 登录态 Cookie
 fonts/remarkx-cjk.ttf     渲染字体
 book/                     收藏帖图 + 笔迹层
 favs.json / pending.json  收藏索引 / Telegram 待发队列
+xdiag.log                 X 请求/响应诊断日志（每次请求一行摘要 + 异常片段，2MB 自动删档）
 ```
 
 ---

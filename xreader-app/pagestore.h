@@ -179,6 +179,9 @@ private:
     void onHomeReady();
     void onOlderReady();
     void onFetchError(const QString &msg);
+    // 刷新在途排队：抓取进行中（多为背景预抓更早内容）收到刷新手势时不丢弃，
+    // 本次抓取结束（成功/失败）时自动执行，否则用户底滑后毫无反应
+    void maybeRunPendingRefresh();
     void onMediaReady(const QString &tweetId);
     void saveInkNow();
     void persistState();
@@ -263,6 +266,7 @@ private:
     QVariantList m_tabsView;
     bool m_waitingOlder = false;
     bool m_prefetchOlder = false;      // 后台预抓更早内容（不阻塞翻页）
+    bool m_pendingRefresh = false;     // 抓取在途期间收到的刷新请求（结束时补做）
     bool m_lastPrefetchEmpty = false;  // 上次预抓无新内容（时间线已到头）
     bool m_extendErrorWas = false;   // 上次错误是否来自续抓（重试走续抓而非首页刷新）
     int m_baseRev = 0;

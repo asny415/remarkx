@@ -108,6 +108,7 @@ fonts/remarkx-cjk.ttf  渲染字体
 book/                  收藏帖图 + 笔迹层
 favs.json              收藏索引（含 "sent"：已推送成功的帖子 mid 去重集合）
 pending.json           Telegram 待发队列
+xdiag.log              X 请求/响应诊断日志（见"日志策略"，2MB 自动删档）
 ```
 
 **启动链**：
@@ -156,7 +157,11 @@ pending.json           Telegram 待发队列
   `Q_PROPERTY`/`Q_INVOKABLE` 暴露给 QML。
 - **日志策略**：不使用 `qInfo` 调试日志（`87657d8` 已整体移除，勿加回）；
   错误用 `qWarning`；保留崩溃处理器，并在关键操作处调 `remarkxSetCtx("...")`
-  记录崩溃上下文。
+  记录崩溃上下文。例外：`xclient.cpp` 的 xdiag 诊断日志写设备端 `xdiag.log`
+  （2026-09 排查"整页 %22 数字"问题时经用户同意新增）——每次 API 请求/响应
+  一行 REQ/RES 摘要（op/urlLen/seen/status/len），异常（非 200、JSON 解析
+  失败、顶层 errors、被过滤的"数据帖"）追加 ANOM 行带正文片段；文件超 2MB
+  自动删档。排查抓取类问题时先看它；确认根因后是否移除由用户决定，勿擅自删。
 - QML 模块名 `xreader`（`qt_add_qml_module`，文件内嵌进单二进制）；
   主程序名 `xr`（`OUTPUT_NAME`）。
 - 凭据与运行数据（`cookies.json`、`config.json`、`favs.json`、`pending.json`、

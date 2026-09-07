@@ -1329,6 +1329,18 @@ void Renderer::drawCardBorder(QPainter &p, int x, int y0, int y1, int w,
     }
 }
 
+void Renderer::setTimeOffset(qint64 ms)
+{
+    m_timeOffsetMs = ms;
+}
+
+// "现在"统一加时钟校准偏移：系统时钟被修正后偏移为 0，此处理论上是空操作；
+// 无权限修正系统时钟时（如非 root 调试），偏移保证时钟/日期判断仍准确
+static QDateTime correctedNow(qint64 offsetMs)
+{
+    return QDateTime::currentDateTime().addMSecs(offsetMs);
+}
+
 QString Renderer::absTime(const QString &createdAt) const
 {
     QString s = createdAt;
@@ -1342,9 +1354,9 @@ QString Renderer::absTime(const QString &createdAt) const
                                            : dt.toLocalTime();
     if (!local.isValid())
         return {};
-    const QDate today = m_tz.isValid()
-            ? QDateTime::currentDateTime().toTimeZone(m_tz).date()
-            : QDate::currentDate();
+    const QDateTime now = correctedNow(m_timeOffsetMs);
+    const QDate today =
+            m_tz.isValid() ? now.toTimeZone(m_tz).date() : now.date();
     if (local.date().year() == today.year())
         return local.toString(QStringLiteral("MM-dd HH:mm"));
     return local.toString(QStringLiteral("yyyy-MM-dd HH:mm"));
@@ -1353,9 +1365,8 @@ QString Renderer::absTime(const QString &createdAt) const
 QString Renderer::nowClock() const
 {
     // 主界面右上角常驻时钟：时区与帖子时间一致（absTime 同一套逻辑）
-    const QDateTime local = m_tz.isValid()
-            ? QDateTime::currentDateTime().toTimeZone(m_tz)
-            : QDateTime::currentDateTime();
+    const QDateTime now = correctedNow(m_timeOffsetMs);
+    const QDateTime local = m_tz.isValid() ? now.toTimeZone(m_tz) : now;
     static const char *const wd[7] = {
         "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"};
     return local.toString(QStringLiteral("MM-dd HH:mm "))

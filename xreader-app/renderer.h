@@ -74,6 +74,11 @@ public:
     //（config.json "timezone"，未配置则设备本地时区），供主界面常驻时钟
     QString nowClock() const;
 
+    // 服务器时钟偏移（毫秒，正=本地落后）：PageStore 在 XClient 时钟校准后
+    // 写入（系统时钟已被修正时为 0）。帖子时间戳本身是绝对 UTC 不受影响，
+    // 只有依赖本地"现在"的显示（常驻时钟、absTime 的"今年"判断）需要补偿
+    void setTimeOffset(qint64 ms);
+
     // 全文流式双栏分页。fullText=true（详情页）时正文/引用不再按行数截断
     QVector<RenderPage> paginate(const QVector<XTweet> &feed,
                                  bool fullText = false);
@@ -161,6 +166,7 @@ private:
     QString m_mediaDir;
     QString m_family;
     QTimeZone m_tz;                        // config.json "timezone"，空=设备本地
+    qint64 m_timeOffsetMs = 0;             // 时钟校准偏移（见 setTimeOffset）
     mutable QHash<QPair<int, bool>, QFont> m_fonts;
     mutable QHash<QString, QImage> m_avatarCache;
     mutable QHash<QString, QImage> m_photoCache;

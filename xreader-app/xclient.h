@@ -106,6 +106,9 @@ public:
     bool hasSession() const;
     bool fetching() const { return m_fetching; }
     QString lastError() const { return m_lastError; }
+    // 服务器时钟偏移（毫秒，正=本地落后）：最近一次 API 响应 Date 头估算；
+    // 系统时钟已被修正时为 0；供渲染端显示兜底
+    qint64 timeOffsetMs() const { return m_timeOffsetMs; }
     QString mediaDir() const { return m_mediaDir; }
     QString mediaPath(const QString &relative) const;
     // 某推文某张媒体是否下载失败（槽位显示"加载失败"）
@@ -149,6 +152,9 @@ signals:
                      bool hasMore);
     // 详情页抓取失败（错误文本见 lastError()）
     void detailFailed(const QString &tweetId);
+    // 时钟校准（每次 API 响应后偏移有实质变化时发出）：offsetMs=服务器−本地
+    //（系统时钟已修正时为 0）；systemUpdated=本次是否成功修正了系统时钟
+    void timeSynced(qint64 offsetMs, bool systemUpdated);
 
 private:
     void fetchHome();
@@ -158,6 +164,10 @@ private:
     void handleFoldersReply(QNetworkReply *reply);
     void handleHomeReply(QNetworkReply *reply);
     void handleOlderReply(QNetworkReply *reply);
+    // 时钟校准：从响应 Date 头估算服务器时钟偏移（SNTP 式中点），漂移 >2s
+    // 时尝试修正系统时钟（root）；失败则保留偏移供渲染端显示补偿。
+    // 各 API 响应处理器入口调用（含 HTTP 错误响应——Date 头同样有效）
+    void syncTimeFromReply(QNetworkReply *reply);
     void ingest(const QVector<XTweet> &batch, bool append);
     void startDetailFetch(const QString &tweetId, bool first);
     void handleDetailReply(const QString &tweetId, QNetworkReply *reply);
@@ -236,4 +246,10 @@ private:
     QSet<QString> m_inflightMedia;
     QHash<QString, int> m_mediaPending;   // tweetId -> 剩余下载任务数
     QSet<QString> m_failedMedia;   // "tweetId:q?idx" → 下载失败
+
+    // 时钟校准状态：m_timeOffsetMs 是渲染端显示兜底用的偏移（系统时钟已
+    // 修正后为 0）；m_lastClockAttemptMs 限修正系统时钟的尝试频率（防无权限
+    // 时每次响应都重试刷日志）
+    qint64 m_timeOffsetMs = 0;
+    qint64 m_lastClockAttemptMs = 0;
 };

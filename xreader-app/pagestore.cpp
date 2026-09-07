@@ -73,6 +73,11 @@ void PageStore::configure(const QString &baseDir)
     connect(m_client, &XClient::mediaReady, this, &PageStore::onMediaReady);
     connect(m_client, &XClient::detailReady, this, &PageStore::onDetailReady);
     connect(m_client, &XClient::detailFailed, this, &PageStore::onDetailFailed);
+    // 时钟校准：XClient 从 API 响应 Date 头估算服务器时钟偏移（root 且漂移
+    // >2s 时已直接修正系统时钟，此时偏移为 0）；偏移传给渲染端做显示兜底
+    //（右上角时钟、帖子时间"今年"判断）
+    connect(m_client, &XClient::timeSynced, m_renderer,
+            &Renderer::setTimeOffset);
 
     // 头像下载到位后的基础页重渲染去抖：一页多次头像到达合并成一次重绘。
     // 详情页打开时各自去抖：feed 页在背景照常重绘（回看时头像已就位），

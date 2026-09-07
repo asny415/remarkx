@@ -211,6 +211,17 @@ pending.json           Telegram 待发队列
     `penMove`（逐 EV_ABS 事件发会把斜向移动拆成"先横后竖"阶梯折线）。
     参考：swtcon 开源 TCON（github.com/yobert/swtcon，libqsgepaper 的
     软件 TCON 同源）。
+17. **时钟校准**（xclient `syncTimeFromReply` + `parseHttpDate`）：X 服务器
+    NTP 授时，每次 API 响应的 HTTP `Date` 头即精确服务器时刻。发送时刻存请求
+    自定义属性（**码必须 `QNetworkRequest::User`=1000 起**，经
+    `reply->request().attribute()` 读回），与接收时刻取中点做 SNTP 式偏移
+    估算；漂移 >2s 用 `clock_settime(CLOCK_REALTIME,…)` 修正系统时钟
+    （设备端 root，实测可行；尝试冷却 5min 防无权限时刷日志），成功则显示
+    偏移清零，失败/冷却期由 `Renderer::setTimeOffset` 用偏移做显示补偿
+    （右上角时钟、absTime "今年"判断；帖子时间戳本身是绝对 UTC 不受影响）。
+    Qt 6 两个坑：`KnownHeaders` 已无 `ContentDate` 枚举（读 `rawHeader("Date")`）；
+    `Qt::RFC2822Date` 解析**不认 GMT 缩写**（X 恒用 GMT），需手动拆时区归一化
+    （见 `parseHttpDate`，已用 SDK qemu-arm 实测验证）。
 
 ## 修改代码时特别注意
 

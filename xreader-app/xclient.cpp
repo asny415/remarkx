@@ -16,8 +16,18 @@
 #include <QNetworkRequest>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QTimeZone>
 
+#include <cerrno>
+#include <cstring>
+#include <ctime>
 #include <memory>
+
+// 自定义请求属性码：发送时刻（本地毫秒 epoch）。QNetworkReply 持有请求副本，
+// 响应回调里经 reply->request().attribute() 读回（时钟校准用，Qt 6 自定义
+// 属性码必须落在 User=1000 起的区间）
+static const QNetworkRequest::Attribute kSentAtAttr =
+        static_cast<QNetworkRequest::Attribute>(QNetworkRequest::User + 1);
 
 // ---- X 网页端公开常量（2026-08；queryId / Bearer 轮换时从浏览器 DevTools 重新抓包） ----
 static const char *const kBearer =
@@ -214,7 +224,93 @@ QNetworkRequest XClient::apiRequest(const QString &op,
     // 传输超时：代理挂起/无数据时 30s 必触发 finished，
     // 否则 m_fetching 永久卡死 → 之后所有刷新/续抓静默失效（只能退出）
     req.setTransferTimeout(30000);
+    // 发送时刻（本地毫秒 epoch，自定义属性随请求带入响应）：与响应 Date 头
+    // 配合估算服务器时钟偏移（时钟校准，见 syncTimeFromReply）
+    req.setAttribute(kSentAtAttr, qint64(QDateTime::currentMSecsSinceEpoch()));
     return req;
+}
+
+// ---- 时钟校准 ----
+// X API 响应的 HTTP Date 头带服务器发送时刻（RFC 1123，秒精度；X 服务器
+// NTP 授时）。发送/接收时刻取中点做 SNTP 式估算：
+//   offset = 服务器时刻 − (tSent + tRecv) / 2   （正=本地落后）
+// 漂移 >2s 且本进程有权限（设备端以 root 运行）时直接修正系统时钟
+// （clock_settime），右上角时钟/收藏时间戳/Telegram 退避等全部随之正确；
+// 无权限则保留 offset，渲染端用它做显示补偿（见 Renderer::setTimeOffset）。
+// 每次 API 响应都重估：会话期间设备时钟保持准确，且被人为改错后能自愈。
+// 解析 HTTP Date 头（RFC 1123）："ddd, dd MMM yyyy HH:mm:ss zzz"。
+// Qt 的 RFC2822Date 解析不认 GMT 这类时区缩写（实测 X 响应恒为 GMT），
+// 故手动归一化：拆出时区部分、剩余按 UTC 解析；数字偏移 ±HHMM 换算回 UTC；
+// 其他缩写（EST…）宁缺勿错，返回无效
+static QDateTime parseHttpDate(const QByteArray &raw)
+{
+    const QString s = QString::fromLatin1(raw).trimmed();
+    const int sp = s.lastIndexOf(QLatin1Char(' '));
+    if (sp < 0)
+        return {};
+    const QString body = s.left(sp);
+    const QString zone = s.mid(sp + 1);
+    QDateTime dt = QDateTime::fromString(
+            body, QStringLiteral("ddd, dd MMM yyyy HH:mm:ss"));
+    if (!dt.isValid())
+        return {};
+    dt.setTimeZone(QTimeZone::UTC);
+    if (zone.size() == 5 && (zone[0] == QLatin1Char('+')
+                             || zone[0] == QLatin1Char('-'))) {
+        const int sign = zone[0] == QLatin1Char('-') ? -1 : 1;
+        const int hh = zone.mid(1, 2).toInt();
+        const int mm = zone.mid(3, 2).toInt();
+        dt = dt.addSecs(-sign * (hh * 3600 + mm * 60));
+    } else if (!zone.isEmpty() && zone != QLatin1String("GMT")
+               && zone != QLatin1String("UTC")
+               && zone != QLatin1Char('Z')) {
+        return {};
+    }
+    return dt;
+}
+
+void XClient::syncTimeFromReply(QNetworkReply *reply)
+{
+    const QDateTime server = parseHttpDate(reply->rawHeader("Date"));
+    if (!server.isValid())
+        return;
+    const qint64 tSent = reply->request().attribute(kSentAtAttr).toLongLong();
+    const qint64 tRecv = QDateTime::currentMSecsSinceEpoch();
+    // 无发送时刻（理论上不会，属性缺失兜底）：偏移被网络耗时低估，只做显示
+    // 补偿，不用于修正系统时钟
+    const qint64 offset = server.toMSecsSinceEpoch()
+                          - (tSent > 0 ? (tSent + tRecv) / 2 : tRecv);
+    if (qAbs(offset) < 2000) {
+        if (m_timeOffsetMs != 0) {   // 此前无权限用偏移补偿，如今时钟已对上
+            m_timeOffsetMs = 0;
+            emit timeSynced(0, false);
+        }
+        return;
+    }
+    const qint64 now = server.toMSecsSinceEpoch() + (tRecv - tSent) / 2;
+    const qint64 tNow = QDateTime::currentMSecsSinceEpoch();
+    if (tSent > 0
+            && (m_lastClockAttemptMs == 0
+                || tNow - m_lastClockAttemptMs >= 300000)) {
+        m_lastClockAttemptMs = tNow;
+        struct timespec ts;
+        ts.tv_sec = static_cast<time_t>(now / 1000);
+        ts.tv_nsec = static_cast<long>((now % 1000) * 1000000LL);
+        if (clock_settime(CLOCK_REALTIME, &ts) == 0) {
+            m_timeOffsetMs = 0;   // 系统时钟已修正：显示无需补偿
+            qWarning() << "XClient: system clock corrected, offset was"
+                       << offset / 60000 << "min";
+            emit timeSynced(0, true);
+            return;
+        }
+        qWarning() << "XClient: clock_settime failed:"
+                   << strerror(errno);
+    }
+    // 无权限修正系统时钟（或处于尝试冷却期）：偏移交给渲染端显示补偿
+    if (m_timeOffsetMs != offset) {
+        m_timeOffsetMs = offset;
+        emit timeSynced(offset, false);
+    }
 }
 
 // 把 QNetworkReply 错误转成可读中文（设备端错误页直接展示）
@@ -301,6 +397,7 @@ void XClient::fetchFolders()
 void XClient::handleFoldersReply(QNetworkReply *reply)
 {
     remarkxSetCtx("xclient:handleFoldersReply");
+    syncTimeFromReply(reply);
     reply->deleteLater();
     m_fetching = false;
     emit fetchingChanged(false);
@@ -426,6 +523,7 @@ void XClient::fetchHome()
 void XClient::handleHomeReply(QNetworkReply *reply)
 {
     remarkxSetCtx("xclient:handleHomeReply");
+    syncTimeFromReply(reply);
     reply->deleteLater();
     m_fetching = false;
     emit fetchingChanged(false);
@@ -484,6 +582,7 @@ void XClient::fetchOlder()
 void XClient::handleOlderReply(QNetworkReply *reply)
 {
     remarkxSetCtx("xclient:handleOlderReply");
+    syncTimeFromReply(reply);
     reply->deleteLater();
     m_fetching = false;
     emit fetchingChanged(false);
@@ -587,6 +686,7 @@ void XClient::startDetailFetch(const QString &tweetId, bool first)
 void XClient::handleDetailReply(const QString &tweetId, QNetworkReply *reply)
 {
     remarkxSetCtx("xclient:handleDetailReply");
+    syncTimeFromReply(reply);
     reply->deleteLater();
     auto it = m_details.find(tweetId);
     if (it == m_details.end())
